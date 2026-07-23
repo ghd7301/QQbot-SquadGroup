@@ -50,9 +50,11 @@ class ReplyDetectionTests(unittest.TestCase):
 
     @patch("squad_bot.onebot.urllib.request.urlopen")
     def test_send_group_message_uses_structured_mention(self, urlopen):
-        urlopen.return_value = FakeResponse({"status": "ok"})
+        urlopen.return_value = FakeResponse(
+            {"status": "ok", "data": {"message_id": 456789}}
+        )
 
-        send_group_msg(
+        message_id = send_group_msg(
             "http://127.0.0.1:3000",
             123,
             "生日快乐！",
@@ -70,6 +72,7 @@ class ReplyDetectionTests(unittest.TestCase):
                 {"type": "text", "data": {"text": " 生日快乐！"}},
             ],
         )
+        self.assertEqual(message_id, "456789")
 
     def test_extracts_reply_id_from_segments(self):
         message = [

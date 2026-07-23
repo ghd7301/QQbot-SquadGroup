@@ -13,7 +13,8 @@
 - 使用本地 Markdown 知识库检索上下文。
 - 使用检索分数和查询词覆盖率区分强命中、弱命中，避免拿弱相关资料硬答。
 - 被 @ 的问题未命中知识库时，由独立的通用模型提示词谨慎兜底。
-- 可在白名单群里低频参与闲聊，使用最近 120 秒、最多 6 条文本作为上下文。
+- 可在白名单群里低频参与闲聊，使用可配置的近期消息和回复关系作为上下文。
+- 按群异步维护滚动场景快照，提炼当前话题、指代关系和接话位置，不阻塞当前回复。
 - @/管理消息、普通问答和闲聊分别由独立 worker 处理，闲聊不会阻塞 @ 消息。
 - 调用 DeepSeek / MiMo 等 OpenAI 兼容接口生成回答。
 - 回答不展示参考资料，不使用 Markdown 格式。
@@ -21,11 +22,13 @@
 - 每分钟最多回复 8 条，避免突发刷屏。
 - 闲聊回复按群限制为至少间隔 60 秒、每小时最多 20 条。
 - 普通消息超过 60 秒、@ 消息超过 5 分钟后不再回复。
-- 普通消息会短暂延迟，让 @ 消息插队。
+- 同一用户连续发送的消息会等待 3 秒并按说话对象聚合，最长等待 8 秒；QQ 的 @/回复关系作为硬目标，目标不明的后续片段由语义分类器判断，低置信度时不继承对机器人的 @。
 - 同一群同一知识主题默认 60 秒内不重复主动回复。
 - 同一群同一用户的短追问默认保留 120 秒上下文。
 - 同群不同用户接话默认保留 30 秒上下文。
 - 被 @ 的追问默认保留 180 秒上下文。
+- QQ 显式回复机器人时按机器人消息 ID 精确加载原问题、原回答和知识来源；对话轮次写入 SQLite，重启后仍可恢复。
+- 没有显式回复链时，只在消息含有明确承接词且话题不冲突时关联上一轮，不再把所有短句都当成追问。
 - 支持本地 `/ask` 调试接口。
 - 支持 `/health` 健康检查。
 - 支持群内 `重载知识库` 或 `reload` 重载知识库。
@@ -83,7 +86,15 @@ MAX_ANSWER_CHARS=500
 MAX_REPLIES_PER_MINUTE=8
 NORMAL_MESSAGE_MAX_AGE_SECONDS=60
 MENTIONED_MESSAGE_MAX_AGE_SECONDS=300
-NORMAL_REPLY_DELAY_SECONDS=2
+NORMAL_REPLY_DELAY_SECONDS=0
+MESSAGE_FRAGMENT_DEBOUNCE_SECONDS=3
+MESSAGE_FRAGMENT_MAX_WAIT_SECONDS=8
+MESSAGE_FRAGMENT_MAX_PARTS=6
+MESSAGE_FRAGMENT_MAX_CHARS=800
+MESSAGE_FRAGMENT_SEMANTIC_ENABLED=true
+MESSAGE_FRAGMENT_SEMANTIC_MODEL=
+MESSAGE_FRAGMENT_SEMANTIC_TIMEOUT_SECONDS=8
+MESSAGE_FRAGMENT_SEMANTIC_MIN_CONFIDENCE=0.75
 SAME_TOPIC_COOLDOWN_SECONDS=60
 FOLLOWUP_SAME_USER_SECONDS=120
 FOLLOWUP_GROUP_SECONDS=30
@@ -100,6 +111,13 @@ MAX_CHAT_REPLIES_PER_HOUR=20
 CHAT_CONTEXT_SECONDS=300
 CHAT_CONTEXT_MESSAGES=12
 CHAT_REPLY_DEBOUNCE_SECONDS=2
+CHAT_SCENE_ENABLED=true
+CHAT_SCENE_DEBOUNCE_SECONDS=3
+CHAT_SCENE_UPDATE_INTERVAL_SECONDS=30
+CHAT_SCENE_STALE_SECONDS=600
+CHAT_SCENE_MIN_MESSAGES=3
+CHAT_SCENE_TIMEOUT_SECONDS=30
+# CHAT_SCENE_MODEL=可选；不配置时复用 LLM_MODEL
 DRY_RUN=false
 ```
 
@@ -176,7 +194,7 @@ API 地址：填到本项目 .env 的 ONEBOT_API_URL
 @机器人 HAB 和 FOB 有啥区别
 ```
 
-普通群消息不会因为提到关键词就必然回复。知识问答、未命中兜底和闲聊使用三套独立提示词。闲聊只在 `CHAT_ALLOWED_GROUP_IDS` 中低频触发，并过滤公告、链接、资料整理、任务安排、bot 元讨论和群友之间的定向对话。发给模型的近期群聊会把真实 QQ 号匿名化为“群友A、群友B”。
+普通群消息不会因为提到关键词就必然回复。知识问答、未命中兜底和闲聊使用三套独立提示词。闲聊只在 `CHAT_ALLOWED_GROUP_IDS` 中低频触发，并过滤公告、链接、资料整理、任务安排、bot 元讨论和群友之间的定向对话。发给模型的近期群聊会把真实 QQ 号匿名化为“群友A、群友B”。场景快照在后台按群合并更新；生成回复时会同时看到快照和原始上下文，并以当前消息、引用关系和原始上下文为准。
 
 ## 消息审计日志
 
@@ -256,7 +274,7 @@ reload
 
 ## 已知边界
 
-- 只有最近 120 秒的短期闲聊上下文，没有长期聊天记忆。
+- 只有可配置时间窗内的短期闲聊上下文和内存场景快照，没有长期聊天记忆；重启后快照会随新消息重新建立。
 - 闲聊回复时间写入 SQLite，因此重启服务不会重置 60 秒冷却和每小时上限。
 - 主动回复策略仍需要根据真实群日志继续调优。
 - 当前是关键词和短语检索，还没有向量检索。

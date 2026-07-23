@@ -50,7 +50,23 @@ class Settings:
     mentioned_message_max_age_seconds: int = int(
         os.getenv("MENTIONED_MESSAGE_MAX_AGE_SECONDS", "300")
     )
-    normal_reply_delay_seconds: float = float(os.getenv("NORMAL_REPLY_DELAY_SECONDS", "2"))
+    normal_reply_delay_seconds: float = float(os.getenv("NORMAL_REPLY_DELAY_SECONDS", "0"))
+    message_fragment_debounce_seconds: float = float(os.getenv("MESSAGE_FRAGMENT_DEBOUNCE_SECONDS", "3"))
+    message_fragment_max_wait_seconds: float = float(os.getenv("MESSAGE_FRAGMENT_MAX_WAIT_SECONDS", "8"))
+    message_fragment_max_parts: int = int(os.getenv("MESSAGE_FRAGMENT_MAX_PARTS", "6"))
+    message_fragment_max_chars: int = int(os.getenv("MESSAGE_FRAGMENT_MAX_CHARS", "800"))
+    message_fragment_semantic_enabled: bool = os.getenv(
+        "MESSAGE_FRAGMENT_SEMANTIC_ENABLED", "true"
+    ).lower() in {"1", "true", "yes", "on"}
+    message_fragment_semantic_model: str = os.getenv("MESSAGE_FRAGMENT_SEMANTIC_MODEL") or os.getenv(
+        "LLM_MODEL", "deepseek-chat"
+    )
+    message_fragment_semantic_timeout_seconds: int = int(
+        os.getenv("MESSAGE_FRAGMENT_SEMANTIC_TIMEOUT_SECONDS", "8")
+    )
+    message_fragment_semantic_min_confidence: float = float(
+        os.getenv("MESSAGE_FRAGMENT_SEMANTIC_MIN_CONFIDENCE", "0.75")
+    )
     same_topic_cooldown_seconds: int = int(os.getenv("SAME_TOPIC_COOLDOWN_SECONDS", "60"))
     followup_same_user_seconds: int = int(
         os.getenv("FOLLOWUP_SAME_USER_SECONDS", os.getenv("FOLLOWUP_CONTEXT_SECONDS", "120"))
@@ -68,6 +84,13 @@ class Settings:
     chat_context_seconds: int = int(os.getenv("CHAT_CONTEXT_SECONDS", "300"))
     chat_context_messages: int = int(os.getenv("CHAT_CONTEXT_MESSAGES", "12"))
     chat_reply_debounce_seconds: float = float(os.getenv("CHAT_REPLY_DEBOUNCE_SECONDS", "2"))
+    chat_scene_enabled: bool = os.getenv("CHAT_SCENE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    chat_scene_model: str = os.getenv("CHAT_SCENE_MODEL") or os.getenv("LLM_MODEL", "deepseek-chat")
+    chat_scene_debounce_seconds: float = float(os.getenv("CHAT_SCENE_DEBOUNCE_SECONDS", "3"))
+    chat_scene_update_interval_seconds: float = float(os.getenv("CHAT_SCENE_UPDATE_INTERVAL_SECONDS", "30"))
+    chat_scene_stale_seconds: int = int(os.getenv("CHAT_SCENE_STALE_SECONDS", "600"))
+    chat_scene_min_messages: int = int(os.getenv("CHAT_SCENE_MIN_MESSAGES", "3"))
+    chat_scene_timeout_seconds: int = int(os.getenv("CHAT_SCENE_TIMEOUT_SECONDS", "30"))
     chat_allowed_group_ids: tuple[str, ...] = tuple(
         group_id.strip()
         for group_id in os.getenv("CHAT_ALLOWED_GROUP_IDS", "").split(",")

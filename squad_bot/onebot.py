@@ -95,7 +95,7 @@ def send_group_msg(
     access_token: str = "",
     *,
     mention_user_id: str = "",
-) -> None:
+) -> str:
     mention_id = str(mention_user_id or "").strip()
     message_payload: str | list[dict]
     if re.fullmatch(r"\d+", mention_id):
@@ -118,7 +118,16 @@ def send_group_msg(
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=15) as response:
-        response.read()
+        raw_response = response.read()
+    try:
+        result = json.loads(raw_response.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return ""
+    response_data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(response_data, dict):
+        return ""
+    message_id = response_data.get("message_id", "")
+    return str(message_id).strip() if message_id is not None else ""
 
 
 def get_message_sender_id(

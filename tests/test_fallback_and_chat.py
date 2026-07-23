@@ -1,6 +1,7 @@
 import json
 import unittest
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +12,8 @@ from squad_bot.llm import (
     CHAT_PROMPT,
     CHAT_ROUTER_PROMPT,
     FALLBACK_PROMPT,
+    PERSONA_CORE,
+    SCENE_ANALYZE_PROMPT,
     SYSTEM_PROMPT,
     is_chat_no_reply,
     normalize_model_answer,
@@ -299,6 +302,18 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertIn("强行转到 Squad", CHAT_PROMPT)
         self.assertIn("生日或毕业", CHAT_PROMPT)
         self.assertNotIn("教官", CHAT_PROMPT)
+        self.assertIn("不要虚构自己正在睡觉", PERSONA_CORE)
+        self.assertIn("不要强行把话题转回 Squad", FALLBACK_PROMPT)
+        self.assertIn("不判断对方是否装身份", FALLBACK_PROMPT)
+        self.assertIn("不虚构现实活动", CHAT_PROMPT)
+        self.assertIn("不嘲讽其身份或语言", CHAT_PROMPT)
+        self.assertIn("需要真实群友表态", CHAT_PROMPT)
+        self.assertIn("不用波浪号卖萌", CHAT_PROMPT)
+        self.assertIn("滚动场景快照", CHAT_PROMPT)
+        self.assertIn("旧快照可能已经过时", SCENE_ANALYZE_PROMPT)
+        self.assertIn("并行话题必须分开", SCENE_ANALYZE_PROMPT)
+        self.assertNotIn("B 站、贴吧、NGA", CHAT_PROMPT)
+        self.assertNotIn("节目效果拉满", CHAT_PROMPT)
 
     def test_chat_generation_uses_history_without_knowledge_context(self) -> None:
         with patch.object(llm, "_answer_or_error", return_value="确实，刷久了容易困") as call:
@@ -308,6 +323,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 model="test-model",
                 message="玩战甲其实后边也犯困",
                 context=("群友A：最近又开始刷战甲了", "群友B：后期基本都在刷材料"),
+                scene_context="话题：大家在聊战甲后期刷材料容易疲劳",
             )
 
         self.assertEqual(answer, "确实，刷久了容易困")
@@ -315,8 +331,38 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         user_prompt = messages[1]["content"]
         self.assertIn("群友A：最近又开始刷战甲了", user_prompt)
         self.assertIn("群友B：后期基本都在刷材料", user_prompt)
+        self.assertIn("话题：大家在聊战甲后期刷材料容易疲劳", user_prompt)
         self.assertIn("当前消息：玩战甲其实后边也犯困", user_prompt)
         self.assertNotIn("知识库资料", user_prompt)
+
+    def test_scene_analysis_is_best_effort_and_uses_previous_snapshot(self) -> None:
+        snapshot = "话题：宿舍卫生\n关系：群友B接群友A的话\n进展：讨论二次清扫\n接话：可回应清扫差异"
+        with patch.object(llm, "_chat_completion", return_value=snapshot) as call:
+            answer = llm.analyze_chat_scene(
+                base_url="https://example.invalid",
+                api_key="test-key",
+                model="test-model",
+                context=("群友A：学生扫完还有阿姨消毒",),
+                previous_scene="话题：学校宿舍",
+            )
+
+        self.assertEqual(answer, snapshot)
+        messages = call.call_args.kwargs["messages"]
+        self.assertIn("旧快照可能已经过时", messages[0]["content"])
+        self.assertIn("话题：学校宿舍", messages[1]["content"])
+        self.assertIn("学生扫完还有阿姨消毒", messages[1]["content"])
+        self.assertEqual(call.call_args.kwargs["retries"], 0)
+
+        with patch.object(llm, "_chat_completion", side_effect=TimeoutError):
+            self.assertEqual(
+                llm.analyze_chat_scene(
+                    base_url="https://example.invalid",
+                    api_key="test-key",
+                    model="test-model",
+                    context=("群友A：还在吗",),
+                ),
+                "",
+            )
 
     def test_fallback_generation_receives_group_context(self) -> None:
         with patch.object(llm, "_answer_or_error", return_value="这里说的枪男就是专心练枪的玩法") as call:
@@ -430,6 +476,27 @@ class ChatStateTests(unittest.TestCase):
             server.record_group_chat_message(1, "2", "话题已经继续了", 102)
             self.assertTrue(server.group_chat_has_newer_user_message(1, candidate_sequence))
 
+    def test_context_can_stop_at_scene_snapshot_sequence(self) -> None:
+        with patch.object(
+            server,
+            "settings",
+            SimpleNamespace(
+                bot_qq="999",
+                chat_context_seconds=300,
+                chat_context_messages=12,
+            ),
+        ):
+            snapshot_sequence = server.record_group_chat_message(1, "1", "第一条话题", 100)
+            server.record_group_chat_message(1, "2", "后到的新话题", 101)
+            context = server.recent_group_chat_context(
+                1,
+                now=101,
+                focus_sequence=snapshot_sequence,
+                through_sequence=snapshot_sequence,
+            )
+
+        self.assertEqual(context, ("【当前消息】群友A：第一条话题",))
+
     def test_context_preserves_reply_relation_and_marks_current_message(self) -> None:
         with patch.object(
             server,
@@ -474,6 +541,65 @@ class ChatStateTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(server.find_group_chat_message(1, "m1").text, "我电脑重装系统了")
+
+    def test_scene_snapshot_must_be_fresh_and_not_newer_than_target(self) -> None:
+        with server.chat_scene_lock:
+            server.group_chat_scenes[1] = server.GroupChatScene(
+                summary="话题：正在讨论宿舍卫生",
+                updated_at=100,
+                sequence=5,
+            )
+
+        self.assertEqual(
+            server.current_group_chat_scene(1, focus_sequence=5, now=150, stale_seconds=120),
+            "话题：正在讨论宿舍卫生",
+        )
+        self.assertEqual(
+            server.current_group_chat_scene(1, focus_sequence=4, now=150, stale_seconds=120),
+            "",
+        )
+        self.assertEqual(
+            server.current_group_chat_scene(1, focus_sequence=5, now=221, stale_seconds=120),
+            "",
+        )
+
+    def test_scene_update_builds_snapshot_without_blocking_chat_worker(self) -> None:
+        configured = SimpleNamespace(
+            bot_qq="999",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+            chat_scene_debounce_seconds=0,
+            chat_scene_update_interval_seconds=0,
+            chat_scene_min_messages=3,
+            chat_scene_timeout_seconds=10,
+            chat_scene_model="scene-model",
+            llm_base_url="https://example.invalid",
+            llm_api_key="test-key",
+            llm_model="chat-model",
+        )
+        with patch.object(server, "settings", configured):
+            current_time = time.time()
+            server.record_group_chat_message(1, "1", "寝室是学生自己打扫", current_time - 2)
+            server.record_group_chat_message(1, "2", "我们有阿姨二次清扫", current_time - 1)
+            sequence = server.record_group_chat_message(1, "3", "最后还会消毒", current_time)
+            with server.chat_scene_lock:
+                server.chat_scene_requested_sequence[1] = sequence
+                server.chat_scene_pending_messages[1] = 3
+                server.chat_scene_running.add(1)
+            with patch.object(
+                server,
+                "analyze_chat_scene",
+                return_value="话题：不同学校的宿舍清扫方式",
+            ) as analyze:
+                server._chat_scene_update_loop(1)
+
+        self.assertEqual(
+            server.current_group_chat_scene(1, focus_sequence=sequence, stale_seconds=0),
+            "话题：不同学校的宿舍清扫方式",
+        )
+        self.assertEqual(analyze.call_args.kwargs["model"], "scene-model")
+        self.assertEqual(len(analyze.call_args.kwargs["context"]), 3)
+        self.assertNotIn(1, server.chat_scene_running)
 
     def test_chat_cooldown_and_hourly_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

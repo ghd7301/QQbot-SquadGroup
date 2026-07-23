@@ -14,10 +14,11 @@ from urllib.parse import parse_qs
 from .config import settings
 from .knowledge import KnowledgeBase
 from .llm import (
+    analyze_chat_scene,
     answer_chat,
-    analyze_scene,
     ask_fallback_llm,
     ask_llm,
+    classify_bot_fragment_prefix,
     is_chat_no_reply,
     normalize_model_answer,
     should_auto_reply,
@@ -54,6 +55,14 @@ chat_history_lock = threading.Lock()
 group_chat_history: dict[int, list["GroupChatMessage"]] = {}
 chat_message_sequence = 0
 chat_reply_lock = threading.Lock()
+chat_scene_lock = threading.Lock()
+group_chat_scenes: dict[int, "GroupChatScene"] = {}
+chat_scene_requested_sequence: dict[int, int] = {}
+chat_scene_pending_messages: dict[int, int] = {}
+chat_scene_running: set[int] = set()
+fragment_condition = threading.Condition()
+group_fragment_buffers: dict[int, "MessageFragmentBuffer"] = {}
+ready_fragment_buffers: list["MessageFragmentBuffer"] = []
 
 
 @dataclass
@@ -77,6 +86,10 @@ class ConversationState:
     sources: tuple[str, ...]
     timestamp: float
     user_id: str = ""
+    last_answer: str = ""
+    reply_mode: str = "knowledge"
+    bot_message_id: str = ""
+    user_message_id: str = ""
 
 
 @dataclass
@@ -95,6 +108,25 @@ class GroupChatMessage:
     reply_message_id: str = ""
     reply_target_user_id: str = ""
     reply_text: str = ""
+
+
+@dataclass
+class GroupChatScene:
+    summary: str
+    updated_at: float
+    sequence: int
+
+
+@dataclass
+class MessageFragmentBuffer:
+    group_id: int
+    user_id: str
+    audience: str
+    item: dict
+    parts: list[str]
+    fragments: list[dict]
+    started_at: float
+    deadline: float
 
 
 IDENTITY_KEYWORDS = (
@@ -558,22 +590,47 @@ GRADUATION_DISCUSSION_CUES = (
     "没毕业",
 )
 
-FOLLOWUP_CUES = (
+FOLLOWUP_PREFIX_CUES = (
     "那",
     "那么",
+    "那要是",
+    "那如果",
+    "那为什么",
+    "那为啥",
+    "那接下来",
+    "所以",
+    "所以说",
+    "这么说",
+    "照这么说",
+    "按你说的",
+    "按这个说法",
+    "也就是说",
     "这个",
     "这种",
     "这样",
-    "为啥",
-    "为什么",
     "然后",
+    "然后呢",
     "还有呢",
+    "还有什么",
+    "还有别的",
+    "另外呢",
+    "再然后",
+    "接下来",
+    "下一步",
     "怎么说",
     "怎么处理",
+    "怎么弄",
     "咋办",
     "怎么办",
     "要不要",
     "还要",
+    "还需要",
+    "具体呢",
+    "比如呢",
+    "多久呢",
+    "多少呢",
+    "为什么呢",
+    "为啥呢",
     "先奶",
     "奶满",
     "补满",
@@ -583,9 +640,62 @@ FOLLOWUP_CUES = (
     "倒一起",
     "上车",
     "转点",
-    "呢",
-    "吗",
 )
+
+FOLLOWUP_REFERENCE_CUES = (
+    "刚才",
+    "刚刚",
+    "前面说",
+    "上面说",
+    "看前面",
+    "看上面",
+    "上一条",
+    "上一句",
+    "你说的",
+    "你刚说",
+    "你提到的",
+    "刚提到",
+    "前者",
+    "后者",
+    "第一个",
+    "第二个",
+    "第三个",
+    "这个情况下",
+    "这种情况下",
+)
+
+FOLLOWUP_NON_CONTINUATION_PREFIXES = (
+    "哪里",
+    "那里",
+    "哪些",
+    "哪个",
+    "哪种",
+    "哪张",
+    "哪边",
+)
+
+FOLLOWUP_NEW_TOPIC_CUES = (
+    "闲聊",
+    "机器人",
+    "bot",
+    "知识库",
+    "提示词",
+    "api",
+    "bug",
+    "回复机制",
+    "追问机制",
+)
+
+FOLLOWUP_TOPIC_GROUPS = {
+    "spawn_network": ("fob", "hab", "radio", "电台", "无线电", "兵站", "队包", "复活点", "出生点"),
+    "voice": ("ts", "ts3", "语音", "麦克风", "耳机", "b键", "v键", "g键"),
+    "medic": ("医疗兵", "医生", "先奶", "奶满", "先拉", "拉起来"),
+    "anti_tank": ("反坦", "轻反", "重反", "lat", "hat"),
+    "vehicle": ("载具", "装甲", "坦克", "步战", "轮战", "车组", "载具兵"),
+    "server": ("服务器", "进服", "选服", "搜不到", "无法连接", "卡三点", "跑小人"),
+    "logistics": ("后勤", "logi", "补给", "卸货", "卸建", "卸弹", "建设点", "弹药点"),
+    "command": ("小队长", "指挥官", "指挥", "指挥频道", "批车", "要车"),
+}
 
 COMMAND_ALIASES = {
     "重载知识库": "reload",
@@ -651,6 +761,7 @@ def write_message_audit(
     reply_message_id: str = "",
     reply_target_user_id: str = "",
     chat_context: Sequence[str] = (),
+    scene_context: str = "",
     answer: str = "",
     mention_user_id: str = "",
     event_time=None,
@@ -675,6 +786,7 @@ def write_message_audit(
         "reply_message_id": str(reply_message_id),
         "reply_target_user_id": str(reply_target_user_id),
         "chat_context": list(chat_context),
+        "scene_context": scene_context,
         "answer": answer,
         "mention_user_id": str(mention_user_id or ""),
     }
@@ -766,9 +878,11 @@ def answer_admin_command(command: str) -> str:
         auto_status = "开" if auto_reply_enabled else "关"
         chat_status = "开" if settings.chat_reply_enabled and auto_reply_enabled else "关"
         queued = message_queue.qsize() + normal_message_queue.qsize() + chat_queue.qsize()
+        with chat_scene_lock:
+            scene_count = len(group_chat_scenes)
         return (
             f"服务正常。知识片段 {len(kb.chunks)} 个，队列 {queued} 条，"
-            f"自动回复{auto_status}，闲聊{chat_status}，"
+            f"自动回复{auto_status}，闲聊{chat_status}，场景快照 {scene_count} 个，"
             f"每分钟最多回复 {settings.max_replies_per_minute} 条。"
         )
     if command == "recent_skips":
@@ -846,15 +960,36 @@ def cleanup_followup_state(now: float) -> None:
             group_followup_state.pop(group_id, None)
 
 
-def looks_like_followup(question: str, mentioned: bool) -> bool:
+def looks_like_followup(question: str, mentioned: bool = False) -> bool:
     normalized = question.strip().lower()
     if not normalized:
         return False
-    if mentioned and len(normalized) <= 28:
+    has_reference = any(cue in normalized for cue in FOLLOWUP_REFERENCE_CUES)
+    if has_reference:
         return True
-    if len(normalized) <= 16:
+    if normalized.startswith(FOLLOWUP_NON_CONTINUATION_PREFIXES):
+        return False
+    if any(cue in normalized for cue in FOLLOWUP_NEW_TOPIC_CUES):
+        return False
+    return normalized.startswith(FOLLOWUP_PREFIX_CUES)
+
+
+def followup_topics(message: str) -> set[str]:
+    lowered = message.lower()
+    topics = {keyword for keyword in AUTO_REPLY_KEYWORDS if keyword in lowered}
+    for topic, aliases in FOLLOWUP_TOPIC_GROUPS.items():
+        if any(alias in lowered for alias in aliases):
+            topics.add(topic)
+    return topics
+
+
+def implicit_followup_matches_state(question: str, state: ConversationState) -> bool:
+    normalized = question.strip().lower()
+    if any(cue in normalized for cue in FOLLOWUP_REFERENCE_CUES):
         return True
-    return any(cue in normalized for cue in FOLLOWUP_CUES)
+    current_topics = followup_topics(normalized)
+    previous_topics = followup_topics(state.last_question)
+    return not (current_topics and previous_topics and current_topics.isdisjoint(previous_topics))
 
 
 def followup_context_for(
@@ -862,17 +997,51 @@ def followup_context_for(
     user_id,
     question: str,
     mentioned: bool,
+    *,
+    reply_message_id: str = "",
+    reply_target_user_id: str = "",
+    reply_text: str = "",
+    bot_qq: str = "",
+    db_path: str | Path | None = None,
 ) -> FollowupMatch | None:
+    now = time.time()
+    is_reply_to_bot = bool(
+        reply_message_id
+        and bot_qq
+        and str(reply_target_user_id or "") == str(bot_qq)
+    )
+    if is_reply_to_bot:
+        state = load_conversation_turn_by_bot_message_id(
+            group_id,
+            reply_message_id,
+            db_path=db_path,
+        )
+        if state:
+            return FollowupMatch(state=state, scope="reply")
+        if reply_text.strip():
+            return FollowupMatch(
+                state=ConversationState(
+                    last_question="",
+                    sources=(),
+                    timestamp=now,
+                    last_answer=reply_text.strip(),
+                    reply_mode="quoted",
+                    bot_message_id=reply_message_id,
+                ),
+                scope="reply_text",
+            )
+        # An explicit reply must never silently bind to an unrelated recent turn.
+        return None
+
     if (
         settings.followup_same_user_seconds <= 0
         and settings.followup_group_seconds <= 0
         and settings.followup_mention_seconds <= 0
     ):
         return None
+    cleanup_followup_state(now)
     if not looks_like_followup(question, mentioned):
         return None
-    now = time.time()
-    cleanup_followup_state(now)
     user_key = str(user_id) if user_id is not None else ""
     user_ttl = settings.followup_mention_seconds if mentioned else settings.followup_same_user_seconds
     group_ttl = settings.followup_mention_seconds if mentioned else settings.followup_group_seconds
@@ -881,12 +1050,20 @@ def followup_context_for(
     if user_key:
         with followup_lock:
             state = user_followup_state.get((group_id, user_key))
-        if state and now - state.timestamp <= user_ttl:
+        if (
+            state
+            and now - state.timestamp <= user_ttl
+            and implicit_followup_matches_state(question, state)
+        ):
             candidates.append((2, state, "user"))
 
     with followup_lock:
         group_state = group_followup_state.get(group_id)
-    if group_state and now - group_state.timestamp <= group_ttl:
+    if (
+        group_state
+        and now - group_state.timestamp <= group_ttl
+        and implicit_followup_matches_state(question, group_state)
+    ):
         candidates.append((1, group_state, "group"))
 
     if not candidates:
@@ -897,26 +1074,58 @@ def followup_context_for(
 
 
 def build_effective_question(question: str, followup_match: FollowupMatch | None) -> str:
-    if not followup_match:
+    if not followup_match or not followup_match.state.last_question:
         return question
     return f"上一轮问题：{followup_match.state.last_question}\n当前追问：{question}"
 
 
-def remember_conversation(group_id: int, user_id, question: str, decision: ProcessingDecision) -> None:
+def build_generation_question(question: str, followup_match: FollowupMatch | None) -> str:
+    if not followup_match:
+        return question
+    parts: list[str] = []
+    if followup_match.state.last_question:
+        parts.append(f"上一轮问题：{followup_match.state.last_question}")
+    if followup_match.state.last_answer:
+        parts.append(f"上一轮回答：{followup_match.state.last_answer[:1200]}")
+    parts.append(f"当前追问：{question}")
+    return "\n".join(parts)
+
+
+def remember_conversation(
+    group_id: int,
+    user_id,
+    question: str,
+    decision: ProcessingDecision,
+    *,
+    answer: str = "",
+    bot_message_id: str = "",
+    user_message_id: str = "",
+    persist: bool = True,
+    db_path: str | Path | None = None,
+) -> None:
+    state = ConversationState(
+        last_question=question,
+        sources=decision.sources,
+        timestamp=time.time(),
+        user_id=str(user_id) if user_id is not None else "",
+        last_answer=answer,
+        reply_mode=decision.reply_mode,
+        bot_message_id=str(bot_message_id or ""),
+        user_message_id=str(user_message_id or ""),
+    )
+    if persist:
+        try:
+            persist_conversation_turn(group_id, state, db_path=db_path)
+        except Exception as exc:
+            print("Persist conversation turn failed:", repr(exc))
     if (
         settings.followup_same_user_seconds <= 0
         and settings.followup_group_seconds <= 0
         and settings.followup_mention_seconds <= 0
     ):
         return
-    if decision.reply_mode != "knowledge" or not decision.sources:
+    if decision.reply_mode not in {"knowledge", "fallback"}:
         return
-    state = ConversationState(
-        last_question=question,
-        sources=decision.sources,
-        timestamp=time.time(),
-        user_id=str(user_id) if user_id is not None else "",
-    )
     with followup_lock:
         if user_id is not None:
             user_followup_state[(group_id, str(user_id))] = state
@@ -981,6 +1190,36 @@ def find_group_chat_message(group_id: int, message_id: str) -> GroupChatMessage 
     return None
 
 
+def resolve_reply_message_context(
+    group_id: int,
+    message_id: str,
+    *,
+    db_path: str | Path | None = None,
+) -> tuple[str, str]:
+    target = str(message_id or "").strip()
+    if not target:
+        return "", ""
+    replied = find_group_chat_message(group_id, target)
+    if replied:
+        return replied.user_id, replied.text
+    sender_id, text = get_message_info(
+        settings.onebot_api_url,
+        target,
+        settings.onebot_access_token,
+        settings.onebot_message_lookup_timeout_seconds,
+    )
+    if sender_id:
+        return sender_id, text
+    turn = load_conversation_turn_by_bot_message_id(
+        group_id,
+        target,
+        db_path=db_path,
+    )
+    if turn:
+        return settings.bot_qq, turn.last_answer
+    return "", text
+
+
 def recent_group_chat_context(
     group_id: int,
     *,
@@ -988,6 +1227,7 @@ def recent_group_chat_context(
     context_seconds: int | None = None,
     max_messages: int | None = None,
     focus_sequence: int = 0,
+    through_sequence: int = 0,
 ) -> tuple[str, ...]:
     current_time = time.time() if now is None else now
     window = settings.chat_context_seconds if context_seconds is None else context_seconds
@@ -1001,12 +1241,17 @@ def recent_group_chat_context(
             group_chat_history[group_id] = recent
         else:
             group_chat_history.pop(group_id, None)
-    selected = recent[-limit:]
+    available = (
+        [item for item in recent if item.sequence <= through_sequence]
+        if through_sequence
+        else recent
+    )
+    selected = available[-limit:]
     if focus_sequence:
-        focus = next((item for item in recent if item.sequence == focus_sequence), None)
+        focus = next((item for item in available if item.sequence == focus_sequence), None)
         if focus and focus.reply_message_id:
             replied = next(
-                (item for item in recent if item.message_id == focus.reply_message_id),
+                (item for item in available if item.message_id == focus.reply_message_id),
                 None,
             )
             if replied and replied not in selected:
@@ -1043,6 +1288,125 @@ def recent_group_chat_context(
     return tuple(lines)
 
 
+def current_group_chat_scene(
+    group_id: int,
+    *,
+    focus_sequence: int = 0,
+    now: float | None = None,
+    stale_seconds: int | None = None,
+) -> str:
+    current_time = time.time() if now is None else now
+    max_age = (
+        getattr(settings, "chat_scene_stale_seconds", 600)
+        if stale_seconds is None
+        else stale_seconds
+    )
+    with chat_scene_lock:
+        scene = group_chat_scenes.get(group_id)
+        if not scene:
+            return ""
+        if max_age > 0 and current_time - scene.updated_at > max_age:
+            return ""
+        if focus_sequence and scene.sequence > focus_sequence:
+            return ""
+        return scene.summary
+
+
+def chat_scene_enabled_for_group(group_id: int) -> bool:
+    if not auto_reply_enabled or not settings.chat_reply_enabled:
+        return False
+    if not getattr(settings, "chat_scene_enabled", True):
+        return False
+    return not settings.chat_allowed_group_ids or str(group_id) in settings.chat_allowed_group_ids
+
+
+def _finish_chat_scene_update(group_id: int) -> None:
+    with chat_scene_lock:
+        chat_scene_running.discard(group_id)
+        chat_scene_requested_sequence.pop(group_id, None)
+        chat_scene_pending_messages.pop(group_id, None)
+
+
+def _chat_scene_update_loop(group_id: int) -> None:
+    while True:
+        debounce = max(0.0, getattr(settings, "chat_scene_debounce_seconds", 3.0))
+        if debounce:
+            time.sleep(debounce)
+
+        with chat_scene_lock:
+            existing = group_chat_scenes.get(group_id)
+            last_updated = existing.updated_at if existing else 0.0
+        min_interval = max(
+            0.0,
+            getattr(settings, "chat_scene_update_interval_seconds", 30.0),
+        )
+        wait_seconds = min_interval - (time.time() - last_updated)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+        with chat_scene_lock:
+            target_sequence = chat_scene_requested_sequence.get(group_id, 0)
+            chat_scene_pending_messages[group_id] = 0
+            previous = group_chat_scenes.get(group_id)
+        context = recent_group_chat_context(
+            group_id,
+            now=time.time(),
+            focus_sequence=target_sequence,
+            through_sequence=target_sequence,
+        )
+        min_messages = max(1, getattr(settings, "chat_scene_min_messages", 3))
+        if len(context) < min_messages:
+            _finish_chat_scene_update(group_id)
+            return
+
+        summary = analyze_chat_scene(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=getattr(settings, "chat_scene_model", settings.llm_model),
+            context=context,
+            previous_scene=previous.summary if previous else "",
+            timeout=max(1, getattr(settings, "chat_scene_timeout_seconds", 30)),
+        )
+        if summary:
+            with chat_scene_lock:
+                group_chat_scenes[group_id] = GroupChatScene(
+                    summary=summary,
+                    updated_at=time.time(),
+                    sequence=target_sequence,
+                )
+            print("Updated chat scene", group_id, target_sequence)
+        else:
+            print("Chat scene update failed", group_id, target_sequence)
+
+        with chat_scene_lock:
+            pending = chat_scene_pending_messages.get(group_id, 0)
+            if pending < min_messages:
+                chat_scene_running.discard(group_id)
+                chat_scene_requested_sequence.pop(group_id, None)
+                chat_scene_pending_messages.pop(group_id, None)
+                return
+
+
+def schedule_chat_scene_update(group_id: int, sequence: int) -> bool:
+    if not sequence or not chat_scene_enabled_for_group(group_id):
+        return False
+    min_messages = max(1, getattr(settings, "chat_scene_min_messages", 3))
+    with chat_scene_lock:
+        chat_scene_requested_sequence[group_id] = sequence
+        pending = chat_scene_pending_messages.get(group_id, 0) + 1
+        chat_scene_pending_messages[group_id] = pending
+        if group_id in chat_scene_running or pending < min_messages:
+            return False
+        chat_scene_running.add(group_id)
+    threading.Thread(
+        target=_chat_scene_update_loop,
+        args=(group_id,),
+        daemon=True,
+        name=f"chat-scene-{group_id}",
+    ).start()
+    return True
+
+
 def has_substantive_chat_context(chat_context: Sequence[str]) -> bool:
     for line in chat_context:
         text = line.split("：", 1)[-1].strip().lower()
@@ -1064,6 +1428,12 @@ def clear_chat_state() -> None:
     with chat_history_lock:
         group_chat_history.clear()
         chat_message_sequence = 0
+    with chat_scene_lock:
+        group_chat_scenes.clear()
+        chat_scene_requested_sequence.clear()
+        chat_scene_pending_messages.clear()
+        chat_scene_running.clear()
+    clear_fragment_state()
 
 
 def save_chat_history(path: str | Path | None = None) -> None:
@@ -1360,6 +1730,7 @@ def answer_question(
     question: str,
     effective_question: str | None = None,
     *,
+    retrieval_question: str | None = None,
     allow_fallback: bool = True,
 ) -> str:
     if is_identity_question(question):
@@ -1370,7 +1741,7 @@ def answer_question(
         )
 
     llm_question = effective_question or question
-    result = retrieve_knowledge(llm_question, settings.max_context_chars)
+    result = retrieve_knowledge(retrieval_question or llm_question, settings.max_context_chars)
     strong_match = is_strong_knowledge_match(
         result.top_score,
         result.query_coverage,
@@ -1399,9 +1770,9 @@ def answer_question(
 def answer_for_decision(
     question: str,
     decision: ProcessingDecision,
-    effective_question: str,
+    generation_question: str,
 ) -> str:
-    llm_question = decision.effective_question or effective_question or question
+    llm_question = generation_question or decision.effective_question or question
     if decision.reply_mode == "fallback":
         answer = ask_fallback_llm(
             base_url=settings.llm_base_url,
@@ -1420,7 +1791,12 @@ def answer_for_decision(
             context=decision.chat_context,
         )
         return finalize_model_answer(answer, unsolicited=True)
-    return answer_question(question, llm_question, allow_fallback=False)
+    return answer_question(
+        question,
+        llm_question,
+        retrieval_question=decision.effective_question or question,
+        allow_fallback=False,
+    )
 
 
 def is_model_error_answer(answer: str) -> bool:
@@ -1477,8 +1853,147 @@ def open_pending_queue_db(db_path: str | Path | None = None) -> sqlite3.Connecti
         "CREATE INDEX IF NOT EXISTS idx_celebration_reply_lookup "
         "ON celebration_reply_history (group_id, target_key, event_kind, replied_at)"
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_message_id TEXT NOT NULL,
+            bot_message_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            reply_mode TEXT NOT NULL,
+            sources_json TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_bot_message "
+        "ON conversation_turns (group_id, bot_message_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_user_time "
+        "ON conversation_turns (group_id, user_id, created_at)"
+    )
     connection.commit()
     return connection
+
+
+def persist_conversation_turn(
+    group_id: int,
+    state: ConversationState,
+    *,
+    db_path: str | Path | None = None,
+) -> int:
+    connection = open_pending_queue_db(db_path)
+    try:
+        cutoff = time.time() - 30 * 86400
+        connection.execute("DELETE FROM conversation_turns WHERE created_at < ?", (cutoff,))
+        cursor = connection.execute(
+            """
+            INSERT INTO conversation_turns (
+                group_id, user_id, user_message_id, bot_message_id,
+                question, answer, reply_mode, sources_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(group_id),
+                state.user_id,
+                state.user_message_id,
+                state.bot_message_id,
+                state.last_question,
+                state.last_answer,
+                state.reply_mode,
+                json.dumps(list(state.sources), ensure_ascii=False),
+                state.timestamp,
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+    finally:
+        connection.close()
+
+
+def _conversation_state_from_row(row) -> ConversationState:
+    try:
+        sources = tuple(json.loads(row[7]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        sources = ()
+    return ConversationState(
+        last_question=str(row[4] or ""),
+        sources=sources,
+        timestamp=float(row[8]),
+        user_id=str(row[1] or ""),
+        last_answer=str(row[5] or ""),
+        reply_mode=str(row[6] or ""),
+        bot_message_id=str(row[3] or ""),
+        user_message_id=str(row[2] or ""),
+    )
+
+
+def load_conversation_turn_by_bot_message_id(
+    group_id: int,
+    bot_message_id: str,
+    *,
+    db_path: str | Path | None = None,
+) -> ConversationState | None:
+    target = str(bot_message_id or "").strip()
+    if not target:
+        return None
+    connection = open_pending_queue_db(db_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT id, user_id, user_message_id, bot_message_id,
+                   question, answer, reply_mode, sources_json, created_at
+            FROM conversation_turns
+            WHERE group_id = ? AND bot_message_id = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (str(group_id), target),
+        ).fetchone()
+    finally:
+        connection.close()
+    return _conversation_state_from_row(row) if row else None
+
+
+def load_recent_conversation_states(
+    *,
+    now: float | None = None,
+    db_path: str | Path | None = None,
+) -> int:
+    current_time = time.time() if now is None else now
+    max_window = max(
+        settings.followup_same_user_seconds,
+        settings.followup_group_seconds,
+        settings.followup_mention_seconds,
+    )
+    if max_window <= 0:
+        return 0
+    connection = open_pending_queue_db(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT group_id, user_id, user_message_id, bot_message_id,
+                   question, answer, reply_mode, sources_json, created_at
+            FROM conversation_turns
+            WHERE created_at >= ? AND reply_mode IN ('knowledge', 'fallback')
+            ORDER BY created_at ASC
+            """,
+            (current_time - max_window,),
+        ).fetchall()
+    finally:
+        connection.close()
+    with followup_lock:
+        for row in rows:
+            group_id = int(row[0])
+            state = _conversation_state_from_row((0, *row[1:]))
+            if state.user_id:
+                user_followup_state[(group_id, state.user_id)] = state
+            group_followup_state[group_id] = state
+    return len(rows)
 
 
 def persist_pending_message(
@@ -1560,6 +2075,317 @@ def enqueue_persistent_message(priority: int, item: dict) -> int:
     target_queue = message_queue if priority == 0 else normal_message_queue
     target_queue.put((priority, sequence, queued_item))
     return pending_id
+
+
+def classify_fragment_audience(item: dict) -> str:
+    """Classify who a fragment addresses without guessing from general pronouns."""
+    bot_qq = str(settings.bot_qq or "")
+    reply_message_id = str(item.get("reply_message_id") or "")
+    reply_target_user_id = str(item.get("reply_target_user_id") or "")
+    if item.get("mentioned"):
+        return "bot"
+    if reply_message_id:
+        if bot_qq and reply_target_user_id == bot_qq:
+            return "bot"
+        return "human"
+    if item.get("mentioned_user_ids"):
+        return "human"
+    return "unknown"
+
+
+def fragment_items_compatible(buffer: MessageFragmentBuffer, item: dict, audience: str) -> bool:
+    if str(item.get("user_id") or "") != buffer.user_id:
+        return False
+    if {buffer.audience, audience} == {"bot", "human"}:
+        return False
+    if audience == "human" or buffer.audience == "human":
+        return audience == buffer.audience
+    if audience == "bot" and buffer.audience == "unknown":
+        return False
+    if audience == "bot" and any(
+        fragment.get("fragment_audience") == "unknown"
+        for fragment in buffer.fragments[1:]
+    ):
+        return False
+    old_reply_id = str(buffer.item.get("reply_message_id") or "")
+    new_reply_id = str(item.get("reply_message_id") or "")
+    if old_reply_id and new_reply_id and old_reply_id != new_reply_id:
+        return False
+    old_target = str(buffer.item.get("reply_target_user_id") or "")
+    new_target = str(item.get("reply_target_user_id") or "")
+    if old_target and new_target and old_target != new_target:
+        return False
+    return True
+
+
+def _message_ids(item: dict) -> list[str]:
+    result: list[str] = []
+    for candidate in item.get("message_ids") or (item.get("message_id"),):
+        value = str(candidate or "").strip()
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _new_fragment_buffer(item: dict, audience: str, now: float) -> MessageFragmentBuffer:
+    buffered_item = dict(item)
+    buffered_item["message_ids"] = _message_ids(item)
+    buffered_item["fragment_audience"] = audience
+    question = str(item.get("question") or "").strip()
+    fragment = dict(item)
+    fragment["fragment_audience"] = audience
+    max_wait = max(0.0, settings.message_fragment_max_wait_seconds)
+    debounce = max(0.0, settings.message_fragment_debounce_seconds)
+    deadline = min(now + debounce, now + max_wait) if max_wait else now + debounce
+    return MessageFragmentBuffer(
+        group_id=int(item["group_id"]),
+        user_id=str(item.get("user_id") or ""),
+        audience=audience,
+        item=buffered_item,
+        parts=[question],
+        fragments=[fragment],
+        started_at=now,
+        deadline=deadline,
+    )
+
+
+def _merge_fragment(buffer: MessageFragmentBuffer, item: dict, audience: str, now: float) -> None:
+    question = str(item.get("question") or "").strip()
+    buffer.parts.append(question)
+    fragment = dict(item)
+    fragment["fragment_audience"] = audience
+    buffer.fragments.append(fragment)
+    buffer.item["question"] = "\n".join(part for part in buffer.parts if part)
+    if audience == "bot":
+        buffer.audience = "bot"
+    buffer.item["fragment_audience"] = buffer.audience
+    buffer.item["mentioned"] = bool(buffer.item.get("mentioned") or item.get("mentioned"))
+    mentioned_ids = list(buffer.item.get("mentioned_user_ids") or ())
+    for candidate in item.get("mentioned_user_ids") or ():
+        value = str(candidate or "").strip()
+        if value and value not in mentioned_ids:
+            mentioned_ids.append(value)
+    buffer.item["mentioned_user_ids"] = mentioned_ids
+    buffer.item["mentions_other"] = bool(mentioned_ids)
+    message_ids = _message_ids(buffer.item)
+    for message_id in _message_ids(item):
+        if message_id not in message_ids:
+            message_ids.append(message_id)
+    buffer.item["message_ids"] = message_ids
+    buffer.item["message_id"] = str(item.get("message_id") or buffer.item.get("message_id") or "")
+    for key in ("reply_message_id", "reply_target_user_id", "reply_text"):
+        if not buffer.item.get(key) and item.get(key):
+            buffer.item[key] = item[key]
+    for key in ("time", "sender_role", "chat_context", "chat_sequence"):
+        if key in item:
+            buffer.item[key] = item[key]
+    debounce = max(0.0, settings.message_fragment_debounce_seconds)
+    max_wait = max(0.0, settings.message_fragment_max_wait_seconds)
+    debounce_deadline = now + debounce
+    hard_deadline = buffer.started_at + max_wait if max_wait else debounce_deadline
+    buffer.deadline = min(debounce_deadline, hard_deadline)
+
+
+def _fragment_prefix_item(buffer: MessageFragmentBuffer, count: int) -> dict:
+    selected = buffer.fragments[:count]
+    item = dict(buffer.item)
+    item["question"] = "\n".join(
+        str(fragment.get("question") or "").strip() for fragment in selected
+    )
+    item["mentioned"] = any(fragment.get("mentioned") for fragment in selected)
+    mentioned_ids: list[str] = []
+    message_ids: list[str] = []
+    for fragment in selected:
+        for candidate in fragment.get("mentioned_user_ids") or ():
+            value = str(candidate or "").strip()
+            if value and value not in mentioned_ids:
+                mentioned_ids.append(value)
+        for message_id in _message_ids(fragment):
+            if message_id not in message_ids:
+                message_ids.append(message_id)
+    item["mentioned_user_ids"] = mentioned_ids
+    item["mentions_other"] = bool(mentioned_ids)
+    item["message_ids"] = message_ids
+    item["message_id"] = str(selected[-1].get("message_id") or "")
+    for key in ("reply_message_id", "reply_target_user_id", "reply_text"):
+        item[key] = next(
+            (fragment.get(key) for fragment in selected if fragment.get(key)),
+            "",
+        )
+    return item
+
+
+def semantic_bot_fragment_count(buffer: MessageFragmentBuffer) -> int:
+    if buffer.audience != "bot" or len(buffer.fragments) < 2:
+        return len(buffer.fragments)
+    if not any(
+        fragment.get("fragment_audience") == "unknown"
+        for fragment in buffer.fragments[1:]
+    ):
+        return len(buffer.fragments)
+    if not getattr(settings, "message_fragment_semantic_enabled", True):
+        return 1
+    decision = classify_bot_fragment_prefix(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=getattr(settings, "message_fragment_semantic_model", settings.llm_model),
+        fragments=buffer.parts,
+        context=tuple(buffer.item.get("chat_context") or ()),
+        timeout=getattr(settings, "message_fragment_semantic_timeout_seconds", 8),
+    )
+    if not decision:
+        return 1
+    count, confidence = decision
+    minimum = getattr(settings, "message_fragment_semantic_min_confidence", 0.75)
+    return count if confidence >= minimum else 1
+
+
+def _dispatch_fragment_buffer(buffer: MessageFragmentBuffer) -> int:
+    count = semantic_bot_fragment_count(buffer)
+    item = _fragment_prefix_item(buffer, count)
+    if count < len(buffer.fragments):
+        print(
+            "Fragment audience split",
+            buffer.group_id,
+            buffer.user_id,
+            f"bot={count}/{len(buffer.fragments)}",
+        )
+    priority = 0 if item.get("mentioned") else 1
+    return enqueue_persistent_message(priority, item)
+
+
+def _defer_fragment_buffers(buffers: Sequence[MessageFragmentBuffer]) -> None:
+    if not buffers:
+        return
+    with fragment_condition:
+        ready_fragment_buffers.extend(buffers)
+        fragment_condition.notify_all()
+
+
+def clear_fragment_state() -> None:
+    with fragment_condition:
+        group_fragment_buffers.clear()
+        ready_fragment_buffers.clear()
+        fragment_condition.notify_all()
+
+
+def flush_group_fragment_buffer(group_id: int, *, defer_dispatch: bool = False) -> int | None:
+    with fragment_condition:
+        buffer = group_fragment_buffers.pop(int(group_id), None)
+        fragment_condition.notify_all()
+    if not buffer:
+        return None
+    if defer_dispatch:
+        _defer_fragment_buffers((buffer,))
+        return None
+    return _dispatch_fragment_buffer(buffer)
+
+
+def flush_fragment_buffer_for_new_speaker(
+    group_id: int,
+    user_id,
+    *,
+    defer_dispatch: bool = False,
+) -> int | None:
+    with fragment_condition:
+        buffer = group_fragment_buffers.get(int(group_id))
+        if not buffer or buffer.user_id == str(user_id or ""):
+            return None
+        buffer = group_fragment_buffers.pop(int(group_id))
+        fragment_condition.notify_all()
+    if defer_dispatch:
+        _defer_fragment_buffers((buffer,))
+        return None
+    return _dispatch_fragment_buffer(buffer)
+
+
+def submit_message_fragment(
+    item: dict,
+    *,
+    now: float | None = None,
+    defer_dispatch: bool = False,
+) -> list[int]:
+    """Buffer a fragment, optionally deferring semantic dispatch to the worker."""
+    current_time = time.monotonic() if now is None else float(now)
+    group_id = int(item["group_id"])
+    audience = classify_fragment_audience(item)
+    displaced: list[MessageFragmentBuffer] = []
+    is_admin_command = bool(get_admin_command(str(item.get("question") or "")))
+
+    with fragment_condition:
+        current = group_fragment_buffers.get(group_id)
+        if current and (
+            is_admin_command
+            or audience == "human"
+            or not fragment_items_compatible(current, item, audience)
+        ):
+            displaced.append(group_fragment_buffers.pop(group_id))
+            current = None
+
+        if audience != "human" and not is_admin_command:
+            max_parts = max(1, settings.message_fragment_max_parts)
+            max_chars = max(1, settings.message_fragment_max_chars)
+            would_exceed = bool(
+                current
+                and (
+                    len(current.parts) >= max_parts
+                    or len("\n".join((*current.parts, str(item.get("question") or "")))) > max_chars
+                )
+            )
+            if would_exceed:
+                displaced.append(group_fragment_buffers.pop(group_id))
+                current = None
+            if current is None:
+                current = _new_fragment_buffer(item, audience, current_time)
+                group_fragment_buffers[group_id] = current
+            else:
+                _merge_fragment(current, item, audience, current_time)
+            if (
+                len(current.parts) >= max_parts
+                or len(str(current.item.get("question") or "")) >= max_chars
+                or current.deadline <= current_time
+            ):
+                displaced.append(group_fragment_buffers.pop(group_id))
+        fragment_condition.notify_all()
+
+    pending_ids: list[int] = []
+    if defer_dispatch:
+        _defer_fragment_buffers(displaced)
+    else:
+        pending_ids = [_dispatch_fragment_buffer(buffer) for buffer in displaced]
+    if is_admin_command:
+        pending_ids.append(enqueue_persistent_message(0 if item.get("mentioned") else 1, item))
+    return pending_ids
+
+
+def fragment_aggregation_worker() -> None:
+    while True:
+        due: list[MessageFragmentBuffer] = []
+        with fragment_condition:
+            while not due:
+                if ready_fragment_buffers:
+                    due = list(ready_fragment_buffers)
+                    ready_fragment_buffers.clear()
+                    break
+                now = time.monotonic()
+                due_group_ids = [
+                    group_id
+                    for group_id, buffer in group_fragment_buffers.items()
+                    if buffer.deadline <= now
+                ]
+                if due_group_ids:
+                    due = [group_fragment_buffers.pop(group_id) for group_id in due_group_ids]
+                    break
+                if not group_fragment_buffers:
+                    fragment_condition.wait()
+                else:
+                    next_deadline = min(buffer.deadline for buffer in group_fragment_buffers.values())
+                    fragment_condition.wait(timeout=max(0.0, next_deadline - now))
+        for buffer in due:
+            try:
+                _dispatch_fragment_buffer(buffer)
+            except Exception as exc:
+                print("Fragment queue write failed:", repr(exc))
 
 
 def restore_pending_messages() -> int:
@@ -1940,9 +2766,6 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
                 continue
 
-            if lane == "normal" and settings.normal_reply_delay_seconds > 0:
-                time.sleep(settings.normal_reply_delay_seconds)
-
             if command:
                 if not is_admin_user(user_id, sender_role):
                     print("Skip admin command: user not allowed", group_id, user_id, question)
@@ -1998,8 +2821,18 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     focus_sequence=int(item.get("chat_sequence") or 0),
                 )
             )
-            followup_match = followup_context_for(group_id, user_id, question, mentioned)
+            followup_match = followup_context_for(
+                group_id,
+                user_id,
+                question,
+                mentioned,
+                reply_message_id=str(item.get("reply_message_id") or ""),
+                reply_target_user_id=str(item.get("reply_target_user_id") or ""),
+                reply_text=str(item.get("reply_text") or ""),
+                bot_qq=settings.bot_qq,
+            )
             effective_question = build_effective_question(question, followup_match)
+            generation_question = build_generation_question(question, followup_match)
             model_started = time.monotonic()
             decision = should_process_message(
                 question,
@@ -2063,7 +2896,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
                 continue
 
-            answer = answer_for_decision(question, decision, effective_question)
+            answer = answer_for_decision(question, decision, generation_question)
             model_latency_ms = int((time.monotonic() - model_started) * 1000)
             mention_user_id = response_mention_user_id(
                 mentioned=mentioned,
@@ -2089,23 +2922,38 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     retrieval_score=decision.retrieval_score,
                     retrieval_coverage=decision.retrieval_coverage,
                     model_latency_ms=model_latency_ms,
+                    reply_message_id=str(item.get("reply_message_id") or ""),
+                    reply_target_user_id=str(item.get("reply_target_user_id") or ""),
                     mention_user_id=mention_user_id,
                     event_time=item.get("time"),
                 )
-                remember_conversation(group_id, user_id, question, decision)
+                remember_conversation(
+                    group_id,
+                    user_id,
+                    question,
+                    decision,
+                    answer=answer,
+                    user_message_id=str(item.get("message_id") or ""),
+                    persist=False,
+                )
                 if decision.reply_mode == "knowledge":
                     mark_topic_replied(group_id, current_topic_key)
                 continue
 
             wait_for_rate_limit()
-            send_group_msg(
+            bot_message_id = send_group_msg(
                 settings.onebot_api_url,
                 group_id,
                 answer,
                 settings.onebot_access_token,
                 mention_user_id=mention_user_id,
             )
-            record_group_chat_message(group_id, settings.bot_qq, answer)
+            record_group_chat_message(
+                group_id,
+                settings.bot_qq,
+                answer,
+                message_id=bot_message_id,
+            )
             print("Answered group", group_id, "question", question)
             write_message_audit(
                 decision="answered",
@@ -2122,10 +2970,20 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 retrieval_score=decision.retrieval_score,
                 retrieval_coverage=decision.retrieval_coverage,
                 model_latency_ms=model_latency_ms,
+                reply_message_id=str(item.get("reply_message_id") or ""),
+                reply_target_user_id=str(item.get("reply_target_user_id") or ""),
                 mention_user_id=mention_user_id,
                 event_time=item.get("time"),
             )
-            remember_conversation(group_id, user_id, question, decision)
+            remember_conversation(
+                group_id,
+                user_id,
+                question,
+                decision,
+                answer=answer,
+                bot_message_id=bot_message_id,
+                user_message_id=str(item.get("message_id") or ""),
+            )
             if decision.reply_mode == "knowledge":
                 mark_topic_replied(group_id, current_topic_key)
         except Exception as exc:
@@ -2228,6 +3086,10 @@ def chat_worker() -> None:
                 now=time.time(),
                 focus_sequence=chat_sequence,
             )
+            scene_context = current_group_chat_scene(
+                group_id,
+                focus_sequence=chat_sequence,
+            )
 
             celebration_target_key = mention_user_id or "unknown"
             if social_event_kind and celebration_was_replied(
@@ -2248,23 +3110,13 @@ def chat_worker() -> None:
                 )
                 continue
 
-            # Scene analysis: extract conversation topic before generating reply
-            scene_topic = analyze_scene(
-                base_url=settings.llm_base_url,
-                api_key=settings.llm_api_key,
-                model=settings.llm_model,
-                context=decision.chat_context,
-            )
-            enhanced_context = decision.chat_context
-            if scene_topic:
-                enhanced_context = (scene_topic,) + tuple(decision.chat_context)
-
             raw_answer = answer_chat(
                 base_url=settings.llm_base_url,
                 api_key=settings.llm_api_key,
                 model=settings.llm_model,
                 message=question,
-                context=enhanced_context,
+                context=decision.chat_context,
+                scene_context=scene_context,
             )
             if is_chat_no_reply(raw_answer):
                 model_latency_ms = int((time.monotonic() - model_started) * 1000)
@@ -2282,6 +3134,7 @@ def chat_worker() -> None:
                     retrieval_coverage=decision.retrieval_coverage,
                     model_latency_ms=model_latency_ms,
                     chat_context=decision.chat_context,
+                    scene_context=scene_context,
                     event_time=event_time,
                 )
                 continue
@@ -2303,6 +3156,7 @@ def chat_worker() -> None:
                     reply_mode="chat",
                     model_latency_ms=model_latency_ms,
                     chat_context=decision.chat_context,
+                    scene_context=scene_context,
                     event_time=event_time,
                 )
                 continue
@@ -2317,6 +3171,7 @@ def chat_worker() -> None:
                     reply_mode="chat",
                     model_latency_ms=model_latency_ms,
                     chat_context=decision.chat_context,
+                    scene_context=scene_context,
                     event_time=event_time,
                 )
                 continue
@@ -2335,6 +3190,7 @@ def chat_worker() -> None:
                     reply_mode="chat",
                     model_latency_ms=model_latency_ms,
                     chat_context=decision.chat_context,
+                    scene_context=scene_context,
                     event_time=event_time,
                 )
                 continue
@@ -2354,6 +3210,7 @@ def chat_worker() -> None:
                     retrieval_coverage=decision.retrieval_coverage,
                     model_latency_ms=model_latency_ms,
                     chat_context=decision.chat_context,
+                    scene_context=scene_context,
                     answer=answer,
                     mention_user_id=mention_user_id,
                     event_time=event_time,
@@ -2377,18 +3234,24 @@ def chat_worker() -> None:
                     reply_mode="chat",
                     model_latency_ms=model_latency_ms,
                     chat_context=decision.chat_context,
+                    scene_context=scene_context,
                     event_time=event_time,
                 )
                 continue
 
-            send_group_msg(
+            bot_message_id = send_group_msg(
                 settings.onebot_api_url,
                 group_id,
                 answer,
                 settings.onebot_access_token,
                 mention_user_id=mention_user_id,
             )
-            record_group_chat_message(group_id, settings.bot_qq, answer)
+            record_group_chat_message(
+                group_id,
+                settings.bot_qq,
+                answer,
+                message_id=bot_message_id,
+            )
             mark_chat_replied(group_id)
             if social_event_kind:
                 mark_celebration_replied(
@@ -2410,9 +3273,19 @@ def chat_worker() -> None:
                 retrieval_coverage=decision.retrieval_coverage,
                 model_latency_ms=model_latency_ms,
                 chat_context=decision.chat_context,
+                scene_context=scene_context,
                 answer=answer,
                 mention_user_id=mention_user_id,
                 event_time=event_time,
+            )
+            remember_conversation(
+                group_id,
+                user_id,
+                question,
+                decision,
+                answer=answer,
+                bot_message_id=bot_message_id,
+                user_message_id=str(item.get("message_id") or ""),
             )
         except Exception as exc:
             terminal = False
@@ -2481,6 +3354,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
+            with chat_scene_lock:
+                scene_groups = len(group_chat_scenes)
+                scene_updating = len(chat_scene_running)
             self._json(
                 200,
                 {
@@ -2494,7 +3370,10 @@ class Handler(BaseHTTPRequestHandler):
                     "priority_queued": message_queue.qsize(),
                     "normal_queued": normal_message_queue.qsize(),
                     "chat_queued": chat_queue.qsize(),
+                    "fragment_buffered": len(group_fragment_buffers),
                     "pending": pending_message_count(),
+                    "scene_groups": scene_groups,
+                    "scene_updating": scene_updating,
                 },
             )
             return
@@ -2586,17 +3465,10 @@ class Handler(BaseHTTPRequestHandler):
         reply_target_user_id = ""
         reply_text = ""
         if reply_message_id:
-            replied = find_group_chat_message(numeric_group_id, reply_message_id)
-            if replied:
-                reply_target_user_id = replied.user_id
-                reply_text = replied.text
-            else:
-                reply_target_user_id, reply_text = get_message_info(
-                    settings.onebot_api_url,
-                    reply_message_id,
-                    settings.onebot_access_token,
-                    settings.onebot_message_lookup_timeout_seconds,
-                )
+            reply_target_user_id, reply_text = resolve_reply_message_context(
+                numeric_group_id,
+                reply_message_id,
+            )
 
         chat_sequence = record_group_chat_message(
             numeric_group_id,
@@ -2609,6 +3481,18 @@ class Handler(BaseHTTPRequestHandler):
             reply_text=reply_text,
         )
         save_chat_history()
+        schedule_chat_scene_update(numeric_group_id, chat_sequence)
+
+        try:
+            flush_fragment_buffer_for_new_speaker(
+                numeric_group_id,
+                user_id,
+                defer_dispatch=True,
+            )
+        except Exception as exc:
+            print("Fragment queue write failed:", repr(exc))
+            self._json(503, {"ok": False, "error": "queue unavailable"})
+            return
 
         # Check if message is too old AFTER recording context
         # Old messages are recorded for context but not processed for replies
@@ -2632,6 +3516,7 @@ class Handler(BaseHTTPRequestHandler):
             settings.bot_qq,
         )
         if not continue_processing:
+            flush_group_fragment_buffer(numeric_group_id, defer_dispatch=True)
             write_message_audit(
                 decision="ignored",
                 reason=reply_reason,
@@ -2690,7 +3575,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "ignored": "no trigger"})
             return
 
-        priority = 0 if mentioned else 1
         item = {
             "group_id": group_id,
             "question": question,
@@ -2703,10 +3587,13 @@ class Handler(BaseHTTPRequestHandler):
             "mentioned_user_ids": list(mentioned_user_ids),
             "reply_message_id": reply_message_id,
             "reply_target_user_id": reply_target_user_id,
+            "reply_text": reply_text,
+            "message_id": str(event.get("message_id") or ""),
             "chat_sequence": chat_sequence,
         }
+        fragment_audience = classify_fragment_audience(item)
         try:
-            enqueue_persistent_message(priority, item)
+            pending_ids = submit_message_fragment(item, defer_dispatch=True)
         except Exception as exc:
             print("Pending queue write failed:", repr(exc))
             write_message_audit(
@@ -2721,7 +3608,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json(503, {"ok": False, "error": "queue unavailable"})
             return
 
-        self._json(200, {"ok": True, "queued": True, "mentioned": mentioned})
+        if fragment_audience == "human":
+            write_message_audit(
+                decision="ignored",
+                reason="fragment directed at another member",
+                group_id=group_id,
+                user_id=user_id,
+                question=question,
+                mentioned=False,
+                event_time=event.get("time"),
+            )
+            self._json(200, {"ok": True, "ignored": "directed at another member"})
+            return
+
+        self._json(
+            200,
+            {
+                "ok": True,
+                "buffered": not pending_ids,
+                "queued": bool(pending_ids),
+                "mentioned": mentioned,
+            },
+        )
 
 
 def main() -> None:
@@ -2731,10 +3639,18 @@ def main() -> None:
     loaded = load_chat_history()
     if loaded:
         print(f"Loaded chat history: {loaded} entries")
+    restored_turns = load_recent_conversation_states()
+    if restored_turns:
+        print(f"Restored conversation turns: {restored_turns}")
     threading.Thread(
         target=worker,
         args=(message_queue, "priority"),
         daemon=True,
+    ).start()
+    threading.Thread(
+        target=fragment_aggregation_worker,
+        daemon=True,
+        name="message-fragment-aggregator",
     ).start()
     threading.Thread(
         target=worker,
