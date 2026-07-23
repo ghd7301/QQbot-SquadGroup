@@ -67,6 +67,18 @@ class Settings:
     message_fragment_semantic_min_confidence: float = float(
         os.getenv("MESSAGE_FRAGMENT_SEMANTIC_MIN_CONFIDENCE", "0.75")
     )
+    contextual_query_enabled: bool = os.getenv(
+        "CONTEXTUAL_QUERY_ENABLED", "true"
+    ).lower() in {"1", "true", "yes", "on"}
+    contextual_query_model: str = os.getenv("CONTEXTUAL_QUERY_MODEL") or os.getenv(
+        "LLM_MODEL", "deepseek-chat"
+    )
+    contextual_query_timeout_seconds: int = int(
+        os.getenv("CONTEXTUAL_QUERY_TIMEOUT_SECONDS", "8")
+    )
+    contextual_query_min_confidence: float = float(
+        os.getenv("CONTEXTUAL_QUERY_MIN_CONFIDENCE", "0.75")
+    )
     same_topic_cooldown_seconds: int = int(os.getenv("SAME_TOPIC_COOLDOWN_SECONDS", "60"))
     followup_same_user_seconds: int = int(
         os.getenv("FOLLOWUP_SAME_USER_SECONDS", os.getenv("FOLLOWUP_CONTEXT_SECONDS", "120"))

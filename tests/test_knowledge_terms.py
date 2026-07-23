@@ -28,6 +28,15 @@ class KnowledgeTermTests(unittest.TestCase):
                     "05-语音软件TeamSpeak教程.md / ST 战队 TS 地址是什么",
                 )
 
+    def test_teamspeak_download_queries_find_group_files(self) -> None:
+        for query in ("TS3去哪下载", "teamspeak安装包在哪", "TS汉化包在哪"):
+            with self.subTest(query=query):
+                result = self.knowledge_base.build_context_with_metrics(query, 1200)
+                self.assertIn("本体安装包和汉化包都在 QQ 群文件", result.context)
+                self.assertTrue(
+                    any("安装包和汉化包在哪里下载" in source for source in result.sources)
+                )
+
     def test_answer_prompt_requires_plain_language_term(self) -> None:
         self.assertIn("统一说“队包”", SYSTEM_PROMPT)
         self.assertIn("不要直接输出英文 Rally", SYSTEM_PROMPT)

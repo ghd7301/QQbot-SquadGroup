@@ -100,6 +100,20 @@ QUERY_COVERAGE_NOISE = (
 QUERY_ALIASES = (
     (
         (
+            "ts去哪下载",
+            "ts3去哪下载",
+            "teamspeak去哪下载",
+            "ts安装包",
+            "ts3安装包",
+            "teamspeak安装包",
+            "ts汉化包",
+            "ts3汉化包",
+            "teamspeak汉化包",
+        ),
+        "TeamSpeak 3 TS3 本体 安装包 汉化包 QQ 群文件 下载",
+    ),
+    (
+        (
             "ts网址",
             "ts地址",
             "st战队ts",
@@ -203,6 +217,21 @@ QUERY_ALIASES = (
 )
 
 PHRASE_BOOSTS = (
+    (
+        (
+            "ts去哪下载",
+            "ts3去哪下载",
+            "teamspeak去哪下载",
+            "ts安装包",
+            "ts3安装包",
+            "teamspeak安装包",
+            "ts汉化包",
+            "ts3汉化包",
+            "teamspeak汉化包",
+        ),
+        ("teamspeak 3安装包和汉化包在哪里下载",),
+        1.2,
+    ),
     (
         ("ts网址", "ts地址", "st战队ts", "语音地址", "teamspeak服务器"),
         ("st战队ts地址是什么", "ts3怎么连接服务器"),

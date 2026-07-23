@@ -21,6 +21,7 @@ from .llm import (
     classify_bot_fragment_prefix,
     is_chat_no_reply,
     normalize_model_answer,
+    rewrite_contextual_question,
     should_auto_reply,
     should_reply_to_chat,
 )
@@ -1713,6 +1714,22 @@ def is_strong_knowledge_match(top_score: float, query_coverage: float) -> bool:
     )
 
 
+def contextual_retrieval_question(
+    question: str,
+    chat_context: Sequence[str],
+) -> tuple[str, float] | None:
+    if not getattr(settings, "contextual_query_enabled", False) or not chat_context:
+        return None
+    return rewrite_contextual_question(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=getattr(settings, "contextual_query_model", settings.llm_model),
+        question=question,
+        context=tuple(chat_context[-8:]),
+        timeout=getattr(settings, "contextual_query_timeout_seconds", 8),
+    )
+
+
 def finalize_model_answer(answer: str, *, unsolicited: bool = False) -> str:
     if is_model_error_answer(answer):
         if unsolicited:
@@ -1732,6 +1749,7 @@ def answer_question(
     *,
     retrieval_question: str | None = None,
     allow_fallback: bool = True,
+    chat_context: Sequence[str] = (),
 ) -> str:
     if is_identity_question(question):
         return (
@@ -1753,6 +1771,7 @@ def answer_question(
                 api_key=settings.llm_api_key,
                 model=settings.llm_model,
                 question=llm_question,
+                context=tuple(chat_context[-8:]),
             )
             return finalize_model_answer(answer)
         return "这个我库里暂时没有准确信息。你可以换个更具体的问法，或者问一下小队长和管理员；涉及服务器规则的话，还是以本服公告为准。"
@@ -1763,6 +1782,7 @@ def answer_question(
         model=settings.llm_model,
         question=llm_question,
         context=result.context,
+        chat_context=tuple(chat_context[-8:]),
     )
     return finalize_model_answer(answer)
 
@@ -1796,6 +1816,7 @@ def answer_for_decision(
         llm_question,
         retrieval_question=decision.effective_question or question,
         allow_fallback=False,
+        chat_context=decision.chat_context,
     )
 
 
@@ -2556,6 +2577,34 @@ def should_process_message(
         result.top_score,
         result.query_coverage,
     )
+    if (
+        not strong_match
+        and chat_context
+        and (mentioned or looks_like_direct_question(normalized))
+    ):
+        rewritten = contextual_retrieval_question(normalized, chat_context)
+        if rewritten:
+            standalone_question, confidence = rewritten
+            minimum_confidence = getattr(settings, "contextual_query_min_confidence", 0.75)
+            if confidence >= minimum_confidence and standalone_question != query_text:
+                candidate = retrieve_knowledge(
+                    standalone_question,
+                    min(settings.max_context_chars, 1200),
+                )
+                candidate_is_strong = is_strong_knowledge_match(
+                    candidate.top_score,
+                    candidate.query_coverage,
+                )
+                candidate_is_better = (
+                    candidate.query_coverage,
+                    candidate.top_score,
+                ) > (result.query_coverage, result.top_score)
+                if candidate.context and (candidate_is_strong or candidate_is_better):
+                    query_text = standalone_question
+                    result = candidate
+                    context = result.context
+                    sources = result.sources
+                    strong_match = candidate_is_strong
     if not context or not strong_match:
         fallback_allowed = settings.llm_fallback_enabled and (
             mentioned or not settings.fallback_only_when_mentioned
@@ -2609,7 +2658,7 @@ def should_process_message(
         decision.retrieval_coverage = result.query_coverage
         return decision
 
-    if len(normalized) < 5 and not has_auto_reply_keyword(normalized) and not followup_of:
+    if len(normalized) < 5 and not has_auto_reply_keyword(query_text) and not followup_of:
         print("Skip message: too short for auto reply", normalized)
         return ProcessingDecision(
             False,
@@ -2634,7 +2683,7 @@ def should_process_message(
             followup_of,
             followup_scope,
             "knowledge",
-            (),
+            tuple(chat_context),
             result.top_score,
             result.query_coverage,
         )
@@ -2667,7 +2716,7 @@ def should_process_message(
             retrieval_coverage=result.query_coverage,
         )
 
-    if not looks_like_direct_question(normalized) or not has_auto_reply_keyword(normalized):
+    if not looks_like_direct_question(normalized) or not has_auto_reply_keyword(query_text):
         decision = consider_chat_reply(
             normalized,
             group_id=group_id,
@@ -2683,7 +2732,7 @@ def should_process_message(
         decision.retrieval_coverage = result.query_coverage
         return decision
 
-    if has_auto_reply_keyword(normalized):
+    if has_auto_reply_keyword(query_text):
         print("Auto reply: matched Squad keyword", normalized)
         return ProcessingDecision(
             True,
@@ -2694,7 +2743,7 @@ def should_process_message(
             followup_of,
             followup_scope,
             "knowledge",
-            (),
+            tuple(chat_context),
             result.top_score,
             result.query_coverage,
         )
@@ -2715,7 +2764,7 @@ def should_process_message(
         followup_of,
         followup_scope,
         "knowledge",
-        (),
+        tuple(chat_context),
         result.top_score,
         result.query_coverage,
     )
@@ -2925,6 +2974,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     reply_message_id=str(item.get("reply_message_id") or ""),
                     reply_target_user_id=str(item.get("reply_target_user_id") or ""),
                     mention_user_id=mention_user_id,
+                    answer=answer,
                     event_time=item.get("time"),
                 )
                 remember_conversation(
@@ -2973,6 +3023,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 reply_message_id=str(item.get("reply_message_id") or ""),
                 reply_target_user_id=str(item.get("reply_target_user_id") or ""),
                 mention_user_id=mention_user_id,
+                answer=answer,
                 event_time=item.get("time"),
             )
             remember_conversation(

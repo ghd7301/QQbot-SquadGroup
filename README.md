@@ -29,6 +29,7 @@
 - 被 @ 的追问默认保留 180 秒上下文。
 - QQ 显式回复机器人时按机器人消息 ID 精确加载原问题、原回答和知识来源；对话轮次写入 SQLite，重启后仍可恢复。
 - 没有显式回复链时，只在消息含有明确承接词且话题不冲突时关联上一轮，不再把所有短句都当成追问。
+- 知识回答会用近期群聊解析“那个、这个”等指代；首次检索较弱时才语义改写独立检索问题，群聊不直接作为事实依据。
 - 支持本地 `/ask` 调试接口。
 - 支持 `/health` 健康检查。
 - 支持群内 `重载知识库` 或 `reload` 重载知识库。
@@ -95,6 +96,10 @@ MESSAGE_FRAGMENT_SEMANTIC_ENABLED=true
 MESSAGE_FRAGMENT_SEMANTIC_MODEL=
 MESSAGE_FRAGMENT_SEMANTIC_TIMEOUT_SECONDS=8
 MESSAGE_FRAGMENT_SEMANTIC_MIN_CONFIDENCE=0.75
+CONTEXTUAL_QUERY_ENABLED=true
+CONTEXTUAL_QUERY_MODEL=
+CONTEXTUAL_QUERY_TIMEOUT_SECONDS=8
+CONTEXTUAL_QUERY_MIN_CONFIDENCE=0.75
 SAME_TOPIC_COOLDOWN_SECONDS=60
 FOLLOWUP_SAME_USER_SECONDS=120
 FOLLOWUP_GROUP_SECONDS=30
