@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.squad.qqbot.mvp</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/run.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPYCACHEPREFIX</key>
+    <string>/private/tmp/codex_pycache</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/launchd.err.log</string>
+</dict>
+</plist>
