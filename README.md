@@ -49,6 +49,12 @@ squad-qqbot-mvp/
     onebot.py       OneBot 消息处理
     server.py       HTTP 服务和群消息队列
   knowledge/        Squad 知识库
+  scripts/
+    com.squad.qqbot.mvp.plist   launchd 配置
+    sync_runtime.sh             同步源码到运行副本
+    rotate_logs.sh              日志轮转
+    replay_chat_audit.py        回放审计日志中的闲聊场景
+  tests/            单元测试
   work/             运行调试文件和消息审计日志
   .env.example      配置模板
   run.py            启动入口
@@ -78,6 +84,7 @@ ONEBOT_ACCESS_TOKEN=
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-chat
 LLM_API_KEY=你的DeepSeek或MiMoKey
+CHAT_MODEL=
 
 KNOWLEDGE_DIR=knowledge
 MAX_CONTEXT_CHARS=4500
@@ -131,7 +138,10 @@ DRY_RUN=false
 ```text
 LLM_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 LLM_MODEL=mimo-v2.5-pro
+CHAT_MODEL=mimo-v2.5
 ```
+
+`CHAT_MODEL` 只控制最终闲聊回复，留空时复用 `LLM_MODEL`。上面的 MiMo 配置会让知识问答、追问改写和场景分析继续使用 `mimo-v2.5-pro`，最终闲聊使用 `mimo-v2.5`。
 
 不要把 `.env` 里的真实 API Key 发到聊天、截图或公开仓库里。
 
@@ -178,6 +188,26 @@ curl -X POST http://127.0.0.1:8088/ask \
 ```bash
 python3 test_local.py
 ```
+
+## 回放审计日志
+
+`scripts/replay_chat_audit.py` 可以回放审计日志中的闲聊场景，用于调试提示词效果，不会发送任何 QQ 消息。
+
+```bash
+# 回放最近 5 条闲聊记录
+python3 scripts/replay_chat_audit.py
+
+# 回放包含特定关键词的记录
+python3 scripts/replay_chat_audit.py --contains "试卷" --limit 10
+
+# 指定模型回放（对比不同模型效果）
+python3 scripts/replay_chat_audit.py --model mimo-v2.5 --limit 10
+
+# 输出到文件
+python3 scripts/replay_chat_audit.py --limit 20 --output replay_result.jsonl
+```
+
+输出每行是一条 JSON，包含原问题、原回答、回放回答和延迟，方便对比优化效果。
 
 ## 接入 QQ
 
@@ -288,9 +318,7 @@ reload
 
 ## 后续建议
 
-- 增加 ST 服务器与社群规则知识库。
 - 根据审计日志继续校准强命中阈值和闲聊接话风格。
-- 增加审计日志轮转，避免长期运行后日志持续增长。
 - 后续可升级 SQLite FTS、embedding 或向量库检索。
 
 ## 公开资料参考

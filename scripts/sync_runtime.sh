@@ -6,6 +6,7 @@ RUNTIME_DIR="/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp"
 
 mkdir -p "$RUNTIME_DIR/work"
 rsync -a \
+  --exclude ".git/" \
   --exclude "work/" \
   --exclude "__pycache__/" \
   --exclude "*.pyc" \

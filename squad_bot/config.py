@@ -37,6 +37,7 @@ class Settings:
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "deepseek-chat")
+    chat_model: str = os.getenv("CHAT_MODEL") or os.getenv("LLM_MODEL", "deepseek-chat")
     knowledge_dir: str = os.getenv("KNOWLEDGE_DIR", "knowledge")
     max_context_chars: int = int(os.getenv("MAX_CONTEXT_CHARS", "4500"))
     knowledge_strong_min_score: float = float(os.getenv("KNOWLEDGE_STRONG_MIN_SCORE", "0.18"))

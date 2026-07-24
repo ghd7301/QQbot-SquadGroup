@@ -29,6 +29,7 @@ def routing_settings(**overrides):
         "llm_base_url": "https://example.invalid",
         "llm_api_key": "test-key",
         "llm_model": "test-model",
+        "chat_model": "test-chat-model",
         "chat_reply_cooldown_seconds": 180,
         "max_chat_replies_per_hour": 8,
         "chat_allowed_group_ids": (),
@@ -502,6 +503,27 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(answer, "对，就是 TeamSpeak 3。")
         self.assertEqual(ask.call_args.kwargs["chat_context"], decision.chat_context)
 
+    def test_chat_answer_for_decision_uses_dedicated_chat_model(self) -> None:
+        configured = routing_settings(chat_model="mimo-v2.5")
+        decision = server.ProcessingDecision(
+            True,
+            "test",
+            reply_mode="chat",
+            chat_context=("群友A：今天周四",),
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "answer_chat", return_value="V你五十？") as answer_chat,
+        ):
+            answer = server.answer_for_decision(
+                "一个糟糕的数字",
+                decision,
+                "一个糟糕的数字",
+            )
+
+        self.assertEqual(answer, "V你五十？")
+        self.assertEqual(answer_chat.call_args.kwargs["model"], "mimo-v2.5")
+
     def test_contextual_question_rewriter_parses_json(self) -> None:
         with patch.object(
             llm,
@@ -816,6 +838,7 @@ class ChatStateTests(unittest.TestCase):
                     reply_mode="chat",
                     chat_context=("群友A：最近在刷战甲", "群友B：材料刷累了"),
                     answer="刷到后面确实容易犯困，材料循环太重复了。",
+                    model_name="mimo-v2.5",
                 )
 
             record = json.loads(audit_path.read_text(encoding="utf-8"))
@@ -825,6 +848,7 @@ class ChatStateTests(unittest.TestCase):
             )
             self.assertNotIn("123", "".join(record["chat_context"]))
             self.assertEqual(record["answer"], "刷到后面确实容易犯困，材料循环太重复了。")
+            self.assertEqual(record["model"], "mimo-v2.5")
 
     def test_celebration_dedup_is_per_target_and_event_kind(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
