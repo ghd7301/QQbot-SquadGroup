@@ -80,6 +80,45 @@ class Settings:
     contextual_query_min_confidence: float = float(
         os.getenv("CONTEXTUAL_QUERY_MIN_CONFIDENCE", "0.75")
     )
+    semantic_planner_enabled: bool = os.getenv(
+        "SEMANTIC_PLANNER_ENABLED", "true"
+    ).lower() in {"1", "true", "yes", "on"}
+    semantic_planner_model: str = os.getenv("SEMANTIC_PLANNER_MODEL") or os.getenv(
+        "CHAT_MODEL"
+    ) or os.getenv("LLM_MODEL", "deepseek-chat")
+    semantic_planner_timeout_seconds: int = int(
+        os.getenv("SEMANTIC_PLANNER_TIMEOUT_SECONDS", "15")
+    )
+    semantic_planner_min_confidence: float = float(
+        os.getenv("SEMANTIC_PLANNER_MIN_CONFIDENCE", "0.68")
+    )
+    chat_relevance_check_enabled: bool = os.getenv(
+        "CHAT_RELEVANCE_CHECK_ENABLED", "true"
+    ).lower() in {"1", "true", "yes", "on"}
+    chat_relevance_check_model: str = os.getenv("CHAT_RELEVANCE_CHECK_MODEL") or os.getenv(
+        "CHAT_MODEL"
+    ) or os.getenv("LLM_MODEL", "deepseek-chat")
+    chat_relevance_check_timeout_seconds: int = int(
+        os.getenv("CHAT_RELEVANCE_CHECK_TIMEOUT_SECONDS", "10")
+    )
+    final_reply_review_model: str = os.getenv("FINAL_REPLY_REVIEW_MODEL") or os.getenv(
+        "CHAT_MODEL"
+    ) or os.getenv("LLM_MODEL", "deepseek-chat")
+    final_reply_review_timeout_seconds: int = int(
+        os.getenv("FINAL_REPLY_REVIEW_TIMEOUT_SECONDS", "4")
+    )
+    mentioned_reply_total_timeout_seconds: int = int(
+        os.getenv("MENTIONED_REPLY_TOTAL_TIMEOUT_SECONDS", "15")
+    )
+    normal_reply_total_timeout_seconds: int = int(
+        os.getenv("NORMAL_REPLY_TOTAL_TIMEOUT_SECONDS", "15")
+    )
+    knowledge_generation_timeout_seconds: int = int(
+        os.getenv("KNOWLEDGE_GENERATION_TIMEOUT_SECONDS", "10")
+    )
+    chat_generation_timeout_seconds: int = int(
+        os.getenv("CHAT_GENERATION_TIMEOUT_SECONDS", "7")
+    )
     same_topic_cooldown_seconds: int = int(os.getenv("SAME_TOPIC_COOLDOWN_SECONDS", "60"))
     followup_same_user_seconds: int = int(
         os.getenv("FOLLOWUP_SAME_USER_SECONDS", os.getenv("FOLLOWUP_CONTEXT_SECONDS", "120"))
@@ -98,7 +137,9 @@ class Settings:
     chat_context_messages: int = int(os.getenv("CHAT_CONTEXT_MESSAGES", "12"))
     chat_reply_debounce_seconds: float = float(os.getenv("CHAT_REPLY_DEBOUNCE_SECONDS", "2"))
     chat_scene_enabled: bool = os.getenv("CHAT_SCENE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-    chat_scene_model: str = os.getenv("CHAT_SCENE_MODEL") or os.getenv("LLM_MODEL", "deepseek-chat")
+    chat_scene_model: str = os.getenv("CHAT_SCENE_MODEL") or os.getenv("CHAT_MODEL") or os.getenv(
+        "LLM_MODEL", "deepseek-chat"
+    )
     chat_scene_debounce_seconds: float = float(os.getenv("CHAT_SCENE_DEBOUNCE_SECONDS", "3"))
     chat_scene_update_interval_seconds: float = float(os.getenv("CHAT_SCENE_UPDATE_INTERVAL_SECONDS", "30"))
     chat_scene_stale_seconds: int = int(os.getenv("CHAT_SCENE_STALE_SECONDS", "600"))

@@ -81,16 +81,49 @@ class PendingQueueTests(unittest.TestCase):
         self.assertTrue(is_message_too_old(now - 301, True, now=now))
 
     def test_restored_admin_commands_are_not_replayed(self) -> None:
-        self.assertTrue(
-            is_restored_admin_command(
-                {"_restored": True, "question": "重载知识库"}
+        with patch.object(
+            server,
+            "settings",
+            SimpleNamespace(admin_qq_ids=("3466734955",)),
+        ):
+            self.assertTrue(
+                is_restored_admin_command(
+                    {
+                        "_restored": True,
+                        "question": "重载知识库",
+                        "user_id": "3466734955",
+                    }
+                )
             )
-        )
-        self.assertFalse(
-            is_restored_admin_command(
-                {"_restored": False, "question": "重载知识库"}
+            self.assertFalse(
+                is_restored_admin_command(
+                    {
+                        "_restored": True,
+                        "question": "重载知识库",
+                        "user_id": "10001",
+                        "sender_role": "owner",
+                    }
+                )
             )
-        )
+            self.assertFalse(
+                is_restored_admin_command(
+                    {
+                        "_restored": False,
+                        "question": "重载知识库",
+                        "user_id": "3466734955",
+                    }
+                )
+            )
+
+    def test_group_role_does_not_bypass_admin_whitelist(self) -> None:
+        with patch.object(
+            server,
+            "settings",
+            SimpleNamespace(admin_qq_ids=("3466734955",)),
+        ):
+            self.assertTrue(server.is_admin_user("3466734955", "member"))
+            self.assertFalse(server.is_admin_user("10001", "owner"))
+            self.assertFalse(server.is_admin_user("10002", "admin"))
 
 
 if __name__ == "__main__":

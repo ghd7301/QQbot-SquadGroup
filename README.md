@@ -2,7 +2,7 @@
 
 这是一个本地运行的《Squad / 战术小队》新兵问答 QQBot。
 
-它不是通用聊天机器人，而是挂在 QQ 群里的“Squad 新兵营教官”：只在白名单群里观察消息，尽量只回答玩法、兵种、服务器、语音软件和故障排查相关的问题。
+它是挂在 QQ 群里的“Squad 新兵营教官”：优先回答玩法、兵种、服务器、语音软件和故障排查问题，也能在白名单群里像普通群友一样低频参与闲聊。
 
 ## 当前功能
 
@@ -15,6 +15,11 @@
 - 被 @ 的问题未命中知识库时，由独立的通用模型提示词谨慎兜底。
 - 可在白名单群里低频参与闲聊，使用可配置的近期消息和回复关系作为上下文。
 - 按群异步维护滚动场景快照，提炼当前话题、指代关系和接话位置，不阻塞当前回复。
+- 使用统一语义规划区分普通闲聊、针对机器人的调侃、人格控制尝试、第三方攻击请求、真实批评和恶意辱骂，不依赖固定触发词表。
+- 群聊和机器人旧回复不能改变长期人格；轻度调侃可以等强度回一句，真实批评正常回应，第三方攻击请求直接挡回。
+- 所有模型回复发送前统一检查人格、虚构经历和话题时效；新消息改变原问题时最多结合最新上下文重生成一次。
+- 主动闲聊在语义规划失败时不回复；被 @ 的兜底在规划失败时不读取整段原始群聊，避免上下文注入。
+- 被 @ 回复和普通回复分别使用 15 秒端到端预算，模型调用不重试；超时或限流等待超过预算时放弃陈旧回复。
 - @/管理消息、普通问答和闲聊分别由独立 worker 处理，闲聊不会阻塞 @ 消息。
 - 调用 DeepSeek / MiMo 等 OpenAI 兼容接口生成回答。
 - 回答不展示参考资料，不使用 Markdown 格式。
@@ -75,7 +80,7 @@ cp .env.example .env
 BOT_HOST=127.0.0.1
 BOT_PORT=8088
 BOT_QQ=你的机器人QQ号
-ADMIN_QQ_IDS=管理员QQ号1,管理员QQ号2
+ADMIN_QQ_IDS=3466734955
 ALLOWED_GROUP_IDS=群号1,群号2
 
 ONEBOT_API_URL=http://127.0.0.1:3000
@@ -103,6 +108,19 @@ MESSAGE_FRAGMENT_SEMANTIC_ENABLED=true
 MESSAGE_FRAGMENT_SEMANTIC_MODEL=
 MESSAGE_FRAGMENT_SEMANTIC_TIMEOUT_SECONDS=8
 MESSAGE_FRAGMENT_SEMANTIC_MIN_CONFIDENCE=0.75
+SEMANTIC_PLANNER_ENABLED=true
+SEMANTIC_PLANNER_MODEL=
+SEMANTIC_PLANNER_TIMEOUT_SECONDS=4
+SEMANTIC_PLANNER_MIN_CONFIDENCE=0.68
+CHAT_RELEVANCE_CHECK_ENABLED=true
+CHAT_RELEVANCE_CHECK_MODEL=
+CHAT_RELEVANCE_CHECK_TIMEOUT_SECONDS=3
+FINAL_REPLY_REVIEW_MODEL=
+FINAL_REPLY_REVIEW_TIMEOUT_SECONDS=4
+MENTIONED_REPLY_TOTAL_TIMEOUT_SECONDS=15
+NORMAL_REPLY_TOTAL_TIMEOUT_SECONDS=15
+KNOWLEDGE_GENERATION_TIMEOUT_SECONDS=10
+CHAT_GENERATION_TIMEOUT_SECONDS=7
 CONTEXTUAL_QUERY_ENABLED=true
 CONTEXTUAL_QUERY_MODEL=
 CONTEXTUAL_QUERY_TIMEOUT_SECONDS=8
@@ -141,7 +159,7 @@ LLM_MODEL=mimo-v2.5-pro
 CHAT_MODEL=mimo-v2.5
 ```
 
-`CHAT_MODEL` 只控制最终闲聊回复，留空时复用 `LLM_MODEL`。上面的 MiMo 配置会让知识问答、追问改写和场景分析继续使用 `mimo-v2.5-pro`，最终闲聊使用 `mimo-v2.5`。
+`CHAT_MODEL` 控制闲聊、语义规划和默认的发送前审查，留空时复用 `LLM_MODEL`。上面的 MiMo 配置会让知识问答使用 `mimo-v2.5-pro`，闲聊、规划和审查使用 `mimo-v2.5`。具体环节仍可用各自的 `*_MODEL` 配置覆盖。
 
 不要把 `.env` 里的真实 API Key 发到聊天、截图或公开仓库里。
 
@@ -229,7 +247,7 @@ API 地址：填到本项目 .env 的 ONEBOT_API_URL
 @机器人 HAB 和 FOB 有啥区别
 ```
 
-普通群消息不会因为提到关键词就必然回复。知识问答、未命中兜底和闲聊使用三套独立提示词。闲聊只在 `CHAT_ALLOWED_GROUP_IDS` 中低频触发，并过滤公告、链接、资料整理、任务安排、bot 元讨论和群友之间的定向对话。发给模型的近期群聊会把真实 QQ 号匿名化为“群友A、群友B”。场景快照在后台按群合并更新；生成回复时会同时看到快照和原始上下文，并以当前消息、引用关系和原始上下文为准。
+普通群消息不会因为提到关键词就必然回复。知识问答、未命中兜底和闲聊使用独立提示词，统一语义规划负责判断受众、意图、话题和相关上下文。闲聊只在 `CHAT_ALLOWED_GROUP_IDS` 中低频触发，并过滤公告、链接、资料整理、任务安排、bot 元讨论和群友之间的定向对话。发给模型的近期群聊会把真实 QQ 号匿名化为“群友A、群友B”。场景快照在后台按群合并更新；生成回复时会同时看到快照和原始上下文，并以当前消息、引用关系和原始上下文为准。模型生成后还会比较群上下文版本，决定发送、丢弃、轻量修正或最多重生成一次。
 
 ## 消息审计日志
 
@@ -286,7 +304,7 @@ reload
 
 ## 管理命令
 
-管理命令只允许群主、群管理员，或 `ADMIN_QQ_IDS` 里的 QQ 执行。管理员可以在群里发：
+管理命令只会对 `ADMIN_QQ_IDS` 白名单里的 QQ 进行识别。群主或群管理员身份不会自动获得权限；非白名单用户发送相同文本时，按普通群消息处理。
 
 ```text
 重载知识库

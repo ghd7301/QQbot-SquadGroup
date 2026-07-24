@@ -14,13 +14,17 @@ from urllib.parse import parse_qs
 from .config import settings
 from .knowledge import KnowledgeBase
 from .llm import (
+    MessagePlan,
     analyze_chat_scene,
     answer_chat,
     ask_fallback_llm,
     ask_llm,
     classify_bot_fragment_prefix,
     is_chat_no_reply,
+    is_provider_refusal_text,
     normalize_model_answer,
+    plan_group_message,
+    review_candidate_reply,
     rewrite_contextual_question,
     should_auto_reply,
     should_reply_to_chat,
@@ -61,6 +65,8 @@ group_chat_scenes: dict[int, "GroupChatScene"] = {}
 chat_scene_requested_sequence: dict[int, int] = {}
 chat_scene_pending_messages: dict[int, int] = {}
 chat_scene_running: set[int] = set()
+hostile_reply_lock = threading.Lock()
+hostile_reply_history: dict[tuple[int, str], list[float]] = {}
 fragment_condition = threading.Condition()
 group_fragment_buffers: dict[int, "MessageFragmentBuffer"] = {}
 ready_fragment_buffers: list["MessageFragmentBuffer"] = []
@@ -79,6 +85,12 @@ class ProcessingDecision:
     chat_context: tuple[str, ...] = ()
     retrieval_score: float = 0.0
     retrieval_coverage: float = 0.0
+    semantic_intent: str = ""
+    semantic_topic: str = ""
+    implicit_meaning: str = ""
+    capability: str = "none"
+    draft_reply: str = ""
+    semantic_confidence: float = 0.0
 
 
 @dataclass
@@ -766,8 +778,17 @@ def write_message_audit(
     scene_context: str = "",
     answer: str = "",
     mention_user_id: str = "",
+    semantic_intent: str = "",
+    semantic_topic: str = "",
+    implicit_meaning: str = "",
+    capability: str = "none",
+    semantic_confidence: float = 0.0,
     event_time=None,
 ) -> None:
+    try:
+        total_latency_ms = max(0, int((time.time() - float(event_time)) * 1000))
+    except (TypeError, ValueError):
+        total_latency_ms = 0
     record = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "event_time": event_time,
@@ -785,6 +806,7 @@ def write_message_audit(
         "retrieval_score": round(float(retrieval_score), 4),
         "retrieval_coverage": round(float(retrieval_coverage), 4),
         "model_latency_ms": int(model_latency_ms),
+        "total_latency_ms": total_latency_ms,
         "model": model_name,
         "reply_message_id": str(reply_message_id),
         "reply_target_user_id": str(reply_target_user_id),
@@ -792,6 +814,11 @@ def write_message_audit(
         "scene_context": scene_context,
         "answer": answer,
         "mention_user_id": str(mention_user_id or ""),
+        "semantic_intent": semantic_intent,
+        "semantic_topic": semantic_topic,
+        "implicit_meaning": implicit_meaning,
+        "capability": capability,
+        "semantic_confidence": round(float(semantic_confidence), 4),
     }
     log_path = Path(settings.message_audit_log)
     try:
@@ -839,13 +866,16 @@ def get_admin_command(message: str) -> str:
 
 
 def is_restored_admin_command(item: dict) -> bool:
-    return bool(item.get("_restored") and get_admin_command(str(item.get("question", ""))))
+    return bool(
+        item.get("_restored")
+        and is_admin_user(item.get("user_id"), item.get("sender_role", ""))
+        and get_admin_command(str(item.get("question", "")))
+    )
 
 
 def is_admin_user(user_id, sender_role: str = "") -> bool:
-    if str(sender_role).lower() in {"owner", "admin"}:
-        return True
-    return bool(settings.admin_qq_ids) and str(user_id) in settings.admin_qq_ids
+    admin_ids = tuple(getattr(settings, "admin_qq_ids", ()))
+    return bool(admin_ids) and str(user_id) in admin_ids
 
 
 def recent_audit_entries(limit: int = 5) -> list[dict]:
@@ -1426,6 +1456,124 @@ def group_chat_has_newer_user_message(group_id: int, sequence: int) -> bool:
         )
 
 
+def latest_group_user_sequence(group_id: int) -> int:
+    with chat_history_lock:
+        return max(
+            (
+                item.sequence
+                for item in group_chat_history.get(group_id, ())
+                if item.user_id != settings.bot_qq
+            ),
+            default=0,
+        )
+
+
+def reply_deadline(event_time, mentioned: bool) -> float:
+    total = (
+        getattr(settings, "mentioned_reply_total_timeout_seconds", 15)
+        if mentioned
+        else getattr(settings, "normal_reply_total_timeout_seconds", 10)
+    )
+    try:
+        elapsed = max(0.0, time.time() - float(event_time))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    return time.monotonic() + max(0.0, float(total) - elapsed)
+
+
+def remaining_reply_timeout(
+    deadline: float,
+    *,
+    cap: int,
+    reserve: int = 0,
+) -> int:
+    remaining = deadline - time.monotonic() - max(0, reserve)
+    if remaining < 1:
+        return 0
+    return max(1, min(int(cap), int(remaining)))
+
+
+def review_and_refresh_answer(
+    *,
+    question: str,
+    answer: str,
+    decision: ProcessingDecision,
+    group_id: int,
+    mentioned: bool,
+    admin: bool,
+    deadline: float,
+) -> tuple[str, str, int]:
+    original_context = tuple(decision.chat_context)
+    candidate = answer
+    regenerated = False
+
+    while True:
+        latest_revision = latest_group_user_sequence(group_id)
+        latest_context = recent_group_chat_context(group_id, now=time.time())
+        review_timeout = remaining_reply_timeout(
+            deadline,
+            cap=getattr(settings, "final_reply_review_timeout_seconds", 4),
+        )
+        if not review_timeout:
+            return "", "reply deadline exhausted before final review", latest_revision
+        review = review_candidate_reply(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=getattr(settings, "final_reply_review_model", settings.chat_model),
+            original_message=question,
+            candidate_reply=candidate,
+            original_context=original_context,
+            latest_context=latest_context,
+            reply_mode=decision.reply_mode,
+            mentioned=mentioned,
+            topic_summary=decision.semantic_topic,
+            allow_regenerate=not regenerated,
+            timeout=review_timeout,
+        )
+        if not review or review.confidence < 0.6:
+            return "", "final review unavailable or low confidence", latest_revision
+        if review.action == "drop":
+            return "", f"final review dropped: {review.reason}", latest_revision
+        if review.action == "revise":
+            candidate = finalize_model_answer(
+                review.revised_reply,
+                unsolicited=decision.reply_mode == "chat",
+            )
+            if not candidate:
+                return "", "final review produced empty revision", latest_revision
+            return candidate, f"final review revised: {review.reason}", latest_revision
+        if review.action == "send":
+            return candidate, f"final review accepted: {review.reason}", latest_revision
+
+        regenerated = True
+        updated_question = review.updated_question
+        decision.chat_context = tuple(latest_context)
+        decision.effective_question = updated_question
+        decision.draft_reply = ""
+        reserve = getattr(settings, "final_reply_review_timeout_seconds", 4)
+        generation_cap = (
+            getattr(settings, "chat_generation_timeout_seconds", 7)
+            if decision.reply_mode == "chat"
+            else getattr(settings, "knowledge_generation_timeout_seconds", 10)
+        )
+        generation_timeout = remaining_reply_timeout(
+            deadline,
+            cap=generation_cap,
+            reserve=reserve,
+        )
+        if not generation_timeout:
+            return "", "reply deadline exhausted before regeneration", latest_revision
+        candidate = answer_for_decision(
+            updated_question,
+            decision,
+            updated_question,
+            admin=admin,
+            timeout=generation_timeout,
+        )
+        if not candidate:
+            return "", "regeneration produced no answer", latest_revision
+
+
 def clear_chat_state() -> None:
     global chat_message_sequence
     with chat_history_lock:
@@ -1436,7 +1584,35 @@ def clear_chat_state() -> None:
         chat_scene_requested_sequence.clear()
         chat_scene_pending_messages.clear()
         chat_scene_running.clear()
+    with hostile_reply_lock:
+        hostile_reply_history.clear()
     clear_fragment_state()
+
+
+SEMANTIC_CHAT_INTENTS = {
+    "chat",
+    "normal_chat",
+    "banter_at_bot",
+    "control_attempt",
+    "third_party_attack",
+    "genuine_criticism",
+    "hostile_abuse",
+}
+
+
+def allow_hostile_reply(group_id: int, user_id: str, *, now: float | None = None) -> bool:
+    current_time = time.time() if now is None else now
+    key = (group_id, str(user_id or ""))
+    with hostile_reply_lock:
+        recent = [
+            timestamp
+            for timestamp in hostile_reply_history.get(key, ())
+            if current_time - timestamp < 600
+        ]
+        allowed = len(recent) < 2
+        recent.append(current_time)
+        hostile_reply_history[key] = recent
+        return allowed
 
 
 def save_chat_history(path: str | Path | None = None) -> None:
@@ -1732,6 +1908,87 @@ def contextual_retrieval_question(
     )
 
 
+def semantic_plan_for_message(
+    question: str,
+    chat_context: Sequence[str],
+    *,
+    mentioned: bool,
+    mentions_other: bool,
+    reply_target_user_id: str = "",
+    timeout: int | None = None,
+) -> MessagePlan | None:
+    if not getattr(settings, "semantic_planner_enabled", False):
+        return None
+    if reply_target_user_id == settings.bot_qq:
+        reply_target = "bot"
+    elif reply_target_user_id:
+        reply_target = "member"
+    else:
+        reply_target = "none"
+    return plan_group_message(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=getattr(settings, "semantic_planner_model", settings.llm_model),
+        message=question,
+        context=tuple(chat_context),
+        mentioned=mentioned,
+        mentions_other=mentions_other,
+        reply_target=reply_target,
+        timeout=timeout or getattr(settings, "semantic_planner_timeout_seconds", 4),
+    )
+
+
+def semantic_plan_is_usable(plan: MessagePlan | None) -> bool:
+    return bool(
+        plan
+        and plan.confidence
+        >= getattr(settings, "semantic_planner_min_confidence", 0.68)
+    )
+
+
+def context_selected_by_plan(
+    chat_context: Sequence[str],
+    plan: MessagePlan | None,
+) -> tuple[str, ...]:
+    if not plan or not plan.relevant_context_indices:
+        return tuple(chat_context)
+    selected = tuple(
+        chat_context[index - 1]
+        for index in plan.relevant_context_indices
+        if 1 <= index <= len(chat_context)
+    )
+    return selected or tuple(chat_context)
+
+
+def semantic_context_for_decision(decision: ProcessingDecision) -> str:
+    parts = []
+    if decision.semantic_topic:
+        parts.append(f"相关话题：{decision.semantic_topic}")
+    if decision.implicit_meaning:
+        parts.append(f"可能的非字面含义：{decision.implicit_meaning}")
+    return "\n".join(parts)
+
+
+def answer_bot_meta(capability: str, *, admin: bool) -> str:
+    knowledge_path = Path(settings.knowledge_dir)
+    files = sorted(path.name for path in knowledge_path.glob("*.md"))
+    if capability == "knowledge_files":
+        if not files:
+            return "当前没有发现可加载的知识库文件。"
+        return "当前加载的知识库文件有：" + "、".join(files)
+    if capability == "knowledge_status":
+        return f"知识库已加载，当前有 {len(files)} 个文件、{len(kb.chunks)} 个片段。"
+    if capability == "model_status":
+        return f"知识问答使用 {settings.llm_model}，闲聊使用 {settings.chat_model}。"
+    if capability in {"runtime_status", "health"}:
+        queued = message_queue.qsize() + normal_message_queue.qsize() + chat_queue.qsize()
+        base = f"服务正在运行，知识片段 {len(kb.chunks)} 个，队列 {queued} 条。"
+        if admin and capability == "runtime_status":
+            return base + f"运行目录是 {Path.cwd().resolve()}，知识库目录是 {knowledge_path.resolve()}。"
+        return base
+    return "可以查看知识库加载状态、知识库文件、当前模型和服务健康状态。"
+
+
 def finalize_model_answer(answer: str, *, unsolicited: bool = False) -> str:
     if is_model_error_answer(answer):
         if unsolicited:
@@ -1752,6 +2009,8 @@ def answer_question(
     retrieval_question: str | None = None,
     allow_fallback: bool = True,
     chat_context: Sequence[str] = (),
+    semantic_context: str = "",
+    timeout: int | None = None,
 ) -> str:
     if is_identity_question(question):
         return (
@@ -1774,6 +2033,8 @@ def answer_question(
                 model=settings.llm_model,
                 question=llm_question,
                 context=tuple(chat_context[-8:]),
+                semantic_context=semantic_context,
+                timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
             )
             return finalize_model_answer(answer)
         return "这个我库里暂时没有准确信息。你可以换个更具体的问法，或者问一下小队长和管理员；涉及服务器规则的话，还是以本服公告为准。"
@@ -1785,6 +2046,8 @@ def answer_question(
         question=llm_question,
         context=result.context,
         chat_context=tuple(chat_context[-8:]),
+        semantic_context=semantic_context,
+        timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
     )
     return finalize_model_answer(answer)
 
@@ -1793,8 +2056,19 @@ def answer_for_decision(
     question: str,
     decision: ProcessingDecision,
     generation_question: str,
+    *,
+    admin: bool = False,
+    timeout: int | None = None,
 ) -> str:
     llm_question = generation_question or decision.effective_question or question
+    semantic_context = semantic_context_for_decision(decision)
+    if decision.reply_mode == "bot_meta":
+        return answer_bot_meta(decision.capability, admin=admin)
+    if decision.draft_reply and decision.reply_mode in {"fallback", "chat"}:
+        return finalize_model_answer(
+            decision.draft_reply,
+            unsolicited=decision.reply_mode == "chat",
+        )
     if decision.reply_mode == "fallback":
         answer = ask_fallback_llm(
             base_url=settings.llm_base_url,
@@ -1802,6 +2076,8 @@ def answer_for_decision(
             model=settings.llm_model,
             question=llm_question,
             context=decision.chat_context,
+            semantic_context=semantic_context,
+            timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
         )
         return finalize_model_answer(answer)
     if decision.reply_mode == "chat":
@@ -1811,6 +2087,8 @@ def answer_for_decision(
             model=settings.chat_model,
             message=question,
             context=decision.chat_context,
+            semantic_context=semantic_context,
+            timeout=timeout or getattr(settings, "chat_generation_timeout_seconds", 7),
         )
         return finalize_model_answer(answer, unsolicited=True)
     return answer_question(
@@ -1819,11 +2097,13 @@ def answer_for_decision(
         retrieval_question=decision.effective_question or question,
         allow_fallback=False,
         chat_context=decision.chat_context,
+        semantic_context=semantic_context,
+        timeout=timeout,
     )
 
 
 def is_model_error_answer(answer: str) -> bool:
-    return answer.startswith(("模型接口", "还没有配置模型 API Key"))
+    return answer.startswith(("模型接口", "还没有配置模型 API Key")) or is_provider_refusal_text(answer)
 
 
 def next_sequence() -> int:
@@ -2333,7 +2613,10 @@ def submit_message_fragment(
     group_id = int(item["group_id"])
     audience = classify_fragment_audience(item)
     displaced: list[MessageFragmentBuffer] = []
-    is_admin_command = bool(get_admin_command(str(item.get("question") or "")))
+    is_admin_command = bool(
+        is_admin_user(item.get("user_id"), item.get("sender_role", ""))
+        and get_admin_command(str(item.get("question") or ""))
+    )
 
     with fragment_condition:
         current = group_fragment_buffers.get(group_id)
@@ -2456,7 +2739,12 @@ def is_event_too_old(event: dict) -> bool:
     return is_message_too_old(event.get("time"), mentioned)
 
 
-def acquire_reply_slot(*, block: bool = True, reserve_slots: int = 0) -> bool:
+def acquire_reply_slot(
+    *,
+    block: bool = True,
+    reserve_slots: int = 0,
+    deadline: float | None = None,
+) -> bool:
     while True:
         now = time.time()
         with rate_limit_lock:
@@ -2474,11 +2762,15 @@ def acquire_reply_slot(*, block: bool = True, reserve_slots: int = 0) -> bool:
                 if reply_timestamps
                 else 60
             )
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or sleep_for > remaining:
+                return False
         time.sleep(sleep_for)
 
 
-def wait_for_rate_limit() -> None:
-    acquire_reply_slot()
+def wait_for_rate_limit(deadline: float | None = None) -> bool:
+    return acquire_reply_slot(deadline=deadline)
 
 
 def consider_chat_reply(
@@ -2566,13 +2858,152 @@ def should_process_message(
     group_id: int = 0,
     chat_context: Sequence[str] = (),
     mentions_other: bool = False,
+    reply_target_user_id: str = "",
+    user_id: str = "",
+    sender_role: str = "",
+    planner_timeout: int | None = None,
 ) -> ProcessingDecision:
     if mentioned and is_identity_question(question):
         return ProcessingDecision(True, "mentioned identity request", reply_mode="identity")
 
     normalized = question.strip()
     query_text = effective_question or normalized
-    result = retrieve_knowledge(query_text, min(settings.max_context_chars, 1200))
+    initial_result = retrieve_knowledge(query_text, min(settings.max_context_chars, 1200))
+    initial_strong_match = is_strong_knowledge_match(
+        initial_result.top_score,
+        initial_result.query_coverage,
+    )
+    if mentioned and initial_strong_match:
+        return ProcessingDecision(
+            True,
+            "mentioned with strong knowledge context",
+            True,
+            tuple(initial_result.sources),
+            query_text,
+            followup_of,
+            followup_scope,
+            "knowledge",
+            tuple(chat_context),
+            initial_result.top_score,
+            initial_result.query_coverage,
+        )
+    plan = semantic_plan_for_message(
+        normalized,
+        chat_context,
+        mentioned=mentioned,
+        mentions_other=mentions_other,
+        reply_target_user_id=reply_target_user_id,
+        timeout=planner_timeout,
+    )
+    usable_plan = plan if semantic_plan_is_usable(plan) else None
+    if usable_plan:
+        chat_context = context_selected_by_plan(chat_context, usable_plan)
+        query_text = usable_plan.standalone_question or query_text
+        if usable_plan.audience == "member" and not mentioned:
+            return ProcessingDecision(
+                False,
+                "semantic plan: directed at another member",
+                chat_context=tuple(chat_context),
+                semantic_intent=usable_plan.intent,
+                semantic_topic=usable_plan.topic_summary,
+                implicit_meaning=usable_plan.implicit_meaning,
+                capability=usable_plan.capability,
+                semantic_confidence=usable_plan.confidence,
+            )
+        if usable_plan.intent == "bot_meta":
+            if mentioned or usable_plan.audience == "bot":
+                return ProcessingDecision(
+                    True,
+                    "semantic plan: bot capability query",
+                    effective_question=query_text,
+                    reply_mode="bot_meta",
+                    chat_context=tuple(chat_context),
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    capability=usable_plan.capability,
+                    semantic_confidence=usable_plan.confidence,
+                )
+            return ProcessingDecision(False, "semantic plan: bot meta not directed at bot")
+        if usable_plan.intent == "admin":
+            return ProcessingDecision(
+                False,
+                "semantic plan: maintenance action requires explicit admin command",
+                semantic_intent=usable_plan.intent,
+                semantic_confidence=usable_plan.confidence,
+            )
+        if usable_plan.intent in SEMANTIC_CHAT_INTENTS:
+            if (
+                usable_plan.intent == "hostile_abuse"
+                and not allow_hostile_reply(group_id, user_id)
+            ):
+                return ProcessingDecision(
+                    False,
+                    "semantic plan: repeated hostile abuse ignored",
+                    reply_mode="chat",
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    semantic_confidence=usable_plan.confidence,
+                )
+            if mentioned:
+                return ProcessingDecision(
+                    True,
+                    f"semantic plan: mentioned {usable_plan.intent}",
+                    effective_question=query_text,
+                    reply_mode="fallback",
+                    chat_context=tuple(chat_context),
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    draft_reply=usable_plan.draft_reply,
+                    semantic_confidence=usable_plan.confidence,
+                )
+            quota_reason = chat_reply_quota_reason(group_id)
+            chat_allowed = (
+                auto_reply_enabled
+                and settings.chat_reply_enabled
+                and (
+                    not settings.chat_allowed_group_ids
+                    or str(group_id) in settings.chat_allowed_group_ids
+                )
+            )
+            if usable_plan.reply_worthy and chat_allowed and not quota_reason:
+                return ProcessingDecision(
+                    True,
+                    "semantic plan: chat candidate",
+                    effective_question=query_text,
+                    reply_mode="chat",
+                    chat_context=tuple(chat_context),
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    draft_reply=usable_plan.draft_reply,
+                    semantic_confidence=usable_plan.confidence,
+                )
+            return ProcessingDecision(
+                False,
+                quota_reason or "semantic plan: no natural chat entry",
+                reply_mode="chat",
+                chat_context=tuple(chat_context),
+                semantic_intent=usable_plan.intent,
+                semantic_topic=usable_plan.topic_summary,
+                implicit_meaning=usable_plan.implicit_meaning,
+                draft_reply=usable_plan.draft_reply,
+                semantic_confidence=usable_plan.confidence,
+            )
+        if usable_plan.intent == "action" and not mentioned:
+            return ProcessingDecision(
+                False,
+                "semantic plan: requires real-world participation",
+                semantic_intent=usable_plan.intent,
+                semantic_topic=usable_plan.topic_summary,
+                semantic_confidence=usable_plan.confidence,
+            )
+    result = (
+        initial_result
+        if query_text == (effective_question or normalized)
+        else retrieve_knowledge(query_text, min(settings.max_context_chars, 1200))
+    )
     context = result.context
     sources = result.sources
     strong_match = is_strong_knowledge_match(
@@ -2580,7 +3011,8 @@ def should_process_message(
         result.query_coverage,
     )
     if (
-        not strong_match
+        not usable_plan
+        and not strong_match
         and chat_context
         and (mentioned or looks_like_direct_question(normalized))
     ):
@@ -2608,6 +3040,20 @@ def should_process_message(
                     sources = result.sources
                     strong_match = candidate_is_strong
     if not context or not strong_match:
+        if (
+            not usable_plan
+            and not mentioned
+            and getattr(settings, "semantic_planner_enabled", False)
+        ):
+            return ProcessingDecision(
+                False,
+                "semantic planner unavailable; unsolicited reply fails closed",
+                has_context=bool(context),
+                sources=tuple(sources),
+                effective_question=query_text,
+                retrieval_score=result.top_score,
+                retrieval_coverage=result.query_coverage,
+            )
         fallback_allowed = settings.llm_fallback_enabled and (
             mentioned or not settings.fallback_only_when_mentioned
         )
@@ -2629,7 +3075,12 @@ def should_process_message(
                 reply_mode="fallback",
                 retrieval_score=result.top_score,
                 retrieval_coverage=result.query_coverage,
-                chat_context=tuple(chat_context),
+                chat_context=tuple(chat_context) if usable_plan else (),
+                semantic_intent=usable_plan.intent if usable_plan else "",
+                semantic_topic=usable_plan.topic_summary if usable_plan else "",
+                implicit_meaning=usable_plan.implicit_meaning if usable_plan else "",
+                capability=usable_plan.capability if usable_plan else "none",
+                semantic_confidence=usable_plan.confidence if usable_plan else 0.0,
             )
 
         if mentioned:
@@ -2660,6 +3111,35 @@ def should_process_message(
         decision.retrieval_coverage = result.query_coverage
         return decision
 
+    if usable_plan and usable_plan.intent == "knowledge":
+        if mentioned or (auto_reply_enabled and usable_plan.reply_worthy):
+            return ProcessingDecision(
+                True,
+                "semantic plan: knowledge question",
+                True,
+                tuple(sources),
+                query_text,
+                followup_of,
+                followup_scope,
+                "knowledge",
+                tuple(chat_context),
+                result.top_score,
+                result.query_coverage,
+                semantic_intent=usable_plan.intent,
+                semantic_topic=usable_plan.topic_summary,
+                implicit_meaning=usable_plan.implicit_meaning,
+                capability=usable_plan.capability,
+                semantic_confidence=usable_plan.confidence,
+            )
+        return ProcessingDecision(
+            False,
+            "semantic plan: knowledge statement not requesting reply",
+            has_context=True,
+            sources=tuple(sources),
+            semantic_intent=usable_plan.intent,
+            semantic_confidence=usable_plan.confidence,
+        )
+
     if len(normalized) < 5 and not has_auto_reply_keyword(query_text) and not followup_of:
         print("Skip message: too short for auto reply", normalized)
         return ProcessingDecision(
@@ -2688,6 +3168,11 @@ def should_process_message(
             tuple(chat_context),
             result.top_score,
             result.query_coverage,
+            semantic_intent=usable_plan.intent if usable_plan else "",
+            semantic_topic=usable_plan.topic_summary if usable_plan else "",
+            implicit_meaning=usable_plan.implicit_meaning if usable_plan else "",
+            capability=usable_plan.capability if usable_plan else "none",
+            semantic_confidence=usable_plan.confidence if usable_plan else 0.0,
         )
 
     if not auto_reply_enabled:
@@ -2783,7 +3268,12 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             user_id = item.get("user_id")
             sender_role = item.get("sender_role", "")
             event_time = item.get("time")
-            command = get_admin_command(question)
+            deadline = reply_deadline(
+                event_time if event_time is not None else item.get("_pending_created_at"),
+                mentioned,
+            )
+            admin_user = is_admin_user(user_id, sender_role)
+            command = get_admin_command(question) if admin_user else ""
 
             if is_restored_admin_command(item):
                 print("Drop restored admin command", group_id, user_id, question)
@@ -2818,19 +3308,6 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 continue
 
             if command:
-                if not is_admin_user(user_id, sender_role):
-                    print("Skip admin command: user not allowed", group_id, user_id, question)
-                    write_message_audit(
-                        decision="skipped",
-                        reason="admin command denied",
-                        group_id=group_id,
-                        user_id=user_id,
-                        question=question,
-                        mentioned=mentioned,
-                        event_time=item.get("time"),
-                    )
-                    continue
-
                 answer = answer_admin_command(command)
                 if settings.dry_run:
                     print("Dry run admin answer:", group_id, answer)
@@ -2885,6 +3362,21 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             effective_question = build_effective_question(question, followup_match)
             generation_question = build_generation_question(question, followup_match)
             model_started = time.monotonic()
+            planner_timeout = remaining_reply_timeout(
+                deadline,
+                cap=getattr(settings, "semantic_planner_timeout_seconds", 4),
+            )
+            if not planner_timeout:
+                write_message_audit(
+                    decision="skipped",
+                    reason="reply deadline exhausted before routing",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    event_time=event_time,
+                )
+                continue
             decision = should_process_message(
                 question,
                 mentioned,
@@ -2894,6 +3386,10 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 group_id=group_id,
                 chat_context=tuple(item.get("chat_context") or ()),
                 mentions_other=bool(item.get("mentions_other")),
+                reply_target_user_id=str(item.get("reply_target_user_id") or ""),
+                user_id=str(user_id or ""),
+                sender_role=sender_role,
+                planner_timeout=planner_timeout,
             )
             if not decision.should_reply:
                 print("Skip message: model/router decided no reply", group_id, question)
@@ -2912,11 +3408,19 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     retrieval_score=decision.retrieval_score,
                     retrieval_coverage=decision.retrieval_coverage,
                     model_latency_ms=int((time.monotonic() - model_started) * 1000),
+                    semantic_intent=decision.semantic_intent,
+                    semantic_topic=decision.semantic_topic,
+                    implicit_meaning=decision.implicit_meaning,
+                    capability=decision.capability,
+                    semantic_confidence=decision.semantic_confidence,
                     event_time=item.get("time"),
                 )
                 continue
 
             if decision.reply_mode == "chat":
+                item["_routing_latency_ms"] = int(
+                    (time.monotonic() - model_started) * 1000
+                )
                 chat_queue.put((item, decision))
                 terminal = False
                 continue
@@ -2947,7 +3451,63 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
                 continue
 
-            answer = answer_for_decision(question, decision, generation_question)
+            if decision.reply_mode in {"bot_meta", "identity"}:
+                generation_timeout = 1 if time.monotonic() < deadline else 0
+            else:
+                review_reserve = getattr(settings, "final_reply_review_timeout_seconds", 4)
+                generation_timeout = remaining_reply_timeout(
+                    deadline,
+                    cap=getattr(settings, "knowledge_generation_timeout_seconds", 10),
+                    reserve=review_reserve,
+                )
+            if not generation_timeout:
+                write_message_audit(
+                    decision="skipped",
+                    reason="reply deadline exhausted before generation",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    reply_mode=decision.reply_mode,
+                    event_time=event_time,
+                )
+                continue
+            answer = answer_for_decision(
+                question,
+                decision,
+                decision.effective_question or generation_question,
+                admin=admin_user,
+                timeout=generation_timeout,
+            )
+            review_reason = ""
+            reviewed_revision = latest_group_user_sequence(group_id)
+            if decision.reply_mode not in {"bot_meta", "identity"}:
+                answer, review_reason, reviewed_revision = review_and_refresh_answer(
+                    question=question,
+                    answer=answer,
+                    decision=decision,
+                    group_id=group_id,
+                    mentioned=mentioned,
+                    admin=admin_user,
+                    deadline=deadline,
+                )
+                if not answer:
+                    write_message_audit(
+                        decision="skipped",
+                        reason=review_reason,
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        mentioned=mentioned,
+                        has_context=decision.has_context,
+                        sources=decision.sources,
+                        reply_mode=decision.reply_mode,
+                        semantic_intent=decision.semantic_intent,
+                        semantic_topic=decision.semantic_topic,
+                        semantic_confidence=decision.semantic_confidence,
+                        event_time=event_time,
+                    )
+                    continue
             model_latency_ms = int((time.monotonic() - model_started) * 1000)
             mention_user_id = response_mention_user_id(
                 mentioned=mentioned,
@@ -2977,6 +3537,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     reply_target_user_id=str(item.get("reply_target_user_id") or ""),
                     mention_user_id=mention_user_id,
                     answer=answer,
+                    semantic_intent=decision.semantic_intent,
+                    semantic_topic=decision.semantic_topic,
+                    implicit_meaning=decision.implicit_meaning,
+                    capability=decision.capability,
+                    semantic_confidence=decision.semantic_confidence,
                     event_time=item.get("time"),
                 )
                 remember_conversation(
@@ -2992,7 +3557,35 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     mark_topic_replied(group_id, current_topic_key)
                 continue
 
-            wait_for_rate_limit()
+            if not wait_for_rate_limit(deadline):
+                write_message_audit(
+                    decision="skipped",
+                    reason="reply deadline exhausted in global rate limit",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    reply_mode=decision.reply_mode,
+                    model_latency_ms=model_latency_ms,
+                    event_time=event_time,
+                )
+                continue
+            if (
+                decision.reply_mode not in {"bot_meta", "identity"}
+                and latest_group_user_sequence(group_id) > reviewed_revision
+            ):
+                write_message_audit(
+                    decision="skipped",
+                    reason="context changed after final review",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    reply_mode=decision.reply_mode,
+                    model_latency_ms=model_latency_ms,
+                    event_time=event_time,
+                )
+                continue
             bot_message_id = send_group_msg(
                 settings.onebot_api_url,
                 group_id,
@@ -3009,7 +3602,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             print("Answered group", group_id, "question", question)
             write_message_audit(
                 decision="answered",
-                reason=decision.reason,
+                reason=f"{decision.reason}; {review_reason}" if review_reason else decision.reason,
                 group_id=group_id,
                 user_id=user_id,
                 question=question,
@@ -3026,6 +3619,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 reply_target_user_id=str(item.get("reply_target_user_id") or ""),
                 mention_user_id=mention_user_id,
                 answer=answer,
+                semantic_intent=decision.semantic_intent,
+                semantic_topic=decision.semantic_topic,
+                implicit_meaning=decision.implicit_meaning,
+                capability=decision.capability,
+                semantic_confidence=decision.semantic_confidence,
                 event_time=item.get("time"),
             )
             remember_conversation(
@@ -3068,11 +3666,16 @@ def chat_worker() -> None:
         item, decision = chat_queue.get()
         terminal = True
         model_started = time.monotonic()
+        routing_latency_ms = int(item.get("_routing_latency_ms") or 0)
         try:
             question = str(item["question"])
             group_id = int(item["group_id"])
             user_id = item.get("user_id")
             event_time = item.get("time")
+            deadline = reply_deadline(
+                event_time if event_time is not None else item.get("_pending_created_at"),
+                False,
+            )
             social_event_kind = celebration_kind(question)
             mention_user_id = response_mention_user_id(
                 mentioned=bool(item.get("mentioned")),
@@ -3119,26 +3722,26 @@ def chat_worker() -> None:
 
             debounce_seconds = max(0.0, getattr(settings, "chat_reply_debounce_seconds", 2.0))
             if debounce_seconds:
+                if time.monotonic() + debounce_seconds >= deadline:
+                    write_message_audit(
+                        decision="skipped",
+                        reason="reply deadline exhausted during chat debounce",
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        reply_mode="chat",
+                        event_time=event_time,
+                    )
+                    continue
                 time.sleep(debounce_seconds)
             chat_sequence = int(item.get("chat_sequence") or 0)
-            if group_chat_has_newer_user_message(group_id, chat_sequence):
-                write_message_audit(
-                    decision="skipped",
-                    reason="chat candidate superseded",
-                    group_id=group_id,
-                    user_id=user_id,
-                    question=question,
-                    reply_mode="chat",
-                    chat_context=decision.chat_context,
-                    event_time=event_time,
-                )
-                continue
-
-            decision.chat_context = recent_group_chat_context(
+            latest_context = recent_group_chat_context(
                 group_id,
                 now=time.time(),
                 focus_sequence=chat_sequence,
             )
+            if not decision.semantic_topic:
+                decision.chat_context = latest_context
             scene_context = current_group_chat_scene(
                 group_id,
                 focus_sequence=chat_sequence,
@@ -3163,16 +3766,30 @@ def chat_worker() -> None:
                 )
                 continue
 
-            raw_answer = answer_chat(
-                base_url=settings.llm_base_url,
-                api_key=settings.llm_api_key,
-                model=settings.chat_model,
-                message=question,
-                context=decision.chat_context,
-                scene_context=scene_context,
+            generation_timeout = remaining_reply_timeout(
+                deadline,
+                cap=getattr(settings, "chat_generation_timeout_seconds", 7),
+                reserve=getattr(settings, "final_reply_review_timeout_seconds", 4),
             )
+            if decision.draft_reply:
+                raw_answer = decision.draft_reply
+            elif generation_timeout:
+                raw_answer = answer_chat(
+                    base_url=settings.llm_base_url,
+                    api_key=settings.llm_api_key,
+                    model=settings.chat_model,
+                    message=question,
+                    context=decision.chat_context,
+                    scene_context=scene_context,
+                    semantic_context=semantic_context_for_decision(decision),
+                    timeout=generation_timeout,
+                )
+            else:
+                raw_answer = ""
             if is_chat_no_reply(raw_answer):
-                model_latency_ms = int((time.monotonic() - model_started) * 1000)
+                model_latency_ms = routing_latency_ms + int(
+                    (time.monotonic() - model_started) * 1000
+                )
                 print("Chat generation: NO_REPLY", group_id, question)
                 write_message_audit(
                     decision="skipped",
@@ -3189,6 +3806,11 @@ def chat_worker() -> None:
                     model_name=settings.chat_model,
                     chat_context=decision.chat_context,
                     scene_context=scene_context,
+                    semantic_intent=decision.semantic_intent,
+                    semantic_topic=decision.semantic_topic,
+                    implicit_meaning=decision.implicit_meaning,
+                    capability=decision.capability,
+                    semantic_confidence=decision.semantic_confidence,
                     event_time=event_time,
                 )
                 continue
@@ -3199,8 +3821,10 @@ def chat_worker() -> None:
                 else "chat generation accepted"
             )
             answer = finalize_model_answer(raw_answer, unsolicited=True)
-            model_latency_ms = int((time.monotonic() - model_started) * 1000)
             if not answer:
+                model_latency_ms = routing_latency_ms + int(
+                    (time.monotonic() - model_started) * 1000
+                )
                 write_message_audit(
                     decision="skipped",
                     reason="chat generation failed",
@@ -3216,10 +3840,22 @@ def chat_worker() -> None:
                 )
                 continue
 
-            if group_chat_has_newer_user_message(group_id, chat_sequence):
+            answer, review_reason, reviewed_revision = review_and_refresh_answer(
+                question=question,
+                answer=answer,
+                decision=decision,
+                group_id=group_id,
+                mentioned=bool(item.get("mentioned")),
+                admin=False,
+                deadline=deadline,
+            )
+            model_latency_ms = routing_latency_ms + int(
+                (time.monotonic() - model_started) * 1000
+            )
+            if not answer:
                 write_message_audit(
                     decision="skipped",
-                    reason="chat superseded during generation",
+                    reason=review_reason,
                     group_id=group_id,
                     user_id=user_id,
                     question=question,
@@ -3228,6 +3864,10 @@ def chat_worker() -> None:
                     model_name=settings.chat_model,
                     chat_context=decision.chat_context,
                     scene_context=scene_context,
+                    semantic_intent=decision.semantic_intent,
+                    semantic_topic=decision.semantic_topic,
+                    implicit_meaning=decision.implicit_meaning,
+                    semantic_confidence=decision.semantic_confidence,
                     event_time=event_time,
                 )
                 continue
@@ -3297,6 +3937,19 @@ def chat_worker() -> None:
                     event_time=event_time,
                 )
                 continue
+            if latest_group_user_sequence(group_id) > reviewed_revision:
+                write_message_audit(
+                    decision="skipped",
+                    reason="context changed after final review",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    reply_mode="chat",
+                    model_latency_ms=model_latency_ms,
+                    model_name=settings.chat_model,
+                    event_time=event_time,
+                )
+                continue
 
             bot_message_id = send_group_msg(
                 settings.onebot_api_url,
@@ -3321,7 +3974,7 @@ def chat_worker() -> None:
             print("Answered chat", group_id, question)
             write_message_audit(
                 decision="answered",
-                reason=accepted_reason,
+                reason=f"{accepted_reason}; {review_reason}",
                 group_id=group_id,
                 user_id=user_id,
                 question=question,
@@ -3336,6 +3989,11 @@ def chat_worker() -> None:
                 scene_context=scene_context,
                 answer=answer,
                 mention_user_id=mention_user_id,
+                semantic_intent=decision.semantic_intent,
+                semantic_topic=decision.semantic_topic,
+                implicit_meaning=decision.implicit_meaning,
+                capability=decision.capability,
+                semantic_confidence=decision.semantic_confidence,
                 event_time=event_time,
             )
             remember_conversation(
