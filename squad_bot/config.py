@@ -24,6 +24,7 @@ class Settings:
     port: int = int(os.getenv("BOT_PORT", "8088"))
     command_prefix: str = os.getenv("COMMAND_PREFIX", "/问")
     bot_qq: str = os.getenv("BOT_QQ", "")
+    member_id_secret: str = os.getenv("MEMBER_ID_SECRET", "")
     admin_qq_ids: tuple[str, ...] = tuple(
         qq_id.strip()
         for qq_id in os.getenv("ADMIN_QQ_IDS", "").split(",")

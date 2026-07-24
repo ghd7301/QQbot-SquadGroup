@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -60,6 +63,8 @@ chat_history_lock = threading.Lock()
 group_chat_history: dict[int, list["GroupChatMessage"]] = {}
 chat_message_sequence = 0
 chat_reply_lock = threading.Lock()
+group_send_locks_lock = threading.Lock()
+group_send_locks: dict[int, threading.Lock] = {}
 chat_scene_lock = threading.Lock()
 group_chat_scenes: dict[int, "GroupChatScene"] = {}
 chat_scene_requested_sequence: dict[int, int] = {}
@@ -121,6 +126,9 @@ class GroupChatMessage:
     reply_message_id: str = ""
     reply_target_user_id: str = ""
     reply_text: str = ""
+    mentioned_bot: bool = False
+    mentioned_user_ids: tuple[str, ...] = ()
+    display_name: str = ""
 
 
 @dataclass
@@ -1181,6 +1189,9 @@ def record_group_chat_message(
     reply_message_id: str = "",
     reply_target_user_id: str = "",
     reply_text: str = "",
+    mentioned_bot: bool = False,
+    mentioned_user_ids: Sequence[str] = (),
+    display_name: str = "",
 ) -> int:
     global chat_message_sequence
     normalized = text.strip()
@@ -1203,6 +1214,9 @@ def record_group_chat_message(
             str(reply_message_id or ""),
             str(reply_target_user_id or ""),
             str(reply_text or "").strip(),
+            bool(mentioned_bot),
+            tuple(str(value) for value in mentioned_user_ids if str(value).strip()),
+            str(display_name or "").strip(),
         )
         history = group_chat_history.setdefault(group_id, [])
         history.append(entry)
@@ -1253,6 +1267,65 @@ def resolve_reply_message_context(
     return "", text
 
 
+def stable_member_id(group_id: int, user_id: str) -> str:
+    user_key = str(user_id or "").strip()
+    if user_key == settings.bot_qq:
+        return "bot"
+    if not user_key:
+        return "unknown_member"
+    secret = (
+        getattr(settings, "member_id_secret", "")
+        or getattr(settings, "onebot_access_token", "")
+        or settings.bot_qq
+        or "local-member-id"
+    )
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        f"{group_id}:{user_key}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:10]
+    return f"member_{digest}"
+
+
+def _context_message_payload(
+    group_id: int,
+    item: GroupChatMessage,
+    *,
+    current: bool,
+) -> dict:
+    speaker_id = stable_member_id(group_id, item.user_id)
+    payload: dict = {
+        "current": current,
+        "message_id": item.message_id,
+        "speaker": {
+            "id": speaker_id,
+            "role": "bot" if speaker_id == "bot" else "member",
+            "display_name": (
+                item.display_name
+                if speaker_id != "bot"
+                else "机器人"
+            ),
+        },
+        "text": item.text,
+        "mentions": [
+            stable_member_id(group_id, user_id)
+            for user_id in item.mentioned_user_ids
+        ],
+        "mentions_bot": item.mentioned_bot,
+    }
+    if item.reply_message_id:
+        target_id = stable_member_id(group_id, item.reply_target_user_id)
+        payload["reply_to"] = {
+            "message_id": item.reply_message_id,
+            "speaker_id": target_id,
+            "speaker_role": "bot" if target_id == "bot" else "member",
+            "quoted_text": item.reply_text,
+        }
+    else:
+        payload["reply_to"] = None
+    return payload
+
+
 def recent_group_chat_context(
     group_id: int,
     *,
@@ -1293,31 +1366,19 @@ def recent_group_chat_context(
                     [replied, *tail],
                     key=lambda item: item.sequence,
                 )
-    aliases: dict[str, str] = {}
     lines: list[str] = []
-
-    def speaker(user_id: str) -> str:
-        user_key = user_id or "未知"
-        if user_key == settings.bot_qq:
-            return "机器人自己"
-        if user_key not in aliases:
-            aliases[user_key] = chr(ord("A") + len(aliases))
-        return f"群友{aliases[user_key]}"
-
     for item in selected:
-        label = speaker(item.user_id)
-        relation = ""
-        if item.reply_message_id:
-            target_label = speaker(item.reply_target_user_id) if item.reply_target_user_id else "某条消息"
-            quoted = item.reply_text.replace("\n", " ").strip()
-            if len(quoted) > 60:
-                quoted = quoted[:59] + "…"
-            relation = f"（回复{target_label}"
-            if quoted:
-                relation += f"“{quoted}”"
-            relation += "）"
-        current = "【当前消息】" if item.sequence == focus_sequence else ""
-        lines.append(f"{current}{label}{relation}：{item.text}")
+        lines.append(
+            json.dumps(
+                _context_message_payload(
+                    group_id,
+                    item,
+                    current=item.sequence == focus_sequence,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     return tuple(lines)
 
 
@@ -1468,6 +1529,25 @@ def latest_group_user_sequence(group_id: int) -> int:
         )
 
 
+def unsafe_or_repeated_reply(group_id: int, answer: str, *, limit: int = 10) -> str:
+    if re.search(r"\bmember_[0-9a-f]{6,}\b", answer, flags=re.I):
+        return "internal member id leaked"
+    normalized = re.sub(r"[\W_]+", "", answer.lower())
+    if len(normalized) < 6:
+        return ""
+    with chat_history_lock:
+        recent_bot_answers = [
+            item.text
+            for item in group_chat_history.get(group_id, ())
+            if item.user_id == settings.bot_qq
+        ][-limit:]
+    for previous in recent_bot_answers:
+        previous_normalized = re.sub(r"[\W_]+", "", previous.lower())
+        if normalized == previous_normalized:
+            return "duplicate recent bot reply"
+    return ""
+
+
 def reply_deadline(event_time, mentioned: bool) -> float:
     total = (
         getattr(settings, "mentioned_reply_total_timeout_seconds", 15)
@@ -1589,6 +1669,11 @@ def clear_chat_state() -> None:
     clear_fragment_state()
 
 
+def group_send_lock(group_id: int) -> threading.Lock:
+    with group_send_locks_lock:
+        return group_send_locks.setdefault(group_id, threading.Lock())
+
+
 SEMANTIC_CHAT_INTENTS = {
     "chat",
     "normal_chat",
@@ -1632,6 +1717,9 @@ def save_chat_history(path: str | Path | None = None) -> None:
                         "reply_message_id": m.reply_message_id,
                         "reply_target_user_id": m.reply_target_user_id,
                         "reply_text": m.reply_text,
+                        "mentioned_bot": m.mentioned_bot,
+                        "mentioned_user_ids": list(m.mentioned_user_ids),
+                        "display_name": m.display_name,
                     }
                     for m in messages
                 ]
@@ -1664,6 +1752,9 @@ def load_chat_history(path: str | Path | None = None) -> int:
                         reply_message_id=m.get("reply_message_id", ""),
                         reply_target_user_id=m.get("reply_target_user_id", ""),
                         reply_text=m.get("reply_text", ""),
+                        mentioned_bot=bool(m.get("mentioned_bot")),
+                        mentioned_user_ids=tuple(m.get("mentioned_user_ids") or ()),
+                        display_name=m.get("display_name", ""),
                     )
                     history.append(entry)
                     chat_message_sequence = max(chat_message_sequence, entry.sequence)
@@ -1957,7 +2048,14 @@ def context_selected_by_plan(
         for index in plan.relevant_context_indices
         if 1 <= index <= len(chat_context)
     )
-    return selected or tuple(chat_context)
+    if not selected:
+        return tuple(chat_context)
+    current = tuple(
+        line
+        for line in chat_context
+        if '"current":true' in line or "【当前消息】" in line
+    )
+    return tuple(dict.fromkeys((*selected, *current)))
 
 
 def semantic_context_for_decision(decision: ProcessingDecision) -> str:
@@ -1982,10 +2080,7 @@ def answer_bot_meta(capability: str, *, admin: bool) -> str:
         return f"知识问答使用 {settings.llm_model}，闲聊使用 {settings.chat_model}。"
     if capability in {"runtime_status", "health"}:
         queued = message_queue.qsize() + normal_message_queue.qsize() + chat_queue.qsize()
-        base = f"服务正在运行，知识片段 {len(kb.chunks)} 个，队列 {queued} 条。"
-        if admin and capability == "runtime_status":
-            return base + f"运行目录是 {Path.cwd().resolve()}，知识库目录是 {knowledge_path.resolve()}。"
-        return base
+        return f"服务正在运行，知识片段 {len(kb.chunks)} 个，队列 {queued} 条。"
     return "可以查看知识库加载状态、知识库文件、当前模型和服务健康状态。"
 
 
@@ -2899,6 +2994,7 @@ def should_process_message(
     if usable_plan:
         chat_context = context_selected_by_plan(chat_context, usable_plan)
         query_text = usable_plan.standalone_question or query_text
+        explicitly_addressed = mentioned or reply_target_user_id == settings.bot_qq
         if usable_plan.audience == "member" and not mentioned:
             return ProcessingDecision(
                 False,
@@ -2910,8 +3006,26 @@ def should_process_message(
                 capability=usable_plan.capability,
                 semantic_confidence=usable_plan.confidence,
             )
+        if usable_plan.capability != "none":
+            if explicitly_addressed and usable_plan.audience == "bot":
+                return ProcessingDecision(
+                    True,
+                    "semantic plan: explicit bot capability query",
+                    effective_question=query_text,
+                    reply_mode="bot_meta",
+                    chat_context=tuple(chat_context),
+                    semantic_intent="bot_meta",
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    capability=usable_plan.capability,
+                    semantic_confidence=usable_plan.confidence,
+                )
+            return ProcessingDecision(
+                False,
+                "semantic plan: bot capability requires explicit bot address",
+            )
         if usable_plan.intent == "bot_meta":
-            if mentioned or usable_plan.audience == "bot":
+            if explicitly_addressed and usable_plan.audience == "bot":
                 return ProcessingDecision(
                     True,
                     "semantic plan: bot capability query",
@@ -2924,7 +3038,7 @@ def should_process_message(
                     capability=usable_plan.capability,
                     semantic_confidence=usable_plan.confidence,
                 )
-            return ProcessingDecision(False, "semantic plan: bot meta not directed at bot")
+            return ProcessingDecision(False, "semantic plan: bot meta requires explicit bot address")
         if usable_plan.intent == "admin":
             return ProcessingDecision(
                 False,
@@ -3323,13 +3437,20 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     continue
 
                 wait_for_rate_limit()
-                send_group_msg(
-                    settings.onebot_api_url,
-                    group_id,
-                    answer,
-                    settings.onebot_access_token,
-                )
-                record_group_chat_message(group_id, settings.bot_qq, answer)
+                with group_send_lock(group_id):
+                    bot_message_id = send_group_msg(
+                        settings.onebot_api_url,
+                        group_id,
+                        answer,
+                        settings.onebot_access_token,
+                        reply_to_message_id=str(item.get("message_id") or ""),
+                    )
+                    record_group_chat_message(
+                        group_id,
+                        settings.bot_qq,
+                        answer,
+                        message_id=bot_message_id,
+                    )
                 print("Answered admin command", group_id, user_id, command)
                 write_message_audit(
                     decision="answered",
@@ -3479,6 +3600,21 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 admin=admin_user,
                 timeout=generation_timeout,
             )
+            if unsafe_or_repeated_reply(group_id, answer) and decision.draft_reply:
+                decision.draft_reply = ""
+                retry_timeout = remaining_reply_timeout(
+                    deadline,
+                    cap=getattr(settings, "knowledge_generation_timeout_seconds", 10),
+                    reserve=getattr(settings, "final_reply_review_timeout_seconds", 4),
+                )
+                if retry_timeout:
+                    answer = answer_for_decision(
+                        question,
+                        decision,
+                        decision.effective_question or generation_question,
+                        admin=admin_user,
+                        timeout=retry_timeout,
+                    )
             review_reason = ""
             reviewed_revision = latest_group_user_sequence(group_id)
             if decision.reply_mode not in {"bot_meta", "identity"}:
@@ -3509,6 +3645,20 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     )
                     continue
             model_latency_ms = int((time.monotonic() - model_started) * 1000)
+            unsafe_reason = unsafe_or_repeated_reply(group_id, answer)
+            if unsafe_reason:
+                write_message_audit(
+                    decision="skipped",
+                    reason=unsafe_reason,
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    reply_mode=decision.reply_mode,
+                    answer=answer,
+                    event_time=event_time,
+                )
+                continue
             mention_user_id = response_mention_user_id(
                 mentioned=mentioned,
                 user_id=user_id,
@@ -3586,19 +3736,39 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     event_time=event_time,
                 )
                 continue
-            bot_message_id = send_group_msg(
-                settings.onebot_api_url,
-                group_id,
-                answer,
-                settings.onebot_access_token,
-                mention_user_id=mention_user_id,
-            )
-            record_group_chat_message(
-                group_id,
-                settings.bot_qq,
-                answer,
-                message_id=bot_message_id,
-            )
+            with group_send_lock(group_id):
+                if (
+                    decision.reply_mode not in {"bot_meta", "identity"}
+                    and latest_group_user_sequence(group_id) > reviewed_revision
+                ):
+                    write_message_audit(
+                        decision="skipped",
+                        reason="context changed while waiting for group send lock",
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        mentioned=mentioned,
+                        reply_mode=decision.reply_mode,
+                        model_latency_ms=model_latency_ms,
+                        event_time=event_time,
+                    )
+                    continue
+                bot_message_id = send_group_msg(
+                    settings.onebot_api_url,
+                    group_id,
+                    answer,
+                    settings.onebot_access_token,
+                    mention_user_id=mention_user_id,
+                    reply_to_message_id=(
+                        str(item.get("message_id") or "") if mentioned else ""
+                    ),
+                )
+                record_group_chat_message(
+                    group_id,
+                    settings.bot_qq,
+                    answer,
+                    message_id=bot_message_id,
+                )
             print("Answered group", group_id, "question", question)
             write_message_audit(
                 decision="answered",
@@ -3840,6 +4010,20 @@ def chat_worker() -> None:
                 )
                 continue
 
+            unsafe_reason = unsafe_or_repeated_reply(group_id, answer)
+            if unsafe_reason:
+                write_message_audit(
+                    decision="skipped",
+                    reason=unsafe_reason,
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    reply_mode="chat",
+                    answer=answer,
+                    event_time=event_time,
+                )
+                continue
+
             answer, review_reason, reviewed_revision = review_and_refresh_answer(
                 question=question,
                 answer=answer,
@@ -3868,6 +4052,20 @@ def chat_worker() -> None:
                     semantic_topic=decision.semantic_topic,
                     implicit_meaning=decision.implicit_meaning,
                     semantic_confidence=decision.semantic_confidence,
+                    event_time=event_time,
+                )
+                continue
+
+            unsafe_reason = unsafe_or_repeated_reply(group_id, answer)
+            if unsafe_reason:
+                write_message_audit(
+                    decision="skipped",
+                    reason=unsafe_reason,
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    reply_mode="chat",
+                    answer=answer,
                     event_time=event_time,
                 )
                 continue
@@ -3951,20 +4149,46 @@ def chat_worker() -> None:
                 )
                 continue
 
-            bot_message_id = send_group_msg(
-                settings.onebot_api_url,
-                group_id,
-                answer,
-                settings.onebot_access_token,
-                mention_user_id=mention_user_id,
-            )
-            record_group_chat_message(
-                group_id,
-                settings.bot_qq,
-                answer,
-                message_id=bot_message_id,
-            )
-            mark_chat_replied(group_id)
+            with group_send_lock(group_id):
+                quota_reason = chat_reply_quota_reason(group_id)
+                if quota_reason:
+                    write_message_audit(
+                        decision="skipped",
+                        reason=f"{quota_reason} while waiting for group send lock",
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        reply_mode="chat",
+                        model_latency_ms=model_latency_ms,
+                        event_time=event_time,
+                    )
+                    continue
+                if latest_group_user_sequence(group_id) > reviewed_revision:
+                    write_message_audit(
+                        decision="skipped",
+                        reason="context changed while waiting for group send lock",
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        reply_mode="chat",
+                        model_latency_ms=model_latency_ms,
+                        event_time=event_time,
+                    )
+                    continue
+                bot_message_id = send_group_msg(
+                    settings.onebot_api_url,
+                    group_id,
+                    answer,
+                    settings.onebot_access_token,
+                    mention_user_id=mention_user_id,
+                )
+                record_group_chat_message(
+                    group_id,
+                    settings.bot_qq,
+                    answer,
+                    message_id=bot_message_id,
+                )
+                mark_chat_replied(group_id)
             if social_event_kind:
                 mark_celebration_replied(
                     group_id,
@@ -4197,6 +4421,13 @@ class Handler(BaseHTTPRequestHandler):
             reply_message_id=reply_message_id,
             reply_target_user_id=reply_target_user_id,
             reply_text=reply_text,
+            mentioned_bot=mentioned,
+            mentioned_user_ids=mentioned_user_ids,
+            display_name=(
+                event.get("sender", {}).get("card")
+                or event.get("sender", {}).get("nickname")
+                or ""
+            ),
         )
         save_chat_history()
         schedule_chat_scene_update(numeric_group_id, chat_sequence)

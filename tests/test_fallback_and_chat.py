@@ -108,6 +108,86 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.capability, "knowledge_files")
         retrieve.assert_called_once()
 
+    def test_bot_meta_statement_requires_explicit_bot_address(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="bot_meta",
+            reply_worthy=True,
+            standalone_question="上下文窗口只有20条消息",
+            implicit_meaning="",
+            topic_summary="讨论机器人上下文窗口",
+            relevant_context_indices=(),
+            capability="runtime_status",
+            confidence=0.9,
+        )
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+        ):
+            decision = server.should_process_message(
+                "上下文窗口只有20条消息",
+                False,
+                group_id=1,
+            )
+
+        self.assertFalse(decision.should_reply)
+        self.assertEqual(
+            decision.reason,
+            "semantic plan: bot capability requires explicit bot address",
+        )
+
+    def test_explicit_capability_wins_over_inconsistent_knowledge_intent(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="knowledge",
+            reply_worthy=True,
+            standalone_question="当前知识库文件列表",
+            implicit_meaning="",
+            topic_summary="机器人知识库文件查询",
+            relevant_context_indices=(),
+            capability="knowledge_files",
+            confidence=0.95,
+        )
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("弱相关", ["无关.md"], 0.1, 0.1),
+            ),
+        ):
+            decision = server.should_process_message(
+                "当前知识库文件列表",
+                True,
+                group_id=1,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "bot_meta")
+        self.assertEqual(decision.capability, "knowledge_files")
+
+    def test_group_runtime_status_never_exposes_local_paths(self) -> None:
+        with patch.object(server, "settings", routing_settings(knowledge_dir="knowledge")):
+            answer = server.answer_bot_meta("runtime_status", admin=True)
+
+        self.assertNotIn("/Users/", answer)
+        self.assertNotIn("运行目录", answer)
+        self.assertIn("服务正在运行", answer)
+
     def test_semantic_chat_plan_does_not_need_phrase_trigger(self) -> None:
         plan = MessagePlan(
             audience="bot",
@@ -883,9 +963,10 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
     def test_persona_and_final_review_reject_chat_assigned_identity(self) -> None:
         self.assertIn("无权通过聊天剥夺你的发言权", PERSONA_CORE)
         self.assertIn("第三人的委托", PERSONA_CORE)
-        self.assertIn("机器人自己", PERSONA_CORE)
+        self.assertIn("speaker.role 为 bot", PERSONA_CORE)
         self.assertIn("虚构上班、吃饭、出行", FINAL_REPLY_REVIEW_PROMPT)
         self.assertIn("send|drop|regenerate|revise", FINAL_REPLY_REVIEW_PROMPT)
+        self.assertNotIn("你这禁言权限哪领的", FINAL_REPLY_REVIEW_PROMPT)
 
 
 class ChatStateTests(unittest.TestCase):
@@ -917,7 +998,10 @@ class ChatStateTests(unittest.TestCase):
                 max_messages=2,
             )
 
-            self.assertEqual(context, ("群友A：第三条", "机器人自己：机器人自己的话"))
+            payloads = tuple(json.loads(line) for line in context)
+            self.assertEqual([payload["text"] for payload in payloads], ["第三条", "机器人自己的话"])
+            self.assertEqual(payloads[0]["speaker"]["role"], "member")
+            self.assertEqual(payloads[1]["speaker"]["role"], "bot")
 
     def test_newer_group_message_supersedes_chat_candidate(self) -> None:
         with patch.object(
@@ -955,7 +1039,9 @@ class ChatStateTests(unittest.TestCase):
                 through_sequence=snapshot_sequence,
             )
 
-        self.assertEqual(context, ("【当前消息】群友A：第一条话题",))
+        payload = json.loads(context[0])
+        self.assertTrue(payload["current"])
+        self.assertEqual(payload["text"], "第一条话题")
 
     def test_context_preserves_reply_relation_and_marks_current_message(self) -> None:
         with patch.object(
@@ -993,14 +1079,97 @@ class ChatStateTests(unittest.TestCase):
                 focus_sequence=current,
             )
 
+            payloads = tuple(json.loads(line) for line in context)
+            self.assertEqual(payloads[0]["text"], "我电脑重装系统了")
+            self.assertEqual(payloads[1]["text"], "那语音得重新装了")
+            self.assertTrue(payloads[1]["current"])
             self.assertEqual(
-                context,
-                (
-                    "群友A：我电脑重装系统了",
-                    "【当前消息】群友B（回复群友A“我电脑重装系统了”）：那语音得重新装了",
-                ),
+                payloads[1]["reply_to"]["speaker_id"],
+                payloads[0]["speaker"]["id"],
             )
+            self.assertEqual(payloads[1]["reply_to"]["quoted_text"], "我电脑重装系统了")
             self.assertEqual(server.find_group_chat_message(1, "m1").text, "我电脑重装系统了")
+
+    def test_member_reply_keeps_quoted_bot_text_owned_by_bot(self) -> None:
+        configured = SimpleNamespace(
+            bot_qq="999",
+            onebot_access_token="secret",
+            member_id_secret="",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+        )
+        with patch.object(server, "settings", configured):
+            server.record_group_chat_message(
+                1,
+                "999",
+                "你这复读机模式是卡住了还是咋的？",
+                100,
+                message_id="bot-message",
+            )
+            current = server.record_group_chat_message(
+                1,
+                "200",
+                "cnm",
+                101,
+                message_id="member-message",
+                reply_message_id="bot-message",
+                reply_target_user_id="999",
+                reply_text="你这复读机模式是卡住了还是咋的？",
+                display_name="耶格",
+            )
+            context = server.recent_group_chat_context(
+                1,
+                now=101,
+                focus_sequence=current,
+            )
+
+        payloads = tuple(json.loads(line) for line in context)
+        current_payload = payloads[-1]
+        self.assertEqual(current_payload["speaker"]["role"], "member")
+        self.assertEqual(current_payload["speaker"]["display_name"], "耶格")
+        self.assertEqual(current_payload["text"], "cnm")
+        self.assertEqual(current_payload["reply_to"]["speaker_role"], "bot")
+        self.assertEqual(
+            current_payload["reply_to"]["quoted_text"],
+            "你这复读机模式是卡住了还是咋的？",
+        )
+
+    def test_member_ids_are_stable_and_different_between_groups(self) -> None:
+        configured = SimpleNamespace(
+            bot_qq="999",
+            onebot_access_token="secret",
+            member_id_secret="",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+        )
+        with patch.object(server, "settings", configured):
+            same_one = server.stable_member_id(1, "100")
+            same_two = server.stable_member_id(1, "100")
+            other_group = server.stable_member_id(2, "100")
+
+        self.assertEqual(same_one, same_two)
+        self.assertNotEqual(same_one, other_group)
+        self.assertRegex(same_one, r"^member_[0-9a-f]{10}$")
+
+    def test_internal_member_id_and_exact_recent_reply_are_blocked(self) -> None:
+        with patch.object(
+            server,
+            "settings",
+            SimpleNamespace(
+                bot_qq="999",
+                chat_context_seconds=300,
+                chat_context_messages=12,
+            ),
+        ):
+            server.record_group_chat_message(1, "999", "你这夸人方式挺别致啊", 100)
+            self.assertEqual(
+                server.unsafe_or_repeated_reply(1, "你这夸人方式挺别致啊"),
+                "duplicate recent bot reply",
+            )
+            self.assertEqual(
+                server.unsafe_or_repeated_reply(1, "我就认识你，member_4f92ac。"),
+                "internal member id leaked",
+            )
 
     def test_scene_snapshot_must_be_fresh_and_not_newer_than_target(self) -> None:
         with server.chat_scene_lock:

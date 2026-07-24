@@ -74,6 +74,30 @@ class ReplyDetectionTests(unittest.TestCase):
         )
         self.assertEqual(message_id, "456789")
 
+    @patch("squad_bot.onebot.urllib.request.urlopen")
+    def test_send_group_message_prefers_native_reply_target(self, urlopen):
+        urlopen.return_value = FakeResponse(
+            {"status": "ok", "data": {"message_id": 456790}}
+        )
+
+        send_group_msg(
+            "http://127.0.0.1:3000",
+            123,
+            "回答内容",
+            "token",
+            mention_user_id="10001",
+            reply_to_message_id="9988",
+        )
+
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(
+            payload["message"],
+            [
+                {"type": "reply", "data": {"id": "9988"}},
+                {"type": "text", "data": {"text": "回答内容"}},
+            ],
+        )
+
     def test_extracts_reply_id_from_segments(self):
         message = [
             {"type": "reply", "data": {"id": 123456}},

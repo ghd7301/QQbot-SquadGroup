@@ -95,10 +95,17 @@ def send_group_msg(
     access_token: str = "",
     *,
     mention_user_id: str = "",
+    reply_to_message_id: str = "",
 ) -> str:
     mention_id = str(mention_user_id or "").strip()
+    reply_id = str(reply_to_message_id or "").strip()
     message_payload: str | list[dict]
-    if re.fullmatch(r"\d+", mention_id):
+    if reply_id:
+        message_payload = [
+            {"type": "reply", "data": {"id": reply_id}},
+            {"type": "text", "data": {"text": message}},
+        ]
+    elif re.fullmatch(r"\d+", mention_id):
         message_payload = [
             {"type": "at", "data": {"qq": mention_id}},
             {"type": "text", "data": {"text": " " + message}},
