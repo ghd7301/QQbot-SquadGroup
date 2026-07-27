@@ -657,6 +657,9 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                         "participants": [f"member_{index}" for index in range(8)],
                         "progress": "乙" * 180,
                         "reply_angle": "丙" * 120,
+                        "anchor_message_ids": ["m1", "missing"],
+                        "confidence": 1.4,
+                        "status": "unknown",
                     },
                     {"id": "t2", "summary": "第二话题"},
                     {"id": "t3", "summary": "不应保留"},
@@ -670,16 +673,21 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 base_url="https://example.invalid",
                 api_key="test-key",
                 model="test-model",
-                context=("群友A：第一话题",),
+                context=(json.dumps({"message_id": "m1", "sequence": 7, "text": "第一话题"}),),
             )
 
         payload = json.loads(answer)
         self.assertEqual(len(payload["topics"]), 2)
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["updated_through_sequence"], 7)
         self.assertEqual(payload["active_topic_id"], "t1")
         self.assertEqual(len(payload["topics"][0]["summary"]), 120)
         self.assertEqual(len(payload["topics"][0]["participants"]), 6)
         self.assertEqual(len(payload["topics"][0]["progress"]), 120)
         self.assertEqual(len(payload["topics"][0]["reply_angle"]), 80)
+        self.assertEqual(payload["topics"][0]["anchor_message_ids"], ["m1"])
+        self.assertEqual(payload["topics"][0]["confidence"], 1.0)
+        self.assertEqual(payload["topics"][0]["status"], "active")
 
     def test_fallback_generation_receives_group_context(self) -> None:
         with patch.object(llm, "_answer_or_error", return_value="这里说的枪男就是专心练枪的玩法") as call:
@@ -1238,6 +1246,83 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(answer, "60 秒。")
         reviewer.assert_called_once()
 
+    def test_late_parallel_message_is_reviewed_and_can_still_send(self) -> None:
+        configured = routing_settings(final_reply_review_mode="adaptive")
+        decision = server.ProcessingDecision(
+            True,
+            "chat",
+            reply_mode="chat",
+            chat_context=("原上下文",),
+            semantic_intent="normal_chat",
+            semantic_topic="IDE 选择",
+            semantic_confidence=0.9,
+        )
+        review = FinalReplyReview(
+            "send",
+            "新增消息属于聚餐话题",
+            0.95,
+            context_relation="unrelated_parallel",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", side_effect=(9, 9)),
+            patch.object(server, "recent_group_chat_context", return_value=("最新上下文",)),
+            patch.object(server, "review_candidate_reply", return_value=review) as reviewer,
+        ):
+            answer, reason, revision = server.refresh_answer_for_late_context(
+                question="IDE 用哪个",
+                answer="VS Code 插件多。",
+                decision=decision,
+                group_id=1,
+                mentioned=False,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                reviewed_revision=8,
+            )
+
+        self.assertEqual(answer, "VS Code 插件多。")
+        self.assertIn("unrelated_parallel", reason)
+        self.assertEqual(revision, 9)
+        reviewer.assert_called_once()
+
+    def test_late_answered_message_drops_stale_bot_reply(self) -> None:
+        configured = routing_settings(final_reply_review_mode="adaptive")
+        decision = server.ProcessingDecision(
+            True,
+            "chat",
+            reply_mode="chat",
+            chat_context=("原上下文",),
+            semantic_intent="normal_chat",
+            semantic_topic="IDE 选择",
+            semantic_confidence=0.9,
+        )
+        review = FinalReplyReview(
+            "drop",
+            "已有群友完整回答",
+            0.95,
+            context_relation="already_answered",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", side_effect=(9, 9)),
+            patch.object(server, "recent_group_chat_context", return_value=("最新上下文",)),
+            patch.object(server, "review_candidate_reply", return_value=review),
+        ):
+            answer, reason, revision = server.refresh_answer_for_late_context(
+                question="IDE 用哪个",
+                answer="VS Code 插件多。",
+                decision=decision,
+                group_id=1,
+                mentioned=False,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                reviewed_revision=8,
+            )
+
+        self.assertEqual(answer, "")
+        self.assertIn("already_answered", reason)
+        self.assertEqual(revision, 9)
+
     def test_persona_and_final_review_reject_chat_assigned_identity(self) -> None:
         self.assertIn("无权通过聊天剥夺你的发言权", PERSONA_CORE)
         self.assertIn("第三人的委托", PERSONA_CORE)
@@ -1280,6 +1365,56 @@ class ChatStateTests(unittest.TestCase):
             self.assertEqual([payload["text"] for payload in payloads], ["第三条", "机器人自己的话"])
             self.assertEqual(payloads[0]["speaker"]["role"], "member")
             self.assertEqual(payloads[1]["speaker"]["role"], "bot")
+
+    def test_context_envelope_includes_order_time_segments_and_status(self) -> None:
+        configured = SimpleNamespace(
+            bot_qq="999",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+        )
+        with patch.object(server, "settings", configured):
+            sequence = server.record_group_chat_message(
+                1,
+                "100",
+                "看这个 [图片]",
+                100,
+                received_time=101.5,
+                message_id="m1",
+                content_segments=(
+                    {"type": "text", "text": "看这个"},
+                    {"type": "image"},
+                ),
+            )
+            payload = json.loads(
+                server.recent_group_chat_context(
+                    1,
+                    now=102,
+                    focus_sequence=sequence,
+                )[0]
+            )
+
+        self.assertEqual(payload["sequence"], sequence)
+        self.assertEqual(payload["event_time"], 100)
+        self.assertEqual(payload["received_time"], 101.5)
+        self.assertEqual(payload["message_status"], "active")
+        self.assertEqual(payload["content_segments"][1], {"type": "image"})
+
+    def test_recalled_message_keeps_lifecycle_but_leaves_context(self) -> None:
+        configured = SimpleNamespace(
+            bot_qq="999",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+        )
+        with patch.object(server, "settings", configured):
+            server.record_group_chat_message(1, "100", "准备撤回", 100, message_id="m1")
+            server.record_group_chat_message(1, "200", "保留消息", 101, message_id="m2")
+            server.recall_group_chat_message(1, "m1")
+            context = server.recent_group_chat_context(1, now=102)
+
+        self.assertEqual([json.loads(line)["message_id"] for line in context], ["m2"])
+        recalled = next(item for item in server.group_chat_history[1] if item.message_id == "m1")
+        self.assertEqual(recalled.message_status, "recalled")
+        self.assertIsNone(server.find_group_chat_message(1, "m1"))
 
     def test_newer_group_message_supersedes_chat_candidate(self) -> None:
         with patch.object(

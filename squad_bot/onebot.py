@@ -6,11 +6,12 @@ import re
 AT_RE_TEMPLATE = r"\[CQ:at,qq={qq}\]"
 AT_RE = re.compile(r"\[CQ:at,qq=\d+\]")
 REPLY_RE = re.compile(r"\[CQ:reply,(?:[^,\]]+,)*id=([^,\]]+)(?:,[^\]]*)?\]")
+CQ_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
 
 
 def extract_plain_text(message) -> str:
     if isinstance(message, str):
-        return REPLY_RE.sub("", AT_RE.sub("", message)).strip()
+        return CQ_RE.sub("", message).strip()
     if not isinstance(message, list):
         return ""
 
@@ -23,8 +24,6 @@ def extract_plain_text(message) -> str:
 
 def extract_context_text(message) -> str:
     """Keep lightweight media placeholders so non-text turns remain in context."""
-    if not isinstance(message, list):
-        return extract_plain_text(message)
     labels = {
         "image": "[图片]",
         "face": "[表情]",
@@ -34,6 +33,23 @@ def extract_context_text(message) -> str:
         "file": "[文件]",
         "json": "[卡片消息]",
     }
+    if isinstance(message, str):
+        parts: list[str] = []
+        position = 0
+        for match in CQ_RE.finditer(message):
+            text = message[position:match.start()].strip()
+            if text:
+                parts.append(text)
+            label = labels.get(match.group(1).lower())
+            if label:
+                parts.append(label)
+            position = match.end()
+        tail = message[position:].strip()
+        if tail:
+            parts.append(tail)
+        return " ".join(parts).strip()
+    if not isinstance(message, list):
+        return ""
     parts: list[str] = []
     for segment in message:
         if not isinstance(segment, dict):
@@ -44,6 +60,55 @@ def extract_context_text(message) -> str:
         elif kind in labels:
             parts.append(labels[kind])
     return " ".join(part.strip() for part in parts if part.strip()).strip()
+
+
+def extract_content_segments(message) -> tuple[dict[str, str], ...]:
+    """Keep model-safe content structure without persisting media URLs or file tokens."""
+    allowed_types = {
+        "text",
+        "image",
+        "face",
+        "mface",
+        "video",
+        "record",
+        "file",
+        "json",
+        "reply",
+        "at",
+    }
+    if isinstance(message, str):
+        segments: list[dict[str, str]] = []
+        position = 0
+        for match in CQ_RE.finditer(message):
+            text = message[position:match.start()].strip()
+            if text:
+                segments.append({"type": "text", "text": text[:1000]})
+            kind = match.group(1).lower()
+            if kind in allowed_types:
+                segments.append({"type": kind})
+            position = match.end()
+        tail = message[position:].strip()
+        if tail:
+            segments.append({"type": "text", "text": tail[:1000]})
+        return tuple(segments[:24])
+    if not isinstance(message, list):
+        return ()
+
+    segments: list[dict[str, str]] = []
+    for raw_segment in message:
+        if not isinstance(raw_segment, dict):
+            continue
+        kind = str(raw_segment.get("type") or "").strip().lower()
+        if kind not in allowed_types:
+            continue
+        segment = {"type": kind}
+        if kind == "text":
+            text = str((raw_segment.get("data") or {}).get("text") or "").strip()
+            if not text:
+                continue
+            segment["text"] = text[:1000]
+        segments.append(segment)
+    return tuple(segments[:24])
 
 
 def extract_reply_message_id(message) -> str:

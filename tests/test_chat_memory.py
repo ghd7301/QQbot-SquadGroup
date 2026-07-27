@@ -116,6 +116,26 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertEqual(payload["speakers"], ["member_a"])
         self.assertEqual(payload["messages"][0]["speaker"]["id"], "member_a")
 
+    def test_formatted_hits_keep_message_lifecycle_metadata(self):
+        now = time.time()
+        self.store.add_message(MemoryMessage(
+            group_id=1,
+            message_id="m1",
+            speaker_id="member_a",
+            display_name="A",
+            speaker_role="member",
+            text="看这个图片",
+            event_time=now,
+            sequence=17,
+            received_time=now + 0.4,
+            content_segments=({"type": "text", "text": "看这个"}, {"type": "image"}),
+        ))
+        hit = self.store.retrieve(group_id=1, query="看这个图片")[0]
+        message = json.loads(self.store.format_hits([hit])[0])["messages"][0]
+        self.assertEqual(message["sequence"], 17)
+        self.assertEqual(message["message_status"], "active")
+        self.assertEqual(message["content_segments"][1], {"type": "image"})
+
     def test_formatted_reply_keeps_quote_ownership(self):
         now = time.time()
         self.store.add_message(self.message(1, "m1", "bot", "你之前问的是北桥", now))
@@ -167,6 +187,35 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertEqual(topics["b1"], topics["m1"])
         self.assertNotEqual(topics["b1"], topics["m2"])
         self.assertEqual((relation["relation_type"], relation["target_message_id"]), ("generated_for", "m1"))
+
+    def test_message_can_keep_two_hard_topic_assignments(self):
+        now = time.time()
+        self.store.add_message(self.message(1, "m1", "member_a", "IDE 插件推荐", now))
+        self.store.add_message(self.message(1, "m2", "member_b", "周五火锅聚餐", now + 1))
+        self.store.add_message(MemoryMessage(
+            group_id=1,
+            message_id="bridge",
+            speaker_id="bot",
+            display_name="机器人",
+            speaker_role="bot",
+            text="可以边吃火锅边聊插件。",
+            event_time=now + 2,
+            generated_for_message_ids=("m1", "m2"),
+        ))
+
+        first = self.store.topic_assignments_for_message(1, "m1")[0]
+        second = self.store.topic_assignments_for_message(1, "m2")[0]
+        bridge = self.store.topic_assignments_for_message(1, "bridge")
+        with self.store.connect() as connection:
+            legacy_primary = int(connection.execute(
+                "SELECT topic_id FROM chat_messages WHERE group_id=1 AND message_id='bridge'"
+            ).fetchone()["topic_id"])
+
+        self.assertEqual(len(bridge), 2)
+        self.assertEqual({item.topic_id for item in bridge}, {first.topic_id, second.topic_id})
+        self.assertEqual(bridge[0].relation_basis, "generated_for")
+        self.assertEqual(bridge[0].anchor_message_ids, ("m1",))
+        self.assertEqual(legacy_primary, bridge[0].topic_id)
 
     def test_self_history_contains_trigger_bot_authorship_and_explicit_feedback(self):
         now = time.time()
@@ -225,8 +274,21 @@ class ChatMemoryTests(unittest.TestCase):
             relation_table = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='message_relations'"
             ).fetchone()
-        self.assertTrue({"generated_for_message_ids_json", "turn_id", "reply_mode", "semantic_topic"} <= columns)
+            topic_relation_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='message_topic_relations'"
+            ).fetchone()
+        self.assertTrue({
+            "generated_for_message_ids_json",
+            "turn_id",
+            "reply_mode",
+            "semantic_topic",
+            "sequence",
+            "received_time",
+            "content_segments_json",
+            "message_status",
+        } <= columns)
         self.assertIsNotNone(relation_table)
+        self.assertIsNotNone(topic_relation_table)
 
 
 if __name__ == "__main__":

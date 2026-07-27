@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from squad_bot.onebot import (
+    extract_content_segments,
     extract_context_text,
     extract_mentioned_user_ids,
     extract_plain_text,
@@ -37,6 +38,23 @@ class ReplyDetectionTests(unittest.TestCase):
             {"type": "face", "data": {"id": "1"}},
         ]
         self.assertEqual(extract_context_text(message), "看这个 [图片] [表情]")
+
+    def test_content_segments_hide_media_tokens_for_list_and_cq_string(self) -> None:
+        structured = [
+            {"type": "text", "data": {"text": "看这个"}},
+            {"type": "image", "data": {"url": "https://secret/image", "file": "token"}},
+        ]
+        self.assertEqual(
+            extract_content_segments(structured),
+            ({"type": "text", "text": "看这个"}, {"type": "image"}),
+        )
+        cq_message = "看这个[CQ:image,file=secret,url=https://secret/image]"
+        self.assertEqual(extract_context_text(cq_message), "看这个 [图片]")
+        self.assertEqual(
+            extract_content_segments(cq_message),
+            ({"type": "text", "text": "看这个"}, {"type": "image"}),
+        )
+        self.assertEqual(extract_plain_text(cq_message), "看这个")
 
     def test_extracts_other_mentions_without_bot_or_all(self):
         segments = [

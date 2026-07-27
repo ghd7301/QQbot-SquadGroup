@@ -87,6 +87,54 @@ class MemorySecurityTests(unittest.TestCase):
         self.assertIn("历史群聊候选", planner_prompt)
         self.assertIn('"chunk_id": 42', planner_prompt)
 
+    def test_planner_parses_multiple_topic_candidates_with_real_anchors(self):
+        payload = {
+            "audience": "group",
+            "intent": "normal_chat",
+            "reply_worthy": True,
+            "standalone_question": "边吃火锅边聊 IDE",
+            "implicit_meaning": "连接两个并行话题",
+            "topic_summary": "聚餐与 IDE 讨论交汇",
+            "topic_candidates": [
+                {
+                    "key": "ide",
+                    "label": "IDE 选择",
+                    "confidence": 0.88,
+                    "anchor_message_ids": ["m1", "missing"],
+                    "basis": "bridge",
+                },
+                {
+                    "key": "dinner",
+                    "label": "周五聚餐",
+                    "confidence": 0.84,
+                    "anchor_message_ids": ["m2"],
+                    "basis": "bridge",
+                },
+            ],
+            "capability": "none",
+            "draft_reply": "",
+            "confidence": 0.9,
+        }
+        context = (
+            json.dumps({"message_id": "m1", "current": False}),
+            json.dumps({"message_id": "m2", "current": True}),
+        )
+        with patch.object(llm, "_chat_completion", return_value=json.dumps(payload)):
+            plan = llm.plan_group_message(
+                base_url="https://example.invalid",
+                api_key="key",
+                model="model",
+                message="边吃边聊这个",
+                context=context,
+                mentioned=False,
+                mentions_other=False,
+            )
+
+        self.assertEqual(len(plan.topic_candidates), 2)
+        self.assertEqual(plan.topic_candidates[0].anchor_message_ids, ("m1",))
+        self.assertEqual(plan.topic_candidates[1].label, "周五聚餐")
+        self.assertEqual(plan.topic_candidates[1].basis, "bridge")
+
     def test_clear_requires_same_admin_confirmation_within_window(self):
         store = SimpleNamespace(clear_group=Mock())
         manager = SimpleNamespace(store=store)
@@ -280,6 +328,40 @@ class MemorySecurityTests(unittest.TestCase):
         self.assertEqual(
             {server.context_line_message_id(line) for line in selected},
             {"reply", "parallel", "current"},
+        )
+
+    def test_context_selection_keeps_two_topic_anchors_and_full_reply_chain(self):
+        context = (
+            json.dumps({"message_id": "root", "reply_to": None}),
+            json.dumps({"message_id": "middle", "reply_to": {"message_id": "root"}}),
+            json.dumps({"message_id": "other-topic", "reply_to": None}),
+            json.dumps({
+                "message_id": "current",
+                "current": True,
+                "reply_to": {"message_id": "middle"},
+            }),
+        )
+        plan = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="连接两个话题",
+            implicit_meaning="",
+            topic_summary="两个并行话题交汇",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            topic_candidates=(
+                llm.SemanticTopicCandidate("one", "第一话题", 1.0, ("middle",), "qq_reply"),
+                llm.SemanticTopicCandidate("two", "第二话题", 0.8, ("other-topic",), "bridge"),
+            ),
+        )
+
+        selected = server.context_selected_by_plan(context, plan)
+
+        self.assertEqual(
+            [json.loads(line)["message_id"] for line in selected],
+            ["root", "middle", "other-topic", "current"],
         )
 
     def test_knowledge_gap_log_is_redacted_and_deduplicated(self):

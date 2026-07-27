@@ -20,6 +20,7 @@ from .embedding import build_embedding_provider
 from .knowledge import KnowledgeBase
 from .llm import (
     MessagePlan,
+    SemanticTopicCandidate,
     analyze_chat_scene,
     answer_chat,
     ask_fallback_llm,
@@ -35,6 +36,7 @@ from .llm import (
     should_reply_to_chat,
 )
 from .onebot import (
+    extract_content_segments,
     extract_mentioned_user_ids,
     extract_context_text,
     extract_plain_text,
@@ -114,6 +116,7 @@ class ProcessingDecision:
     memory_rejection_reason: str = ""
     recent_context_candidate_count: int = 0
     risk_flags: tuple[str, ...] = ()
+    topic_candidates: tuple[SemanticTopicCandidate, ...] = ()
     recent_context_selected_count: int = 0
     recent_context_chars: int = 0
     memory_context_chars: int = 0
@@ -127,6 +130,7 @@ class ProcessingDecision:
     self_history_chars: int = 0
     self_history_selected_message_ids: tuple[str, ...] = ()
     self_history_reasons: tuple[str, ...] = ()
+    reply_regenerated: bool = False
 
 
 @dataclass(frozen=True)
@@ -177,6 +181,9 @@ class GroupChatMessage:
     turn_id: str = ""
     reply_mode: str = ""
     semantic_topic: str = ""
+    received_time: float = 0.0
+    content_segments: tuple[dict[str, str], ...] = ()
+    message_status: str = "active"
 
 
 @dataclass
@@ -853,6 +860,7 @@ def write_message_audit(
     implicit_meaning: str = "",
     capability: str = "none",
     semantic_confidence: float = 0.0,
+    topic_candidates: Sequence[SemanticTopicCandidate] = (),
     memory_query: str = "",
     memory_hit_count: int = 0,
     memory_retrieval_attempted: bool = False,
@@ -881,6 +889,10 @@ def write_message_audit(
         total_latency_ms = max(0, int((time.time() - float(event_time)) * 1000))
     except (TypeError, ValueError):
         total_latency_ms = 0
+    try:
+        scene_payload = json.loads(scene_context) if scene_context else {}
+    except (json.JSONDecodeError, TypeError):
+        scene_payload = {}
     record = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "event_time": event_time,
@@ -911,6 +923,22 @@ def write_message_audit(
         "implicit_meaning": implicit_meaning,
         "capability": capability,
         "semantic_confidence": round(float(semantic_confidence), 4),
+        "topic_candidates": [
+            {
+                "key": candidate.key,
+                "label": candidate.label,
+                "confidence": round(candidate.confidence, 4),
+                "basis": candidate.basis,
+                "anchor_message_ids": list(candidate.anchor_message_ids),
+            }
+            for candidate in topic_candidates
+        ],
+        "scene_version": int(scene_payload.get("version") or 0) if isinstance(scene_payload, dict) else 0,
+        "scene_updated_through_sequence": (
+            int(scene_payload.get("updated_through_sequence") or 0)
+            if isinstance(scene_payload, dict)
+            else 0
+        ),
         "memory_query": memory_query,
         "memory_hit_count": int(memory_hit_count),
         "memory_retrieval_attempted": bool(memory_retrieval_attempted),
@@ -1061,6 +1089,7 @@ def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") 
         state = "暂停" if status["paused"] else "运行"
         return (
             f"聊天记忆{state}，消息 {status['messages']} 条，片段 {status['chunks']} 个，"
+            f"话题关系 {status.get('topic_relations', 0)} 条，"
             f"待索引 {status['queued']} 条，向量方式 {status['provider']}。"
         )
     if command == "memory_pause":
@@ -1362,6 +1391,9 @@ def record_group_chat_message(
     turn_id: str = "",
     reply_mode: str = "",
     semantic_topic: str = "",
+    received_time=None,
+    content_segments: Sequence[dict[str, str]] = (),
+    message_status: str = "active",
 ) -> int:
     global chat_message_sequence
     normalized = text.strip()
@@ -1371,30 +1403,51 @@ def record_group_chat_message(
         timestamp = float(event_time)
     except (TypeError, ValueError):
         timestamp = time.time()
+    try:
+        received_timestamp = float(received_time)
+    except (TypeError, ValueError):
+        received_timestamp = time.time()
+    normalized_status = str(message_status or "active").strip().lower()
+    if normalized_status not in {"active", "recalled", "edited", "invalid"}:
+        normalized_status = "active"
+    safe_segments = tuple(
+        {
+            str(key): str(value)[:1000]
+            for key, value in segment.items()
+            if str(key) in {"type", "text"}
+        }
+        for segment in content_segments
+        if isinstance(segment, dict) and str(segment.get("type") or "").strip()
+    )[:24]
     window = max(0, settings.chat_context_seconds)
     max_messages = max(1, settings.chat_context_messages)
     with chat_history_lock:
         chat_message_sequence += 1
         entry = GroupChatMessage(
-            normalized,
-            str(user_id or ""),
-            timestamp,
-            chat_message_sequence,
-            str(message_id or ""),
-            str(reply_message_id or ""),
-            str(reply_target_user_id or ""),
-            str(reply_text or "").strip(),
-            bool(mentioned_bot),
-            tuple(str(value) for value in mentioned_user_ids if str(value).strip()),
-            str(display_name or "").strip(),
-            tuple(dict.fromkeys(
+            text=normalized,
+            user_id=str(user_id or ""),
+            timestamp=timestamp,
+            sequence=chat_message_sequence,
+            message_id=str(message_id or ""),
+            reply_message_id=str(reply_message_id or ""),
+            reply_target_user_id=str(reply_target_user_id or ""),
+            reply_text=str(reply_text or "").strip(),
+            mentioned_bot=bool(mentioned_bot),
+            mentioned_user_ids=tuple(
+                str(value) for value in mentioned_user_ids if str(value).strip()
+            ),
+            display_name=str(display_name or "").strip(),
+            generated_for_message_ids=tuple(dict.fromkeys(
                 str(value).strip()
                 for value in generated_for_message_ids
                 if str(value).strip()
             )),
-            str(turn_id or "").strip(),
-            str(reply_mode or "").strip(),
-            str(semantic_topic or "").strip(),
+            turn_id=str(turn_id or "").strip(),
+            reply_mode=str(reply_mode or "").strip(),
+            semantic_topic=str(semantic_topic or "").strip(),
+            received_time=received_timestamp,
+            content_segments=safe_segments,
+            message_status=normalized_status,
         )
         history = group_chat_history.setdefault(group_id, [])
         history.append(entry)
@@ -1421,6 +1474,10 @@ def record_group_chat_message(
                 turn_id=entry.turn_id,
                 reply_mode=entry.reply_mode,
                 semantic_topic=entry.semantic_topic,
+                sequence=entry.sequence,
+                received_time=entry.received_time,
+                content_segments=entry.content_segments,
+                message_status=entry.message_status,
             )
         )
     return sequence
@@ -1432,7 +1489,7 @@ def find_group_chat_message(group_id: int, message_id: str) -> GroupChatMessage 
         return None
     with chat_history_lock:
         for item in reversed(group_chat_history.get(group_id, ())):
-            if item.message_id == target:
+            if item.message_id == target and item.message_status == "active":
                 return item
     return None
 
@@ -1497,6 +1554,10 @@ def _context_message_payload(
     payload: dict = {
         "current": current,
         "message_id": item.message_id,
+        "sequence": item.sequence,
+        "event_time": item.timestamp,
+        "received_time": item.received_time,
+        "message_status": item.message_status,
         "speaker": {
             "id": speaker_id,
             "role": "bot" if speaker_id == "bot" else "member",
@@ -1508,6 +1569,7 @@ def _context_message_payload(
             ),
         },
         "text": item.text,
+        "content_segments": list(item.content_segments),
         "mentions": [
             stable_member_id(group_id, user_id)
             for user_id in item.mentioned_user_ids
@@ -1552,10 +1614,11 @@ def recent_group_chat_context(
             group_chat_history[group_id] = recent
         else:
             group_chat_history.pop(group_id, None)
+    active = [item for item in recent if item.message_status == "active"]
     available = (
-        [item for item in recent if item.sequence <= through_sequence]
+        [item for item in active if item.sequence <= through_sequence]
         if through_sequence
-        else recent
+        else active
     )
     selected = available[-limit:]
     if focus_sequence:
@@ -1818,7 +1881,7 @@ def review_and_refresh_answer(
 ) -> tuple[str, str, int]:
     original_context = tuple(decision.chat_context)
     candidate = answer
-    regenerated = False
+    regenerated = decision.reply_regenerated
 
     while True:
         latest_revision = latest_group_user_sequence(group_id)
@@ -1879,7 +1942,7 @@ def review_and_refresh_answer(
         if not review or review.confidence < 0.6:
             return "", "final review unavailable or low confidence", latest_revision
         if review.action == "drop":
-            return "", f"final review dropped: {review.reason}", latest_revision
+            return "", f"final review dropped [{review.context_relation}]: {review.reason}", latest_revision
         if review.action == "revise":
             candidate = finalize_model_answer(
                 review.revised_reply,
@@ -1887,11 +1950,12 @@ def review_and_refresh_answer(
             )
             if not candidate:
                 return "", "final review produced empty revision", latest_revision
-            return candidate, f"final review revised: {review.reason}", latest_revision
+            return candidate, f"final review revised [{review.context_relation}]: {review.reason}", latest_revision
         if review.action == "send":
-            return candidate, f"final review accepted: {review.reason}", latest_revision
+            return candidate, f"final review accepted [{review.context_relation}]: {review.reason}", latest_revision
 
         regenerated = True
+        decision.reply_regenerated = True
         updated_question = review.updated_question
         decision.chat_context = tuple(latest_context)
         decision.effective_question = updated_question
@@ -1919,6 +1983,38 @@ def review_and_refresh_answer(
         if not candidate:
             return "", "regeneration produced no answer", latest_revision
         baseline_revision = latest_revision
+
+
+def refresh_answer_for_late_context(
+    *,
+    question: str,
+    answer: str,
+    decision: ProcessingDecision,
+    group_id: int,
+    mentioned: bool,
+    admin: bool,
+    deadline: float,
+    reviewed_revision: int,
+) -> tuple[str, str, int]:
+    """Re-review only when messages arrived after the previous review."""
+    latest_revision = latest_group_user_sequence(group_id)
+    if latest_revision <= reviewed_revision:
+        return answer, "context unchanged after final review", reviewed_revision
+    refreshed_answer, reason, revision = review_and_refresh_answer(
+        question=question,
+        answer=answer,
+        decision=decision,
+        group_id=group_id,
+        mentioned=mentioned,
+        admin=admin,
+        deadline=deadline,
+        baseline_revision=reviewed_revision,
+    )
+    if refreshed_answer:
+        unsafe_reason = unsafe_or_repeated_reply(group_id, refreshed_answer)
+        if unsafe_reason:
+            return "", unsafe_reason, revision
+    return refreshed_answer, reason, revision
 
 
 def clear_chat_state() -> None:
@@ -1991,6 +2087,9 @@ def save_chat_history(path: str | Path | None = None) -> None:
                         "turn_id": m.turn_id,
                         "reply_mode": m.reply_mode,
                         "semantic_topic": m.semantic_topic,
+                        "received_time": m.received_time,
+                        "content_segments": list(m.content_segments),
+                        "message_status": m.message_status,
                     }
                     for m in messages
                 ]
@@ -2039,7 +2138,9 @@ def recall_group_chat_message(group_id: int, message_id: str) -> None:
         return
     with chat_history_lock:
         history = group_chat_history.get(group_id, [])
-        history[:] = [item for item in history if item.message_id != target]
+        for item in history:
+            if item.message_id == target:
+                item.message_status = "recalled"
     if chat_memory_manager:
         chat_memory_manager.enqueue_recall(group_id, target)
 
@@ -2076,6 +2177,9 @@ def load_chat_history(path: str | Path | None = None) -> int:
                         turn_id=m.get("turn_id", ""),
                         reply_mode=m.get("reply_mode", ""),
                         semantic_topic=m.get("semantic_topic", ""),
+                        received_time=float(m.get("received_time") or m["timestamp"]),
+                        content_segments=tuple(m.get("content_segments") or ()),
+                        message_status=str(m.get("message_status") or "active"),
                     )
                     history.append(entry)
                     chat_message_sequence = max(chat_message_sequence, entry.sequence)
@@ -2115,6 +2219,10 @@ def migrate_loaded_chat_history_to_memory() -> int:
             turn_id=item.turn_id,
             reply_mode=item.reply_mode,
             semantic_topic=item.semantic_topic,
+            sequence=item.sequence,
+            received_time=item.received_time,
+            content_segments=item.content_segments,
+            message_status=item.message_status,
         )))
     return queued
 
@@ -2460,6 +2568,11 @@ def context_selected_by_plan(
         for line in chat_context
         if context_line_payload(line).get("current") or "【当前消息】" in line
     )
+    required_ids = {
+        context_line_message_id(line)
+        for line in current_lines
+        if context_line_message_id(line)
+    }
     reply_ids = {
         reply_id
         for line in current_lines
@@ -2469,14 +2582,30 @@ def context_selected_by_plan(
             )
         )
     }
+    required_ids.update(reply_ids)
+    for candidate in plan.topic_candidates:
+        required_ids.update(candidate.anchor_message_ids)
+    changed = True
+    while changed:
+        changed = False
+        for line in chat_context:
+            message_id = context_line_message_id(line)
+            if message_id not in required_ids:
+                continue
+            reply_id = str(
+                (context_line_payload(line).get("reply_to") or {}).get("message_id") or ""
+            )
+            if reply_id and reply_id not in required_ids:
+                required_ids.add(reply_id)
+                changed = True
     hard_context = tuple(
         line
         for line in chat_context
-        if line in current_lines or context_line_message_id(line) in reply_ids
+        if line in current_lines or context_line_message_id(line) in required_ids
     )
     selected: tuple[str, ...] = ()
     if plan.relevant_context_message_ids:
-        wanted = set(plan.relevant_context_message_ids)
+        wanted = set(plan.relevant_context_message_ids) | required_ids
         selected = tuple(
             line for line in chat_context if context_line_message_id(line) in wanted
         )
@@ -2508,10 +2637,15 @@ def budget_recent_context(
     *,
     max_messages: int,
     max_chars: int,
+    required_message_ids: Sequence[str] = (),
 ) -> tuple[str, ...]:
     if not context:
         return ()
-    required_ids: set[str] = set()
+    required_ids: set[str] = {
+        str(value or "").strip()
+        for value in required_message_ids
+        if str(value or "").strip()
+    }
     for line in context:
         payload = context_line_payload(line)
         if payload.get("current"):
@@ -2543,6 +2677,12 @@ def semantic_context_for_decision(decision: ProcessingDecision) -> str:
         parts.append(f"相关话题：{decision.semantic_topic}")
     if decision.implicit_meaning:
         parts.append(f"可能的非字面含义：{decision.implicit_meaning}")
+    if decision.topic_candidates:
+        candidates = "；".join(
+            f"{candidate.label}（{candidate.basis}，置信度 {candidate.confidence:.2f}）"
+            for candidate in decision.topic_candidates
+        )
+        parts.append(f"候选话题：{candidates}")
     return "\n".join(parts)
 
 
@@ -2646,10 +2786,16 @@ def apply_context_budget(decision: ProcessingDecision) -> None:
     else:
         recent_limit, recent_chars = 8, 1200
         memory_hits, memory_chars = 2, 800
+    topic_anchor_ids = tuple(dict.fromkeys(
+        message_id
+        for candidate in decision.topic_candidates
+        for message_id in candidate.anchor_message_ids
+    ))
     decision.chat_context = budget_recent_context(
         decision.chat_context,
         max_messages=recent_limit,
         max_chars=recent_chars,
+        required_message_ids=topic_anchor_ids,
     )
     decision.memory_context = budget_memory_context(
         decision.memory_context,
@@ -2774,7 +2920,15 @@ def enrich_decision_with_chat_memory(
                 value = str(message_id or "").strip()
                 if value and value not in related_message_ids:
                     related_message_ids.append(value)
-            topic_ids = tuple(dict.fromkeys(hit.topic_id for hit in hits if hit.topic_id))
+            topic_ids_list = list(dict.fromkeys(hit.topic_id for hit in hits if hit.topic_id))
+            for message_id in selected_recent_ids:
+                for assignment in chat_memory_manager.store.topic_assignments_for_message(
+                    group_id,
+                    message_id,
+                ):
+                    if assignment.topic_id not in topic_ids_list:
+                        topic_ids_list.append(assignment.topic_id)
+            topic_ids = tuple(topic_ids_list)
             self_history = chat_memory_manager.store.format_self_history(
                 group_id=group_id,
                 related_message_ids=related_message_ids,
@@ -2838,6 +2992,7 @@ def enrich_decision_with_chat_memory(
             self_history_chars=decision.self_history_chars,
             self_history_selected_message_ids=decision.self_history_selected_message_ids,
             self_history_reasons=decision.self_history_reasons,
+            topic_candidates=decision.topic_candidates,
             event_time=item.get("time"),
         )
     return decision
@@ -4403,14 +4558,15 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             decision.recent_context_candidate_count = int(
                 item.get("_recent_context_candidate_count") or len(item.get("chat_context") or ())
             )
+            if selected_plan:
+                decision.risk_flags = selected_plan[0].risk_flags
+                decision.topic_candidates = selected_plan[0].topic_candidates
             decision = enrich_decision_with_chat_memory(
                 decision,
                 item,
                 selected_plan[0] if selected_plan else None,
                 memory_probe,
             )
-            if selected_plan:
-                decision.risk_flags = selected_plan[0].risk_flags
             if not decision.should_reply:
                 print("Skip message: model/router decided no reply", group_id, question)
                 write_message_audit(
@@ -4633,22 +4789,35 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     event_time=event_time,
                 )
                 continue
-            if (
-                decision.reply_mode not in {"bot_meta", "identity"}
-                and latest_group_user_sequence(group_id) > reviewed_revision
-            ):
-                write_message_audit(
-                    decision="skipped",
-                    reason="context changed after final review",
-                    group_id=group_id,
-                    user_id=user_id,
+            if decision.reply_mode not in {"bot_meta", "identity"}:
+                answer, late_review_reason, reviewed_revision = refresh_answer_for_late_context(
                     question=question,
+                    answer=answer,
+                    decision=decision,
+                    group_id=group_id,
                     mentioned=mentioned,
-                    reply_mode=decision.reply_mode,
-                    model_latency_ms=model_latency_ms,
-                    event_time=event_time,
+                    admin=admin_user,
+                    deadline=deadline,
+                    reviewed_revision=reviewed_revision,
                 )
-                continue
+                if not answer:
+                    write_message_audit(
+                        decision="skipped",
+                        reason=late_review_reason,
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        mentioned=mentioned,
+                        reply_mode=decision.reply_mode,
+                        model_latency_ms=int((time.monotonic() - model_started) * 1000),
+                        event_time=event_time,
+                    )
+                    continue
+                if late_review_reason != "context unchanged after final review":
+                    review_reason = "; ".join(
+                        value for value in (review_reason, late_review_reason) if value
+                    )
+                    model_latency_ms = int((time.monotonic() - model_started) * 1000)
             with group_send_lock(group_id):
                 if (
                     decision.reply_mode not in {"bot_meta", "identity"}
@@ -4717,6 +4886,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 implicit_meaning=decision.implicit_meaning,
                 capability=decision.capability,
                 semantic_confidence=decision.semantic_confidence,
+                topic_candidates=decision.topic_candidates,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
@@ -4953,7 +5123,6 @@ def chat_worker() -> None:
                     event_time=event_time,
                 )
                 continue
-
             unsafe_reason = unsafe_or_repeated_reply(group_id, answer)
             if unsafe_reason:
                 write_message_audit(
@@ -5080,19 +5249,38 @@ def chat_worker() -> None:
                     event_time=event_time,
                 )
                 continue
-            if latest_group_user_sequence(group_id) > reviewed_revision:
+            answer, late_review_reason, reviewed_revision = refresh_answer_for_late_context(
+                question=question,
+                answer=answer,
+                decision=decision,
+                group_id=group_id,
+                mentioned=bool(item.get("mentioned")),
+                admin=False,
+                deadline=deadline,
+                reviewed_revision=reviewed_revision,
+            )
+            if not answer:
                 write_message_audit(
                     decision="skipped",
-                    reason="context changed after final review",
+                    reason=late_review_reason,
                     group_id=group_id,
                     user_id=user_id,
                     question=question,
                     reply_mode="chat",
-                    model_latency_ms=model_latency_ms,
+                    model_latency_ms=routing_latency_ms + int(
+                        (time.monotonic() - model_started) * 1000
+                    ),
                     model_name=settings.chat_model,
                     event_time=event_time,
                 )
                 continue
+            if late_review_reason != "context unchanged after final review":
+                review_reason = "; ".join(
+                    value for value in (review_reason, late_review_reason) if value
+                )
+                model_latency_ms = routing_latency_ms + int(
+                    (time.monotonic() - model_started) * 1000
+                )
 
             with group_send_lock(group_id):
                 quota_reason = chat_reply_quota_reason(group_id)
@@ -5168,6 +5356,7 @@ def chat_worker() -> None:
                 implicit_meaning=decision.implicit_meaning,
                 capability=decision.capability,
                 semantic_confidence=decision.semantic_confidence,
+                topic_candidates=decision.topic_candidates,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
@@ -5279,6 +5468,7 @@ class Handler(BaseHTTPRequestHandler):
                     "scene_updating": scene_updating,
                     "memory_messages": memory_status.get("messages", 0),
                     "memory_chunks": memory_status.get("chunks", 0),
+                    "memory_topic_relations": memory_status.get("topic_relations", 0),
                     "memory_queued": memory_status.get("queued", 0),
                     "memory_paused": memory_status.get("paused", False),
                 },
@@ -5341,6 +5531,7 @@ class Handler(BaseHTTPRequestHandler):
             if not settings.allowed_group_ids or str(group_id) in settings.allowed_group_ids:
                 try:
                     recall_group_chat_message(int(group_id), str(event.get("message_id") or ""))
+                    schedule_chat_history_save()
                 except (TypeError, ValueError):
                     pass
             self._json(200, {"ok": True, "recalled": True})
@@ -5369,8 +5560,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         raw_message = event.get("message", "")
+        received_time = time.time()
         text = extract_plain_text(raw_message)
         context_text = extract_context_text(raw_message)
+        content_segments = extract_content_segments(raw_message)
         mentioned = is_mentioned(settings.bot_qq, raw_message)
         mentioned_user_ids = extract_mentioned_user_ids(settings.bot_qq, raw_message)
         user_id = event.get("user_id")
@@ -5404,6 +5597,8 @@ class Handler(BaseHTTPRequestHandler):
                 or event.get("sender", {}).get("nickname")
                 or ""
             ),
+            received_time=received_time,
+            content_segments=content_segments,
         )
         schedule_chat_history_save()
         schedule_chat_scene_update(numeric_group_id, chat_sequence)
@@ -5515,6 +5710,9 @@ class Handler(BaseHTTPRequestHandler):
             "reply_text": reply_text,
             "message_id": str(event.get("message_id") or ""),
             "chat_sequence": chat_sequence,
+            "received_time": received_time,
+            "content_segments": list(content_segments),
+            "message_status": "active",
         }
         fragment_audience = classify_fragment_audience(item)
         try:
