@@ -59,6 +59,28 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertTrue(any("今晚八点集合" in hit.text for hit in hits))
         self.assertTrue(all("reply_chain" in hit.reasons for hit in hits))
 
+    def test_lexical_probe_recalls_related_history_without_embedding_query(self):
+        now = time.time()
+        self.store.add_message(self.message(1, "m1", "member_a", "今晚八点在北桥集合", now))
+
+        class FailingEmbedding:
+            name = "must-not-run"
+            dimensions = 128
+
+            def embed(self, texts):
+                raise AssertionError("lexical probe must stay local")
+
+        self.store.embedding = FailingEmbedding()
+        hits = self.store.lexical_probe(group_id=1, query="北桥集合时间")
+        self.assertTrue(hits)
+        self.assertIn("北桥", hits[0].text)
+
+    def test_lexical_probe_rejects_single_weak_overlap(self):
+        now = time.time()
+        self.store.add_message(self.message(1, "m1", "member_a", "今天晚上一起吃饭", now))
+        hits = self.store.lexical_probe(group_id=1, query="晚上开黑地图")
+        self.assertFalse(hits)
+
     def test_retrieval_never_crosses_group_boundary(self):
         now = time.time()
         self.store.add_message(self.message(1, "g1", "member_a", "秘密集合点在北桥", now))
@@ -89,6 +111,7 @@ class ChatMemoryTests(unittest.TestCase):
         hit = self.store.retrieve(group_id=1, query="北桥")[0]
         payload = json.loads(self.store.format_hits([hit])[0])
         self.assertEqual(payload["source"], "untrusted_group_chat_memory")
+        self.assertEqual(payload["chunk_id"], hit.chunk_id)
         self.assertEqual(payload["speakers"], ["member_a"])
         self.assertEqual(payload["messages"][0]["speaker"]["id"], "member_a")
 

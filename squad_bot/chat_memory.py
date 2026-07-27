@@ -312,6 +312,72 @@ class ChatMemoryStore:
             self.rebuild_group(group_id)
         return found
 
+    def lexical_probe(
+        self,
+        *,
+        group_id: int,
+        query: str,
+        exclude_message_id: str = "",
+        limit: int = 3,
+        max_chars: int = 1600,
+    ) -> tuple[MemoryHit, ...]:
+        """Cheap local recall used before deciding whether full retrieval is worthwhile."""
+        query_terms = tuple(term for term in lexical_terms(query) if len(term) >= 2)
+        if len(query_terms) < 2:
+            return ()
+        match = " OR ".join(f'"{term}"' for term in query_terms[:40])
+        with self.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """SELECT c.*, bm25(memory_chunks_fts) AS rank FROM memory_chunks_fts
+                       JOIN memory_chunks c ON c.id=memory_chunks_fts.chunk_id
+                       WHERE memory_chunks_fts MATCH ? AND c.group_id=? AND c.active=1
+                       ORDER BY rank LIMIT 40""",
+                    (match, group_id),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return ()
+
+            now = time.time()
+            hits: list[MemoryHit] = []
+            query_term_set = set(query_terms)
+            for position, row in enumerate(rows):
+                message_ids = tuple(json.loads(row["message_ids_json"]))
+                if exclude_message_id and exclude_message_id in message_ids:
+                    continue
+                row_terms = set(str(row["search_text"]).split())
+                matched = len(query_term_set.intersection(row_terms))
+                coverage = matched / max(1, len(query_term_set))
+                # One common bigram is too weak for automatic history injection.
+                if matched < 2 or coverage < 0.24:
+                    continue
+                age_days = max(0.0, (now - float(row["ended_at"])) / 86400)
+                recency = 1.0 / (1.0 + age_days / 7.0)
+                lexical_score = min(1.0, 0.75 * coverage + 0.25 / (1.0 + position))
+                hits.append(MemoryHit(
+                    int(row["id"]),
+                    int(row["group_id"]),
+                    str(row["text"]),
+                    tuple(json.loads(row["speaker_ids_json"])),
+                    float(row["ended_at"]),
+                    int(row["topic_id"]),
+                    message_ids,
+                    0.85 * lexical_score + 0.15 * recency,
+                    ("lexical_probe", "recent"),
+                ))
+            hits.sort(key=lambda hit: hit.score, reverse=True)
+            selected: list[MemoryHit] = []
+            used = 0
+            for hit in hits:
+                size = len(hit.text)
+                if selected and used + size > max_chars:
+                    continue
+                selected.append(hit)
+                used += size
+                if len(selected) >= max(1, limit) or used >= max_chars:
+                    break
+            return tuple(selected)
+
     def retrieve(self, *, group_id: int, query: str, speaker_id: str = "", reply_message_id: str = "", exclude_message_id: str = "", topic_id: int = 0, participant_scope: str = "group", time_scope: str = "", limit: int = 6, max_chars: int = 2400) -> tuple[MemoryHit, ...]:
         if not query.strip() and not reply_message_id:
             return ()
@@ -432,6 +498,7 @@ class ChatMemoryStore:
                     })
                 lines.append(json.dumps({
                     "source": "untrusted_group_chat_memory",
+                    "chunk_id": hit.chunk_id,
                     "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(hit.event_time)),
                     "speakers": list(hit.speaker_ids),
                     "messages": messages,

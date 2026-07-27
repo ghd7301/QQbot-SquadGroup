@@ -15,7 +15,7 @@ from typing import Sequence
 from urllib.parse import parse_qs
 
 from .config import settings
-from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryMessage, redact_for_model
+from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
 from .knowledge import KnowledgeBase
 from .llm import (
@@ -108,6 +108,27 @@ class ProcessingDecision:
     memory_query: str = ""
     memory_needed: bool = False
     memory_hit_count: int = 0
+    memory_retrieval_attempted: bool = False
+    memory_retrieval_mode: str = ""
+    memory_candidate_count: int = 0
+    memory_rejection_reason: str = ""
+    recent_context_candidate_count: int = 0
+    recent_context_selected_count: int = 0
+    recent_context_chars: int = 0
+    memory_context_chars: int = 0
+    context_deduplicated_count: int = 0
+    recent_context_selected_ids: tuple[str, ...] = ()
+    memory_selected_chunk_ids: tuple[int, ...] = ()
+    memory_selected_by_planner: bool = False
+
+
+@dataclass(frozen=True)
+class MemoryProbeResult:
+    query: str = ""
+    hits: tuple[MemoryHit, ...] = ()
+    context: tuple[str, ...] = ()
+    attempted: bool = False
+    rejection_reason: str = ""
 
 
 @dataclass
@@ -819,6 +840,18 @@ def write_message_audit(
     semantic_confidence: float = 0.0,
     memory_query: str = "",
     memory_hit_count: int = 0,
+    memory_retrieval_attempted: bool = False,
+    memory_retrieval_mode: str = "",
+    memory_candidate_count: int = 0,
+    memory_rejection_reason: str = "",
+    recent_context_candidate_count: int = 0,
+    recent_context_selected_count: int = 0,
+    recent_context_chars: int = 0,
+    memory_context_chars: int = 0,
+    context_deduplicated_count: int = 0,
+    recent_context_selected_ids: Sequence[str] = (),
+    memory_selected_chunk_ids: Sequence[int] = (),
+    memory_selected_by_planner: bool = False,
     event_time=None,
 ) -> None:
     try:
@@ -857,6 +890,18 @@ def write_message_audit(
         "semantic_confidence": round(float(semantic_confidence), 4),
         "memory_query": memory_query,
         "memory_hit_count": int(memory_hit_count),
+        "memory_retrieval_attempted": bool(memory_retrieval_attempted),
+        "memory_retrieval_mode": memory_retrieval_mode,
+        "memory_candidate_count": int(memory_candidate_count),
+        "memory_rejection_reason": memory_rejection_reason,
+        "recent_context_candidate_count": int(recent_context_candidate_count),
+        "recent_context_selected_count": int(recent_context_selected_count),
+        "recent_context_chars": int(recent_context_chars),
+        "memory_context_chars": int(memory_context_chars),
+        "context_deduplicated_count": int(context_deduplicated_count),
+        "recent_context_selected_ids": list(recent_context_selected_ids),
+        "memory_selected_chunk_ids": [int(value) for value in memory_selected_chunk_ids],
+        "memory_selected_by_planner": bool(memory_selected_by_planner),
     }
     log_path = Path(settings.message_audit_log)
     try:
@@ -1646,6 +1691,33 @@ def unsafe_or_repeated_reply(group_id: int, answer: str, *, limit: int = 10) -> 
     return ""
 
 
+def is_recent_duplicate_group_message(
+    group_id: int,
+    text: str,
+    *,
+    focus_sequence: int,
+    event_time=None,
+    window_seconds: int = 60,
+) -> bool:
+    normalized = re.sub(r"[\W_]+", "", str(text or "").lower())
+    if len(normalized) < 4 or focus_sequence <= 0:
+        return False
+    try:
+        current_time = float(event_time)
+    except (TypeError, ValueError):
+        current_time = time.time()
+    with chat_history_lock:
+        for item in reversed(group_chat_history.get(group_id, ())):
+            if item.sequence >= focus_sequence:
+                continue
+            if current_time - item.timestamp > max(0, window_seconds):
+                break
+            previous = re.sub(r"[\W_]+", "", item.text.lower())
+            if previous == normalized:
+                return True
+    return False
+
+
 def reply_deadline(event_time, mentioned: bool) -> float:
     total = (
         getattr(settings, "mentioned_reply_total_timeout_seconds", 15)
@@ -2230,6 +2302,7 @@ def semantic_plan_for_message(
     question: str,
     chat_context: Sequence[str],
     *,
+    memory_candidates: Sequence[str] = (),
     mentioned: bool,
     mentions_other: bool,
     reply_target_user_id: str = "",
@@ -2249,6 +2322,7 @@ def semantic_plan_for_message(
         model=getattr(settings, "semantic_planner_model", settings.llm_model),
         message=question,
         context=tuple(chat_context),
+        memory_candidates=tuple(memory_candidates),
         mentioned=mentioned,
         mentions_other=mentions_other,
         reply_target=reply_target,
@@ -2268,21 +2342,88 @@ def context_selected_by_plan(
     chat_context: Sequence[str],
     plan: MessagePlan | None,
 ) -> tuple[str, ...]:
-    if not plan or not plan.relevant_context_indices:
+    if not plan:
         return tuple(chat_context)
-    selected = tuple(
-        chat_context[index - 1]
-        for index in plan.relevant_context_indices
-        if 1 <= index <= len(chat_context)
-    )
-    if not selected:
-        return tuple(chat_context)
-    current = tuple(
+    current_lines = tuple(
         line
         for line in chat_context
-        if '"current":true' in line or "【当前消息】" in line
+        if context_line_payload(line).get("current") or "【当前消息】" in line
     )
-    return tuple(dict.fromkeys((*selected, *current)))
+    reply_ids = {
+        reply_id
+        for line in current_lines
+        if (
+            reply_id := str(
+                (context_line_payload(line).get("reply_to") or {}).get("message_id") or ""
+            )
+        )
+    }
+    hard_context = tuple(
+        line
+        for line in chat_context
+        if line in current_lines or context_line_message_id(line) in reply_ids
+    )
+    selected: tuple[str, ...] = ()
+    if plan.relevant_context_message_ids:
+        wanted = set(plan.relevant_context_message_ids)
+        selected = tuple(
+            line for line in chat_context if context_line_message_id(line) in wanted
+        )
+    elif plan.relevant_context_indices:
+        selected = tuple(
+            chat_context[index - 1]
+            for index in plan.relevant_context_indices
+            if 1 <= index <= len(chat_context)
+        )
+    if not selected:
+        return hard_context or tuple(chat_context[-1:])
+    return tuple(dict.fromkeys((*selected, *hard_context)))
+
+
+def context_line_payload(line: str) -> dict:
+    try:
+        payload = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def context_line_message_id(line: str) -> str:
+    return str(context_line_payload(line).get("message_id") or "")
+
+
+def budget_recent_context(
+    context: Sequence[str],
+    *,
+    max_messages: int,
+    max_chars: int,
+) -> tuple[str, ...]:
+    if not context:
+        return ()
+    required_ids: set[str] = set()
+    for line in context:
+        payload = context_line_payload(line)
+        if payload.get("current"):
+            message_id = str(payload.get("message_id") or "")
+            if message_id:
+                required_ids.add(message_id)
+            reply_to = payload.get("reply_to") or {}
+            replied_id = str(reply_to.get("message_id") or "")
+            if replied_id:
+                required_ids.add(replied_id)
+    selected: list[str] = []
+    used = 0
+    for line in reversed(tuple(context)):
+        message_id = context_line_message_id(line)
+        required = message_id in required_ids
+        if not required and len(selected) >= max(1, max_messages):
+            continue
+        if not required and selected and used + len(line) > max(200, max_chars):
+            continue
+        selected.append(line)
+        used += len(line)
+    selected.reverse()
+    return tuple(selected)
 
 
 def semantic_context_for_decision(decision: ProcessingDecision) -> str:
@@ -2301,37 +2442,191 @@ def chat_memory_enabled_for_group(group_id: int) -> bool:
     return not allowed or str(group_id) in allowed
 
 
+def probe_chat_memory(item: dict, query: str) -> MemoryProbeResult:
+    group_id = int(item.get("group_id") or 0)
+    if not chat_memory_enabled_for_group(group_id):
+        return MemoryProbeResult(query=query, rejection_reason="memory disabled for group")
+    normalized = "".join(re.findall(r"[a-z0-9\u3400-\u9fff]", str(query or "").lower()))
+    if len(normalized) < 4:
+        return MemoryProbeResult(query=query, rejection_reason="query too short for automatic probe")
+    try:
+        hits = chat_memory_manager.store.lexical_probe(
+            group_id=group_id,
+            query=query,
+            exclude_message_id=str(item.get("message_id") or ""),
+            limit=max(1, getattr(settings, "chat_memory_probe_max_hits", 8)),
+            max_chars=max(200, getattr(settings, "chat_memory_probe_max_chars", 1600)),
+        )
+        context = chat_memory_manager.store.format_hits(hits)
+        return MemoryProbeResult(
+            query=query,
+            hits=hits,
+            context=context,
+            attempted=True,
+            rejection_reason="" if context else "no relevant memory candidate",
+        )
+    except Exception as exc:
+        print("Chat memory probe failed:", type(exc).__name__, repr(exc))
+        return MemoryProbeResult(
+            query=query,
+            attempted=True,
+            rejection_reason=f"probe error: {type(exc).__name__}",
+        )
+
+
+def deduplicate_memory_context(
+    memory_context: Sequence[str],
+    recent_context: Sequence[str],
+) -> tuple[tuple[str, ...], int]:
+    recent_message_ids = {
+        context_line_message_id(line) for line in recent_context if context_line_message_id(line)
+    }
+    result: list[str] = []
+    dropped = 0
+    for line in memory_context:
+        payload = context_line_payload(line)
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            result.append(line)
+            continue
+        kept = []
+        for message in messages:
+            message_id = str(message.get("message_id") or "") if isinstance(message, dict) else ""
+            if message_id and message_id in recent_message_ids:
+                dropped += 1
+                continue
+            kept.append(message)
+        if not kept:
+            continue
+        payload["messages"] = kept
+        result.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return tuple(result), dropped
+
+
+def budget_memory_context(
+    context: Sequence[str],
+    *,
+    max_hits: int,
+    max_chars: int,
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    used = 0
+    for line in context:
+        if selected and used + len(line) > max(200, max_chars):
+            continue
+        selected.append(line)
+        used += len(line)
+        if len(selected) >= max(1, max_hits) or used >= max_chars:
+            break
+    return tuple(selected)
+
+
+def apply_context_budget(decision: ProcessingDecision) -> None:
+    recent_candidate_count = (
+        decision.recent_context_candidate_count or len(decision.chat_context)
+    )
+    if decision.reply_mode == "chat":
+        recent_limit = max(1, getattr(settings, "planned_chat_context_messages", 10))
+        recent_chars = max(400, getattr(settings, "planned_chat_context_max_chars", 1600))
+        memory_hits, memory_chars = 3, 1000
+    elif decision.reply_mode == "knowledge":
+        recent_limit, recent_chars = 8, 1200
+        memory_hits, memory_chars = 2, 800
+    else:
+        recent_limit, recent_chars = 8, 1200
+        memory_hits, memory_chars = 2, 800
+    decision.chat_context = budget_recent_context(
+        decision.chat_context,
+        max_messages=recent_limit,
+        max_chars=recent_chars,
+    )
+    decision.memory_context = budget_memory_context(
+        decision.memory_context,
+        max_hits=memory_hits,
+        max_chars=memory_chars,
+    )
+    decision.recent_context_candidate_count = recent_candidate_count
+    decision.recent_context_selected_count = len(decision.chat_context)
+    decision.recent_context_chars = sum(len(line) for line in decision.chat_context)
+    decision.memory_context_chars = sum(len(line) for line in decision.memory_context)
+    decision.memory_hit_count = len(decision.memory_context)
+    decision.recent_context_selected_ids = tuple(
+        message_id
+        for line in decision.chat_context
+        if (message_id := context_line_message_id(line))
+    )
+    selected_chunk_ids: list[int] = []
+    for line in decision.memory_context:
+        try:
+            chunk_id = int(context_line_payload(line).get("chunk_id"))
+        except (TypeError, ValueError):
+            continue
+        if chunk_id not in selected_chunk_ids:
+            selected_chunk_ids.append(chunk_id)
+    decision.memory_selected_chunk_ids = tuple(selected_chunk_ids)
+
+
 def enrich_decision_with_chat_memory(
     decision: ProcessingDecision,
     item: dict,
     plan: MessagePlan | None,
+    probe: MemoryProbeResult | None = None,
 ) -> ProcessingDecision:
     group_id = int(item.get("group_id") or 0)
     reply_message_id = str(item.get("reply_message_id") or "")
-    memory_needed = bool(reply_message_id or (plan and plan.memory_needed))
-    decision.memory_needed = memory_needed
-    if not memory_needed or not chat_memory_enabled_for_group(group_id):
-        return decision
+    requested_by_plan = bool(plan and plan.memory_needed)
+    hard_reply_retrieval = bool(reply_message_id and not requested_by_plan)
     query = (
         (plan.memory_query if plan else "")
         or decision.effective_question
         or str(item.get("question") or "")
     )
+    probe = probe or probe_chat_memory(item, query)
     decision.memory_query = query
+    decision.memory_retrieval_attempted = probe.attempted
+    decision.memory_candidate_count = len(probe.context)
+    decision.memory_rejection_reason = probe.rejection_reason
+    decision.memory_selected_by_planner = bool(
+        plan and (plan.selected_memory_chunk_ids or plan.memory_needed)
+    )
+    hits: Sequence[MemoryHit] = ()
     try:
-        hits = chat_memory_manager.store.retrieve(
-            group_id=group_id,
-            query=query,
-            speaker_id=stable_member_id(group_id, str(item.get("user_id") or "")),
-            reply_message_id=reply_message_id,
-            exclude_message_id=str(item.get("message_id") or ""),
-            participant_scope=plan.participant_scope if plan else "reply_chain",
-            time_scope=plan.time_scope if plan else "",
-            limit=max(1, getattr(settings, "chat_memory_max_hits", 6)),
-            max_chars=max(200, getattr(settings, "chat_memory_max_chars", 2400)),
-        )
-        formatted = chat_memory_manager.store.format_hits(hits)
+        if not decision.should_reply:
+            decision.memory_retrieval_mode = "probe_only"
+            decision.memory_rejection_reason = "router decided no reply"
+        elif not chat_memory_enabled_for_group(group_id):
+            decision.memory_retrieval_mode = "disabled"
+            decision.memory_rejection_reason = "memory disabled for group"
+        elif requested_by_plan or hard_reply_retrieval:
+            decision.memory_retrieval_mode = "planned" if requested_by_plan else "reply_chain"
+            decision.memory_retrieval_attempted = True
+            hits = chat_memory_manager.store.retrieve(
+                group_id=group_id,
+                query=query,
+                speaker_id=stable_member_id(group_id, str(item.get("user_id") or "")),
+                reply_message_id=reply_message_id,
+                exclude_message_id=str(item.get("message_id") or ""),
+                participant_scope=plan.participant_scope if requested_by_plan else "reply_chain",
+                time_scope=plan.time_scope if plan else "",
+                limit=max(1, getattr(settings, "chat_memory_max_hits", 6)),
+                max_chars=max(200, getattr(settings, "chat_memory_max_chars", 2400)),
+            )
+        else:
+            decision.memory_retrieval_mode = "lexical_probe"
+            if plan:
+                selected_ids = set(plan.selected_memory_chunk_ids)
+                hits = tuple(hit for hit in probe.hits if hit.chunk_id in selected_ids)
+                if probe.context and not selected_ids:
+                    decision.memory_rejection_reason = "planner did not select memory candidate"
+            else:
+                hits = probe.hits
+        formatted = chat_memory_manager.store.format_hits(hits) if hits else ()
+        formatted, deduplicated = deduplicate_memory_context(formatted, decision.chat_context)
+        decision.context_deduplicated_count = deduplicated
         decision.memory_hit_count = len(formatted)
+        decision.memory_needed = bool(formatted)
+        if not formatted:
+            decision.memory_rejection_reason = decision.memory_rejection_reason or "no selected memory candidate"
         if getattr(settings, "chat_memory_shadow_mode", False):
             print("Chat memory shadow", group_id, len(formatted), query[:80])
             write_message_audit(
@@ -2342,6 +2637,10 @@ def enrich_decision_with_chat_memory(
                 question=str(item.get("question") or ""),
                 memory_query=query,
                 memory_hit_count=len(formatted),
+                memory_retrieval_attempted=True,
+                memory_retrieval_mode=decision.memory_retrieval_mode,
+                memory_candidate_count=decision.memory_candidate_count,
+                memory_rejection_reason=decision.memory_rejection_reason,
                 event_time=item.get("time"),
             )
         else:
@@ -2349,7 +2648,32 @@ def enrich_decision_with_chat_memory(
             if formatted:
                 decision.draft_reply = ""
     except Exception as exc:
+        decision.memory_rejection_reason = f"retrieval error: {type(exc).__name__}"
         print("Chat memory retrieval failed:", type(exc).__name__, repr(exc))
+    apply_context_budget(decision)
+    if not getattr(settings, "chat_memory_shadow_mode", False):
+        write_message_audit(
+            decision="memory_retrieval",
+            reason=decision.memory_rejection_reason or "memory context injected",
+            group_id=group_id,
+            user_id=item.get("user_id"),
+            question=str(item.get("question") or ""),
+            memory_query=query,
+            memory_hit_count=decision.memory_hit_count,
+            memory_retrieval_attempted=decision.memory_retrieval_attempted,
+            memory_retrieval_mode=decision.memory_retrieval_mode,
+            memory_candidate_count=decision.memory_candidate_count,
+            memory_rejection_reason=decision.memory_rejection_reason,
+            recent_context_candidate_count=decision.recent_context_candidate_count,
+            recent_context_selected_count=decision.recent_context_selected_count,
+            recent_context_chars=decision.recent_context_chars,
+            memory_context_chars=decision.memory_context_chars,
+            context_deduplicated_count=decision.context_deduplicated_count,
+            recent_context_selected_ids=decision.recent_context_selected_ids,
+            memory_selected_chunk_ids=decision.memory_selected_chunk_ids,
+            memory_selected_by_planner=decision.memory_selected_by_planner,
+            event_time=item.get("time"),
+        )
     return decision
 
 
@@ -3244,6 +3568,7 @@ def should_process_message(
     followup_scope: str = "",
     group_id: int = 0,
     chat_context: Sequence[str] = (),
+    memory_candidates: Sequence[str] = (),
     mentions_other: bool = False,
     reply_target_user_id: str = "",
     user_id: str = "",
@@ -3278,6 +3603,7 @@ def should_process_message(
     plan = semantic_plan_for_message(
         normalized,
         chat_context,
+        memory_candidates=memory_candidates,
         mentioned=mentioned,
         mentions_other=mentions_other,
         reply_target_user_id=reply_target_user_id,
@@ -3765,6 +4091,28 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
                 continue
 
+            if (
+                not mentioned
+                and not item.get("reply_message_id")
+                and not item.get("mentioned_user_ids")
+                and is_recent_duplicate_group_message(
+                    group_id,
+                    question,
+                    focus_sequence=int(item.get("chat_sequence") or 0),
+                    event_time=event_time,
+                )
+            ):
+                write_message_audit(
+                    decision="skipped",
+                    reason="duplicate group message before semantic planning",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    event_time=event_time,
+                )
+                continue
+
             item["chat_context"] = list(
                 recent_group_chat_context(
                     group_id,
@@ -3772,6 +4120,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     focus_sequence=int(item.get("chat_sequence") or 0),
                 )
             )
+            item["_recent_context_candidate_count"] = len(item["chat_context"])
             followup_match = followup_context_for(
                 group_id,
                 user_id,
@@ -3784,6 +4133,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             )
             effective_question = build_effective_question(question, followup_match)
             generation_question = build_generation_question(question, followup_match)
+            memory_probe = probe_chat_memory(item, effective_question or question)
             model_started = time.monotonic()
             planner_timeout = remaining_reply_timeout(
                 deadline,
@@ -3809,6 +4159,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 followup_scope=followup_match.scope if followup_match else "",
                 group_id=group_id,
                 chat_context=tuple(item.get("chat_context") or ()),
+                memory_candidates=memory_probe.context,
                 mentions_other=bool(item.get("mentions_other")),
                 reply_target_user_id=str(item.get("reply_target_user_id") or ""),
                 user_id=str(user_id or ""),
@@ -3816,10 +4167,14 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 planner_timeout=planner_timeout,
                 plan_out=selected_plan,
             )
+            decision.recent_context_candidate_count = int(
+                item.get("_recent_context_candidate_count") or len(item.get("chat_context") or ())
+            )
             decision = enrich_decision_with_chat_memory(
                 decision,
                 item,
                 selected_plan[0] if selected_plan else None,
+                memory_probe,
             )
             if not decision.should_reply:
                 print("Skip message: model/router decided no reply", group_id, question)
@@ -4221,6 +4576,12 @@ def chat_worker() -> None:
             )
             if not decision.semantic_topic:
                 decision.chat_context = latest_context
+            decision.memory_context, dropped = deduplicate_memory_context(
+                decision.memory_context,
+                decision.chat_context,
+            )
+            decision.context_deduplicated_count += dropped
+            apply_context_budget(decision)
             scene_context = current_group_chat_scene(
                 group_id,
                 focus_sequence=chat_sequence,

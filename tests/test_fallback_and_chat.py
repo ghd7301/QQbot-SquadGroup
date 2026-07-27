@@ -56,6 +56,27 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
     def tearDown(self) -> None:
         server.clear_chat_state()
 
+    def test_recent_duplicate_can_skip_semantic_planning(self) -> None:
+        configured = routing_settings(chat_context_seconds=300, chat_context_messages=12)
+        with patch.object(server, "settings", configured):
+            first = server.record_group_chat_message(1, "a", "好家伙，复读机是吧", 100)
+            second = server.record_group_chat_message(1, "b", "好家伙复读机是吧", 120)
+            self.assertFalse(server.is_recent_duplicate_group_message(
+                1, "好家伙，复读机是吧", focus_sequence=first, event_time=100
+            ))
+            self.assertTrue(server.is_recent_duplicate_group_message(
+                1, "好家伙复读机是吧", focus_sequence=second, event_time=120
+            ))
+
+    def test_short_common_messages_are_not_duplicate_coalesced(self) -> None:
+        configured = routing_settings(chat_context_seconds=300, chat_context_messages=12)
+        with patch.object(server, "settings", configured):
+            server.record_group_chat_message(1, "a", "哈哈", 100)
+            second = server.record_group_chat_message(1, "b", "哈哈", 101)
+            self.assertFalse(server.is_recent_duplicate_group_message(
+                1, "哈哈", focus_sequence=second, event_time=101
+            ))
+
     def test_mentioned_knowledge_miss_uses_fallback(self) -> None:
         with (
             patch.object(server, "settings", routing_settings()),
