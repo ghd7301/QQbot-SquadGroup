@@ -68,6 +68,7 @@ QUERY_COVERAGE_NOISE = (
     "怎么说",
     "怎么用",
     "怎么玩",
+    "怎么样",
     "怎么",
     "咋玩",
     "咋办",
@@ -103,9 +104,17 @@ QUERY_COVERAGE_NOISE = (
     "多久",
     "为啥",
     "什么",
+    "是",
+    "的",
     "啊",
     "呢",
     "吗",
+)
+
+COLLOQUIAL_QUERY_REWRITES = (
+    ("咋样", "怎么样"),
+    ("咋个", "怎么"),
+    ("咋", "怎么"),
 )
 
 QUERY_ALIASES = (
@@ -399,6 +408,8 @@ def tokenize(text: str) -> list[str]:
 
 def coverage_tokens(text: str) -> set[str]:
     cleaned = text.lower()
+    for colloquial, standard in COLLOQUIAL_QUERY_REWRITES:
+        cleaned = cleaned.replace(colloquial, standard)
     for phrase in QUERY_COVERAGE_NOISE:
         cleaned = cleaned.replace(phrase, " ")
 

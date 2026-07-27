@@ -62,6 +62,22 @@ class KnowledgeTermTests(unittest.TestCase):
         self.assertTrue(any("医疗" in source for source in result.sources))
         self.assertTrue(any("榴弹" in source for source in result.sources))
 
+    def test_colloquial_st_badge_queries_recall_local_rules(self) -> None:
+        for query in (
+            "考队标要咋考啊",
+            "队标怎么考",
+            "晋升路线是咋样的",
+            "考核晋升路线",
+        ):
+            with self.subTest(query=query):
+                result = self.knowledge_base.build_context_with_metrics(query, 1200)
+                self.assertGreaterEqual(result.top_score, 0.18)
+                self.assertGreaterEqual(result.query_coverage, 0.6)
+                self.assertTrue(
+                    any(source.startswith("19-ST战队队标考核.md") for source in result.sources)
+                )
+                self.assertIn("[S.T.I]", result.context)
+
     def test_fob_and_hab_queries_find_correct_explanations(self) -> None:
         expected_titles = {
             "FOB和HAB有什么区别": {"FOB 是什么", "FOB、电台、兵站、HAB 是什么关系"},

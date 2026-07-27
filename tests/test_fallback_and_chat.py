@@ -92,6 +92,23 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "fallback")
         self.assertEqual(decision.reason, "mentioned llm fallback")
 
+    def test_colloquial_st_badge_question_uses_knowledge_before_planner(self) -> None:
+        with (
+            patch.object(server, "settings", routing_settings()),
+            patch.object(server, "semantic_plan_for_message") as planner,
+        ):
+            decision = server.should_process_message(
+                "考队标要咋考啊",
+                True,
+                group_id=1,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "knowledge")
+        self.assertGreaterEqual(decision.retrieval_coverage, 0.6)
+        self.assertTrue(any("19-ST战队队标考核.md" in source for source in decision.sources))
+        planner.assert_not_called()
+
     def test_semantic_bot_meta_query_uses_runtime_capability(self) -> None:
         plan = MessagePlan(
             audience="bot",
