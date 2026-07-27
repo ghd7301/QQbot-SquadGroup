@@ -21,6 +21,8 @@ def fragment_settings(**overrides):
         "llm_base_url": "https://example.invalid",
         "llm_api_key": "test-key",
         "llm_model": "test-model",
+        "onebot_api_url": "http://127.0.0.1:3000",
+        "onebot_access_token": "",
         "chat_context_seconds": 300,
         "chat_context_messages": 12,
     }
@@ -133,6 +135,12 @@ class MessageFragmentTests(unittest.TestCase):
                 server.classify_fragment_audience(item("让教官跟你说明白")),
                 "unknown",
             )
+
+    def test_explicit_knowledge_command_uses_priority_audience(self):
+        command_item = item("队包多久一轮")
+        command_item["explicit_knowledge_command"] = True
+        with patch.object(server, "settings", fragment_settings()):
+            self.assertEqual(server.classify_fragment_audience(command_item), "bot")
 
     def test_low_confidence_semantic_result_does_not_inherit_bot_target(self):
         dispatched = []
@@ -357,6 +365,23 @@ class MessageFragmentTests(unittest.TestCase):
         self.assertEqual(restored.turn_id, "bot:bot-1")
         self.assertEqual(restored.reply_mode, "chat")
         self.assertEqual(restored.semantic_topic, "分段消息")
+
+    def test_sending_bot_turn_immediately_persists_short_history(self):
+        with (
+            patch.object(server, "settings", fragment_settings(bot_qq="999")),
+            patch.object(server, "send_group_msg", return_value="bot-1"),
+            patch.object(server, "save_chat_history") as save_history,
+        ):
+            server.clear_chat_state()
+            server.send_and_record_bot_turn(
+                group_id=100,
+                item=item("原问题", mentioned=True, message_id="user-1"),
+                answer="我的回答",
+                reply_mode="fallback",
+                reply_to_trigger=True,
+            )
+
+        save_history.assert_called_once()
 
     def test_review_message_ids_accept_only_real_context_messages(self):
         payload = item("队标怎么考", mentioned=True, message_id="m1")

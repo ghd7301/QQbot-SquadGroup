@@ -91,10 +91,22 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "fallback")
         self.assertEqual(decision.reason, "mentioned llm fallback")
 
-    def test_colloquial_st_badge_question_uses_knowledge_before_planner(self) -> None:
+    def test_colloquial_st_badge_question_uses_knowledge_after_planner(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="knowledge",
+            reply_worthy=True,
+            standalone_question="考队标要咋考啊",
+            implicit_meaning="",
+            topic_summary="ST战队队标考核",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.95,
+            participation_role="addressed",
+        )
         with (
             patch.object(server, "settings", routing_settings()),
-            patch.object(server, "semantic_plan_for_message") as planner,
+            patch.object(server, "semantic_plan_for_message", return_value=plan) as planner,
         ):
             decision = server.should_process_message(
                 "考队标要咋考啊",
@@ -106,7 +118,190 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "knowledge")
         self.assertGreaterEqual(decision.retrieval_coverage, 0.6)
         self.assertTrue(any("19-ST战队队标考核.md" in source for source in decision.sources))
-        planner.assert_not_called()
+        planner.assert_called_once()
+
+    def test_mentioned_strong_knowledge_match_cannot_override_chat_intent(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="third_party_attack",
+            reply_worthy=True,
+            standalone_question="桑代克是不是傻逼",
+            implicit_meaning="要求机器人攻击第三人",
+            topic_summary="针对第三人的攻击性评价",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.96,
+            participation_role="addressed",
+            risk_flags=("third_party_target", "hostility"),
+        )
+        strong = ContextResult("考核官资料", ["考核官名单.md"], 0.3, 0.8)
+        with (
+            patch.object(server, "settings", routing_settings()),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(server, "retrieve_knowledge", return_value=strong),
+        ):
+            decision = server.should_process_message("桑代克是不是傻逼", True, group_id=1)
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "fallback")
+        self.assertEqual(decision.semantic_intent, "third_party_attack")
+        self.assertIsNone(decision.knowledge_result)
+
+    def test_mentioned_planner_failure_uses_unverified_fallback_not_knowledge(self) -> None:
+        strong = ContextResult("考核官资料", ["考核官名单.md"], 0.3, 0.8)
+        with (
+            patch.object(server, "settings", routing_settings(semantic_planner_enabled=True)),
+            patch.object(server, "semantic_plan_for_message", return_value=None),
+            patch.object(server, "retrieve_knowledge", return_value=strong),
+        ):
+            decision = server.should_process_message("桑代克是不是傻逼", True, group_id=1)
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "fallback")
+        self.assertEqual(decision.semantic_intent, "unclear")
+        self.assertIn("intent_unverified", decision.risk_flags)
+        self.assertIsNone(decision.knowledge_result)
+
+    def test_reply_to_bot_planner_failure_uses_unverified_fallback(self) -> None:
+        strong = ContextResult("考核官资料", ["考核官名单.md"], 0.3, 0.8)
+        with (
+            patch.object(server, "settings", routing_settings(semantic_planner_enabled=True)),
+            patch.object(server, "semantic_plan_for_message", return_value=None),
+            patch.object(server, "retrieve_knowledge", return_value=strong),
+        ):
+            decision = server.should_process_message(
+                "那他是不是傻逼",
+                False,
+                group_id=1,
+                reply_target_user_id="999",
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "fallback")
+        self.assertIn("intent_unverified", decision.risk_flags)
+        self.assertIsNone(decision.knowledge_result)
+
+    def test_reply_to_bot_chat_plan_uses_addressed_lane(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="你还在吗",
+            implicit_meaning="",
+            topic_summary="确认机器人是否在线",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.95,
+            participation_role="addressed",
+        )
+        with (
+            patch.object(server, "settings", routing_settings(semantic_planner_enabled=True)),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+        ):
+            decision = server.should_process_message(
+                "你还在吗",
+                False,
+                group_id=1,
+                reply_target_user_id="999",
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "fallback")
+        self.assertEqual(decision.reason, "semantic plan: addressed normal_chat")
+
+    def test_planner_circuit_skips_unsolicited_but_never_blocks_mention(self) -> None:
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+            semantic_planner_circuit_failures=1,
+            semantic_planner_circuit_seconds=60,
+        )
+        mentioned_plan = MessagePlan(
+            audience="bot",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="还在吗",
+            implicit_meaning="",
+            topic_summary="确认机器人是否响应",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            participation_role="addressed",
+        )
+        with patch.object(server, "settings", configured):
+            server.record_semantic_planner_availability(False, now=10)
+            with (
+                patch.object(server, "semantic_planner_circuit_is_open", return_value=True),
+                patch.object(server, "semantic_plan_for_message", return_value=mentioned_plan) as planner,
+                patch.object(
+                    server,
+                    "retrieve_knowledge",
+                    return_value=ContextResult("", [], 0.0, 0.0),
+                ),
+            ):
+                ordinary = server.should_process_message("群里今天挺热闹", False, group_id=1)
+                mentioned = server.should_process_message("还在吗", True, group_id=1)
+
+        self.assertFalse(ordinary.should_reply)
+        self.assertEqual(ordinary.planner_status, "circuit_open")
+        self.assertTrue(mentioned.should_reply)
+        self.assertEqual(mentioned.reply_mode, "fallback")
+        planner.assert_called_once()
+
+    def test_explicit_knowledge_command_keeps_strong_fallback_during_planner_failure(self) -> None:
+        strong = ContextResult("队包每60秒一轮", ["队包.md"], 0.4, 1.0)
+        configured = routing_settings(semantic_planner_enabled=True)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=None),
+            patch.object(server, "retrieve_knowledge", return_value=strong),
+        ):
+            decision = server.should_process_message(
+                "队包多久一轮",
+                False,
+                group_id=1,
+                explicit_knowledge_command=True,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "knowledge")
+        self.assertEqual(decision.planner_status, "unavailable")
+
+    def test_explicit_knowledge_command_replies_when_planner_succeeds(self) -> None:
+        strong = ContextResult("队包每60秒一轮", ["队包.md"], 0.4, 1.0)
+        plan = MessagePlan(
+            audience="bot",
+            intent="knowledge",
+            reply_worthy=True,
+            standalone_question="队包多久一轮",
+            implicit_meaning="",
+            topic_summary="队包复活周期",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.95,
+            participation_role="addressed",
+        )
+        configured = routing_settings(semantic_planner_enabled=True)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "auto_reply_enabled", False),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(server, "retrieve_knowledge", return_value=strong),
+        ):
+            decision = server.should_process_message(
+                "队包多久一轮",
+                False,
+                group_id=1,
+                explicit_knowledge_command=True,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "knowledge")
 
     def test_semantic_bot_meta_query_uses_runtime_capability(self) -> None:
         plan = MessagePlan(
@@ -1025,11 +1220,24 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             record_gap.assert_not_called()
 
     def test_combined_mentioned_question_uses_knowledge(self) -> None:
-        decision = server.should_process_message(
-            "医疗要咋玩，还有榴弹要咋玩",
-            True,
-            group_id=983063031,
+        plan = MessagePlan(
+            audience="bot",
+            intent="knowledge",
+            reply_worthy=True,
+            standalone_question="医疗要咋玩，还有榴弹要咋玩",
+            implicit_meaning="",
+            topic_summary="医疗兵和榴弹兵玩法",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.95,
+            participation_role="addressed",
         )
+        with patch.object(server, "semantic_plan_for_message", return_value=plan):
+            decision = server.should_process_message(
+                "医疗要咋玩，还有榴弹要咋玩",
+                True,
+                group_id=983063031,
+            )
 
         self.assertEqual(decision.reply_mode, "knowledge")
         self.assertGreaterEqual(decision.retrieval_coverage, 0.6)
@@ -1191,6 +1399,28 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
 
         self.assertFalse(decision.should_reply)
         self.assertIn("fails closed", decision.reason)
+
+    def test_planner_failure_cannot_fall_back_to_strong_unsolicited_knowledge(self) -> None:
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+        )
+        strong = ContextResult("考核官资料", ["考核官名单.md"], 0.3, 0.8)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=None),
+            patch.object(server, "retrieve_knowledge", return_value=strong),
+        ):
+            decision = server.should_process_message(
+                "桑代克最近在群里说话吗",
+                False,
+                group_id=1,
+            )
+
+        self.assertFalse(decision.should_reply)
+        self.assertIn("fails closed", decision.reason)
+        self.assertEqual(decision.planner_status, "unavailable")
+        self.assertIsNone(decision.knowledge_result)
 
     def test_mentioned_planner_failure_does_not_feed_raw_history_to_fallback(self) -> None:
         configured = routing_settings(
@@ -1409,6 +1639,45 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             )
 
         self.assertEqual(reviewer.call_count, 2)
+
+    def test_final_review_marks_original_message_as_current_in_latest_context(self) -> None:
+        configured = routing_settings(
+            final_reply_review_mode="always",
+            final_reply_review_timeout_seconds=4,
+            final_reply_review_model="review-model",
+        )
+        decision = server.ProcessingDecision(
+            True,
+            "planned",
+            reply_mode="fallback",
+            semantic_intent="normal_chat",
+            semantic_confidence=0.9,
+            semantic_audience="bot",
+            participation_role="addressed",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", return_value=7),
+            patch.object(server, "recent_group_chat_context", return_value=()) as recent,
+            patch.object(
+                server,
+                "review_candidate_reply",
+                return_value=FinalReplyReview("send", "通过", 0.9),
+            ),
+        ):
+            server.review_and_refresh_answer(
+                question="原问题",
+                answer="回答",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=7,
+                target_item={"chat_sequence": 7, "message_id": "m1"},
+            )
+
+        self.assertEqual(recent.call_args.kwargs["focus_sequence"], 7)
 
     def test_always_review_mode_preserves_model_review(self) -> None:
         configured = routing_settings(final_reply_review_mode="always")

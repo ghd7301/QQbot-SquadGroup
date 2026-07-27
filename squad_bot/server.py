@@ -33,7 +33,6 @@ from .llm import (
     plan_group_message,
     review_candidate_reply,
     rewrite_contextual_question,
-    should_auto_reply,
 )
 from .onebot import (
     extract_content_segments,
@@ -82,6 +81,9 @@ chat_memory_manager: ChatMemoryManager | None = None
 chat_history_save_event = threading.Event()
 knowledge_gap_lock = threading.Lock()
 recent_knowledge_gap_queries: dict[str, float] = {}
+semantic_planner_health_lock = threading.Lock()
+semantic_planner_consecutive_failures = 0
+semantic_planner_circuit_open_until = 0.0
 
 
 @dataclass
@@ -141,6 +143,15 @@ class ProcessingDecision:
     related_message_ids: tuple[str, ...] = ()
     semantic_replan_count: int = 0
     semantic_replan_reason: str = ""
+    planner_status: str = "not_run"
+    planner_latency_ms: int = 0
+
+
+@dataclass(frozen=True)
+class PendingFailureResult:
+    status: str
+    attempts: int
+    next_attempt_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -775,6 +786,8 @@ def write_message_audit(
     related_message_ids: Sequence[str] = (),
     semantic_replan_count: int = 0,
     semantic_replan_reason: str = "",
+    planner_status: str = "not_run",
+    planner_latency_ms: int = 0,
     memory_query: str = "",
     memory_hit_count: int = 0,
     memory_retrieval_attempted: bool = False,
@@ -867,6 +880,8 @@ def write_message_audit(
         "related_message_ids": list(related_message_ids),
         "semantic_replan_count": int(semantic_replan_count),
         "semantic_replan_reason": semantic_replan_reason,
+        "planner_status": planner_status,
+        "planner_latency_ms": int(planner_latency_ms),
         "scene_version": int(scene_payload.get("version") or 0) if isinstance(scene_payload, dict) else 0,
         "scene_updated_through_sequence": (
             int(scene_payload.get("updated_through_sequence") or 0)
@@ -1864,7 +1879,11 @@ def review_and_refresh_answer(
             if unsafe_reason:
                 return "", unsafe_reason, latest_revision
             return candidate, "adaptive final review skipped", latest_revision
-        latest_context = recent_group_chat_context(group_id, now=time.time())
+        latest_context = recent_group_chat_context(
+            group_id,
+            now=time.time(),
+            focus_sequence=int((target_item or {}).get("chat_sequence") or 0),
+        )
         review_timeout = remaining_reply_timeout(
             deadline,
             cap=getattr(settings, "final_reply_review_timeout_seconds", 4),
@@ -2000,6 +2019,7 @@ def refresh_answer_for_late_context(
 
 def clear_chat_state() -> None:
     global chat_message_sequence
+    global semantic_planner_consecutive_failures, semantic_planner_circuit_open_until
     with chat_history_lock:
         group_chat_history.clear()
         chat_message_sequence = 0
@@ -2010,6 +2030,9 @@ def clear_chat_state() -> None:
         chat_scene_running.clear()
     with hostile_reply_lock:
         hostile_reply_history.clear()
+    with semantic_planner_health_lock:
+        semantic_planner_consecutive_failures = 0
+        semantic_planner_circuit_open_until = 0.0
     clear_fragment_state()
 
 
@@ -2563,6 +2586,36 @@ def semantic_plan_for_message(
     )
 
 
+def semantic_planner_circuit_is_open(*, now: float | None = None) -> bool:
+    current_time = time.monotonic() if now is None else now
+    with semantic_planner_health_lock:
+        return semantic_planner_circuit_open_until > current_time
+
+
+def record_semantic_planner_availability(
+    available: bool,
+    *,
+    now: float | None = None,
+) -> None:
+    global semantic_planner_consecutive_failures, semantic_planner_circuit_open_until
+    current_time = time.monotonic() if now is None else now
+    with semantic_planner_health_lock:
+        if available:
+            semantic_planner_consecutive_failures = 0
+            semantic_planner_circuit_open_until = 0.0
+            return
+        semantic_planner_consecutive_failures += 1
+        threshold = max(
+            1,
+            int(getattr(settings, "semantic_planner_circuit_failures", 3)),
+        )
+        if semantic_planner_consecutive_failures >= threshold:
+            semantic_planner_circuit_open_until = current_time + max(
+                1,
+                int(getattr(settings, "semantic_planner_circuit_seconds", 60)),
+            )
+
+
 def semantic_plan_is_usable(plan: MessagePlan | None) -> bool:
     return bool(
         plan
@@ -2765,6 +2818,8 @@ def budget_recent_context(
 
 def semantic_context_for_decision(decision: ProcessingDecision) -> str:
     parts = []
+    if decision.planner_status in {"unavailable", "circuit_open", "low_confidence"}:
+        parts.append("语义规划未确认：只能保守理解当前消息，不得因知识检索命中而假定这是事实问题")
     if decision.semantic_topic:
         parts.append(f"相关话题：{decision.semantic_topic}")
     if decision.implicit_meaning:
@@ -2807,6 +2862,8 @@ def semantic_relation_audit_fields(decision: ProcessingDecision) -> dict:
         "related_message_ids": decision.related_message_ids,
         "semantic_replan_count": decision.semantic_replan_count,
         "semantic_replan_reason": decision.semantic_replan_reason,
+        "planner_status": decision.planner_status,
+        "planner_latency_ms": decision.planner_latency_ms,
     }
 
 
@@ -3533,6 +3590,25 @@ def open_pending_queue_db(db_path: str | Path | None = None) -> sqlite3.Connecti
         )
         """
     )
+    existing_pending_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(pending_messages)")
+    }
+    pending_migrations = {
+        "status": "TEXT NOT NULL DEFAULT 'queued'",
+        "attempts": "INTEGER NOT NULL DEFAULT 0",
+        "next_attempt_at": "REAL NOT NULL DEFAULT 0",
+        "last_error": "TEXT NOT NULL DEFAULT ''",
+        "dispatch_id": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, definition in pending_migrations.items():
+        if column not in existing_pending_columns:
+            connection.execute(
+                f"ALTER TABLE pending_messages ADD COLUMN {column} {definition}"
+            )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_status_time "
+        "ON pending_messages (status, next_attempt_at, priority, sequence)"
+    )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS chat_reply_history (
@@ -3715,21 +3791,39 @@ def persist_pending_message(
 
 def load_pending_messages(
     db_path: str | Path | None = None,
+    *,
+    include_future: bool = False,
 ) -> list[tuple[int, int, dict]]:
     connection = open_pending_queue_db(db_path)
     try:
-        rows = connection.execute(
-            """
-            SELECT id, priority, sequence, payload, created_at
+        query = """
+            SELECT id, priority, sequence, payload, created_at,
+                   status, attempts, next_attempt_at, last_error, dispatch_id
             FROM pending_messages
-            ORDER BY priority, sequence
-            """
-        ).fetchall()
+            WHERE status IN ('queued', 'retry')
+        """
+        parameters: tuple = ()
+        if not include_future:
+            query += " AND next_attempt_at <= ?"
+            parameters = (time.time(),)
+        query += " ORDER BY priority, sequence"
+        rows = connection.execute(query, parameters).fetchall()
     finally:
         connection.close()
 
     pending: list[tuple[int, int, dict]] = []
-    for pending_id, priority, sequence, payload, created_at in rows:
+    for (
+        pending_id,
+        priority,
+        sequence,
+        payload,
+        created_at,
+        status,
+        attempts,
+        next_attempt_at,
+        last_error,
+        dispatch_id,
+    ) in rows:
         try:
             item = json.loads(payload)
         except (json.JSONDecodeError, TypeError):
@@ -3741,8 +3835,124 @@ def load_pending_messages(
         item["_pending_id"] = int(pending_id)
         item["_pending_created_at"] = float(created_at)
         item["_restored"] = True
+        item["_pending_status"] = str(status or "queued")
+        item["_pending_attempts"] = int(attempts or 0)
+        item["_pending_next_attempt_at"] = float(next_attempt_at or 0)
+        item["_pending_last_error"] = str(last_error or "")
+        item["_pending_dispatch_id"] = str(dispatch_id or "")
+        item["_queue_priority"] = int(priority)
+        item["_queue_sequence"] = int(sequence)
         pending.append((int(priority), int(sequence), item))
     return pending
+
+
+def mark_pending_failure(
+    pending_id: int,
+    error: str,
+    *,
+    db_path: str | Path | None = None,
+    now: float | None = None,
+    max_attempts: int | None = None,
+) -> PendingFailureResult:
+    current_time = time.time() if now is None else float(now)
+    limit = max(
+        1,
+        int(
+            max_attempts
+            if max_attempts is not None
+            else getattr(settings, "pending_retry_max_attempts", 3)
+        ),
+    )
+    connection = open_pending_queue_db(db_path)
+    try:
+        row = connection.execute(
+            "SELECT attempts FROM pending_messages WHERE id = ?",
+            (pending_id,),
+        ).fetchone()
+        if not row:
+            return PendingFailureResult("missing", 0, 0.0)
+        attempts = int(row[0] or 0) + 1
+        if attempts >= limit:
+            status = "dead_letter"
+            next_attempt_at = 0.0
+        else:
+            status = "retry"
+            delays = (1.0, 3.0, 10.0)
+            delay = delays[min(attempts - 1, len(delays) - 1)]
+            next_attempt_at = current_time + delay
+        connection.execute(
+            """
+            UPDATE pending_messages
+            SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?
+            WHERE id = ?
+            """,
+            (status, attempts, next_attempt_at, str(error or "")[:500], pending_id),
+        )
+        connection.commit()
+        return PendingFailureResult(status, attempts, next_attempt_at)
+    finally:
+        connection.close()
+
+
+def mark_pending_sent_unknown(
+    pending_id: int,
+    error: str,
+    *,
+    db_path: str | Path | None = None,
+) -> None:
+    connection = open_pending_queue_db(db_path)
+    try:
+        connection.execute(
+            """
+            UPDATE pending_messages
+            SET status = 'sent_unknown', last_error = ?, next_attempt_at = 0
+            WHERE id = ?
+            """,
+            (str(error or "")[:500], pending_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def mark_pending_dispatch_started(
+    pending_id: int,
+    dispatch_id: str,
+    *,
+    db_path: str | Path | None = None,
+) -> None:
+    connection = open_pending_queue_db(db_path)
+    try:
+        connection.execute(
+            """
+            UPDATE pending_messages
+            SET status = 'dispatching', dispatch_id = ?, last_error = ''
+            WHERE id = ? AND status IN ('queued', 'retry')
+            """,
+            (str(dispatch_id), pending_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def recover_incomplete_pending_dispatches(
+    db_path: str | Path | None = None,
+) -> int:
+    connection = open_pending_queue_db(db_path)
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE pending_messages
+            SET status = 'sent_unknown', next_attempt_at = 0,
+                last_error = 'service stopped during message dispatch'
+            WHERE status = 'dispatching'
+            """
+        )
+        connection.commit()
+        return max(0, int(cursor.rowcount or 0))
+    finally:
+        connection.close()
 
 
 def delete_pending_message(
@@ -3760,10 +3970,31 @@ def delete_pending_message(
 def pending_message_count(db_path: str | Path | None = None) -> int:
     connection = open_pending_queue_db(db_path)
     try:
-        row = connection.execute("SELECT COUNT(*) FROM pending_messages").fetchone()
+        row = connection.execute(
+            "SELECT COUNT(*) FROM pending_messages WHERE status IN ('queued', 'retry')"
+        ).fetchone()
         return int(row[0]) if row else 0
     finally:
         connection.close()
+
+
+def pending_status_counts(db_path: str | Path | None = None) -> dict[str, int]:
+    result = {
+        "queued": 0,
+        "retry": 0,
+        "dispatching": 0,
+        "dead_letter": 0,
+        "sent_unknown": 0,
+    }
+    connection = open_pending_queue_db(db_path)
+    try:
+        for status, count in connection.execute(
+            "SELECT status, COUNT(*) FROM pending_messages GROUP BY status"
+        ):
+            result[str(status or "queued")] = int(count or 0)
+    finally:
+        connection.close()
+    return result
 
 
 def enqueue_persistent_message(priority: int, item: dict) -> int:
@@ -3771,9 +4002,63 @@ def enqueue_persistent_message(priority: int, item: dict) -> int:
     pending_id = persist_pending_message(priority, sequence, item)
     queued_item = dict(item)
     queued_item["_pending_id"] = pending_id
+    queued_item["_queue_priority"] = priority
+    queued_item["_queue_sequence"] = sequence
     target_queue = message_queue if priority == 0 else normal_message_queue
     target_queue.put((priority, sequence, queued_item))
     return pending_id
+
+
+def _queue_pending_item(item: dict, *, delay: float = 0.0) -> None:
+    raw_priority = item.get("_queue_priority")
+    priority = int(
+        raw_priority
+        if raw_priority is not None
+        else (0 if item.get("mentioned") or item.get("explicit_knowledge_command") else 1)
+    )
+    raw_sequence = item.get("_queue_sequence")
+    sequence = int(raw_sequence if raw_sequence is not None else next_sequence())
+    queued_item = dict(item)
+    queued_item["_queue_priority"] = priority
+    queued_item["_queue_sequence"] = sequence
+    target_queue = message_queue if priority == 0 else normal_message_queue
+
+    def enqueue() -> None:
+        target_queue.put((priority, sequence, queued_item))
+
+    if delay <= 0:
+        enqueue()
+        return
+    timer = threading.Timer(delay, enqueue)
+    timer.daemon = True
+    timer.start()
+
+
+def handle_pending_worker_failure(item: dict, error: str) -> str:
+    pending_id = item.get("_pending_id")
+    if pending_id is None:
+        return "untracked"
+    if item.get("_dispatch_completed"):
+        return "delivered"
+    if item.get("_dispatch_started"):
+        mark_pending_sent_unknown(int(pending_id), error)
+        return "sent_unknown"
+    result = mark_pending_failure(int(pending_id), error)
+    if result.status == "retry":
+        _queue_pending_item(
+            item,
+            delay=max(0.0, result.next_attempt_at - time.time()),
+        )
+    return result.status
+
+
+def begin_pending_dispatch(item: dict) -> None:
+    pending_id = item.get("_pending_id")
+    dispatch_id = f"{pending_id or 'untracked'}:{time.time_ns()}"
+    if pending_id is not None:
+        mark_pending_dispatch_started(int(pending_id), dispatch_id)
+    item["_pending_dispatch_id"] = dispatch_id
+    item["_dispatch_started"] = True
 
 
 def classify_fragment_audience(item: dict) -> str:
@@ -3781,7 +4066,7 @@ def classify_fragment_audience(item: dict) -> str:
     bot_qq = str(settings.bot_qq or "")
     reply_message_id = str(item.get("reply_message_id") or "")
     reply_target_user_id = str(item.get("reply_target_user_id") or "")
-    if item.get("mentioned"):
+    if item.get("mentioned") or item.get("explicit_knowledge_command"):
         return "bot"
     if reply_message_id:
         if bot_qq and reply_target_user_id == bot_qq:
@@ -3845,6 +4130,7 @@ def send_and_record_bot_turn(
 ) -> tuple[object, tuple[str, ...], str]:
     trigger_message_id = str(item.get("message_id") or "")
     user_id = str(item.get("user_id") or "")
+    begin_pending_dispatch(item)
     bot_message_id = send_group_msg(
         settings.onebot_api_url,
         group_id,
@@ -3853,6 +4139,8 @@ def send_and_record_bot_turn(
         mention_user_id=mention_user_id,
         reply_to_message_id=trigger_message_id if reply_to_trigger else "",
     )
+    item["_dispatch_completed"] = True
+    item["_sent_message_id"] = str(bot_message_id or "")
     trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
     record_group_chat_message(
         group_id,
@@ -3867,6 +4155,7 @@ def send_and_record_bot_turn(
         reply_mode=reply_mode,
         semantic_topic=semantic_topic,
     )
+    save_chat_history()
     return bot_message_id, trigger_message_ids, turn_id
 
 
@@ -4186,15 +4475,24 @@ def fragment_aggregation_worker() -> None:
 
 def restore_pending_messages() -> int:
     global sequence_number
-    pending = load_pending_messages()
+    recovered = recover_incomplete_pending_dispatches()
+    if recovered:
+        print("Marked interrupted message dispatches as sent_unknown", recovered)
+    pending = load_pending_messages(include_future=True)
     if not pending:
         return 0
     with sequence_lock:
         sequence_number = max(sequence_number, max(sequence for _priority, sequence, _item in pending))
-    for queued_item in pending:
-        priority = queued_item[0]
-        target_queue = message_queue if priority == 0 else normal_message_queue
-        target_queue.put(queued_item)
+    for priority, sequence, item in pending:
+        item["_queue_priority"] = priority
+        item["_queue_sequence"] = sequence
+        _queue_pending_item(
+            item,
+            delay=max(
+                0.0,
+                float(item.get("_pending_next_attempt_at") or 0) - time.time(),
+            ),
+        )
     return len(pending)
 
 
@@ -4355,6 +4653,7 @@ def should_process_message(
     sender_role: str = "",
     planner_timeout: int | None = None,
     plan_out: list[MessagePlan] | None = None,
+    explicit_knowledge_command: bool = False,
 ) -> ProcessingDecision:
     if mentioned and is_identity_question(question):
         return ProcessingDecision(True, "mentioned identity request", reply_mode="identity")
@@ -4366,41 +4665,37 @@ def should_process_message(
         initial_result.top_score,
         initial_result.query_coverage,
     )
-    if mentioned and initial_strong_match:
-        return attach_knowledge_result(
-            ProcessingDecision(
-                True,
-                "mentioned with strong knowledge context",
-                True,
-                tuple(initial_result.sources),
-                query_text,
-                followup_of,
-                followup_scope,
-                "knowledge",
-                tuple(chat_context),
-                initial_result.top_score,
-                initial_result.query_coverage,
-            ),
-            query_text,
-            initial_result,
-        )
-    plan = semantic_plan_for_message(
-        normalized,
-        chat_context,
-        scene_context=scene_context,
-        memory_candidates=memory_candidates,
-        mentioned=mentioned,
-        mentions_other=mentions_other,
-        reply_target_user_id=reply_target_user_id,
-        timeout=planner_timeout,
+    planner_enabled = bool(getattr(settings, "semantic_planner_enabled", False))
+    explicitly_addressed = bool(
+        mentioned
+        or explicit_knowledge_command
+        or reply_target_user_id == settings.bot_qq
     )
+    circuit_open = bool(
+        planner_enabled
+        and not explicitly_addressed
+        and semantic_planner_circuit_is_open()
+    )
+    plan = None
+    if not circuit_open:
+        plan = semantic_plan_for_message(
+            normalized,
+            chat_context,
+            scene_context=scene_context,
+            memory_candidates=memory_candidates,
+            mentioned=mentioned,
+            mentions_other=mentions_other,
+            reply_target_user_id=reply_target_user_id,
+            timeout=planner_timeout,
+        )
+        if planner_enabled:
+            record_semantic_planner_availability(plan is not None)
     usable_plan = plan if semantic_plan_is_usable(plan) else None
     if usable_plan is not None and plan_out is not None:
         plan_out.append(usable_plan)
     if usable_plan:
         chat_context = context_selected_by_plan(chat_context, usable_plan)
         query_text = usable_plan.standalone_question or query_text
-        explicitly_addressed = mentioned or reply_target_user_id == settings.bot_qq
         participation_role = derive_participation_role(
             usable_plan,
             chat_context,
@@ -4475,10 +4770,10 @@ def should_process_message(
                     semantic_topic=usable_plan.topic_summary,
                     semantic_confidence=usable_plan.confidence,
                 )
-            if mentioned:
+            if explicitly_addressed:
                 return ProcessingDecision(
                     True,
-                    f"semantic plan: mentioned {usable_plan.intent}",
+                    f"semantic plan: addressed {usable_plan.intent}",
                     effective_question=query_text,
                     reply_mode="fallback",
                     chat_context=tuple(chat_context),
@@ -4541,6 +4836,92 @@ def should_process_message(
                 semantic_topic=usable_plan.topic_summary,
                 semantic_confidence=usable_plan.confidence,
             )
+        if usable_plan and usable_plan.intent != "knowledge":
+            if explicitly_addressed:
+                return ProcessingDecision(
+                    True,
+                    f"semantic plan: addressed {usable_plan.intent}",
+                    effective_question=query_text,
+                    reply_mode="fallback",
+                    chat_context=tuple(chat_context),
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    semantic_confidence=usable_plan.confidence,
+                )
+            return ProcessingDecision(
+                False,
+                f"semantic plan: unsupported unsolicited intent {usable_plan.intent}",
+                chat_context=tuple(chat_context),
+                semantic_intent=usable_plan.intent,
+                semantic_topic=usable_plan.topic_summary,
+                semantic_confidence=usable_plan.confidence,
+            )
+    if planner_enabled and not usable_plan and explicitly_addressed:
+        if explicit_knowledge_command and initial_strong_match:
+            decision = attach_knowledge_result(
+                ProcessingDecision(
+                    True,
+                    "explicit knowledge command with strong context",
+                    True,
+                    tuple(initial_result.sources),
+                    query_text,
+                    followup_of,
+                    followup_scope,
+                    "knowledge",
+                    tuple(chat_context),
+                    initial_result.top_score,
+                    initial_result.query_coverage,
+                    semantic_intent="knowledge",
+                    semantic_audience="bot",
+                    participation_role="addressed",
+                    planner_status=("low_confidence" if plan else "unavailable"),
+                ),
+                query_text,
+                initial_result,
+            )
+            return decision
+        fallback_allowed = settings.llm_fallback_enabled and (
+            explicitly_addressed or not settings.fallback_only_when_mentioned
+        )
+        if fallback_allowed:
+            return ProcessingDecision(
+                should_reply=True,
+                reason="explicit address with unverified semantic fallback",
+                has_context=bool(initial_result.context),
+                sources=tuple(initial_result.sources),
+                effective_question=query_text,
+                followup_of=followup_of,
+                followup_scope=followup_scope,
+                reply_mode="fallback",
+                chat_context=(),
+                retrieval_score=initial_result.top_score,
+                retrieval_coverage=initial_result.query_coverage,
+                semantic_intent="unclear",
+                semantic_audience="bot",
+                participation_role="addressed",
+                risk_flags=("intent_unverified",),
+                planner_status=("low_confidence" if plan else "unavailable"),
+            )
+    if planner_enabled and not usable_plan and not explicitly_addressed:
+        return ProcessingDecision(
+            False,
+            (
+                "semantic planner circuit open; unsolicited reply fails closed"
+                if circuit_open
+                else "semantic planner unavailable; unsolicited reply fails closed"
+            ),
+            has_context=bool(initial_result.context),
+            sources=tuple(initial_result.sources),
+            effective_question=query_text,
+            retrieval_score=initial_result.top_score,
+            retrieval_coverage=initial_result.query_coverage,
+            planner_status=(
+                "circuit_open"
+                if circuit_open
+                else ("low_confidence" if plan else "unavailable")
+            ),
+        )
     result = (
         initial_result
         if query_text == (effective_question or normalized)
@@ -4589,22 +4970,8 @@ def should_process_message(
     ):
         record_knowledge_gap(query_text, result)
     if not context or not strong_match:
-        if (
-            not usable_plan
-            and not mentioned
-            and getattr(settings, "semantic_planner_enabled", False)
-        ):
-            return ProcessingDecision(
-                False,
-                "semantic planner unavailable; unsolicited reply fails closed",
-                has_context=bool(context),
-                sources=tuple(sources),
-                effective_question=query_text,
-                retrieval_score=result.top_score,
-                retrieval_coverage=result.query_coverage,
-            )
         fallback_allowed = settings.llm_fallback_enabled and (
-            mentioned or not settings.fallback_only_when_mentioned
+            explicitly_addressed or not settings.fallback_only_when_mentioned
         )
         if fallback_allowed:
             fallback_reason = (
@@ -4665,7 +5032,7 @@ def should_process_message(
         return decision
 
     if usable_plan and usable_plan.intent == "knowledge":
-        if mentioned or (auto_reply_enabled and usable_plan.reply_worthy):
+        if explicitly_addressed or (auto_reply_enabled and usable_plan.reply_worthy):
             return attach_knowledge_result(
                 ProcessingDecision(
                     True,
@@ -4808,35 +5175,14 @@ def should_process_message(
             result,
         )
 
-    should_reply = should_auto_reply(
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        message=query_text,
-    )
-    print("Auto reply router:", "YES" if should_reply else "NO", normalized)
-    return attach_knowledge_result(
-        ProcessingDecision(
-            should_reply,
-            "llm router accepted" if should_reply else "llm router rejected",
-            True,
-            tuple(sources),
-            query_text,
-            followup_of,
-            followup_scope,
-            "knowledge",
-            tuple(chat_context),
-            result.top_score,
-            result.query_coverage,
-        ),
-        query_text,
-        result,
-    )
-
-
 def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
     while True:
         priority, seq, item = work_queue.get()
+        if lane == "normal" and not message_queue.empty():
+            work_queue.put((priority, seq, item))
+            work_queue.task_done()
+            time.sleep(0.05)
+            continue
         terminal = True
         try:
             question = str(item["question"])
@@ -4913,6 +5259,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
 
                 wait_for_rate_limit()
                 with group_send_lock(group_id):
+                    begin_pending_dispatch(item)
                     bot_message_id = send_group_msg(
                         settings.onebot_api_url,
                         group_id,
@@ -4920,6 +5267,8 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         settings.onebot_access_token,
                         reply_to_message_id=str(item.get("message_id") or ""),
                     )
+                    item["_dispatch_completed"] = True
+                    item["_sent_message_id"] = str(bot_message_id or "")
                     trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
                     record_group_chat_message(
                         group_id,
@@ -5027,7 +5376,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 sender_role=sender_role,
                 planner_timeout=planner_timeout,
                 plan_out=selected_plan,
+                explicit_knowledge_command=bool(item.get("explicit_knowledge_command")),
             )
+            decision.planner_latency_ms = int((time.monotonic() - model_started) * 1000)
+            if selected_plan:
+                decision.planner_status = "ok"
             decision.recent_context_candidate_count = int(
                 item.get("_recent_context_candidate_count") or len(item.get("chat_context") or ())
             )
@@ -5083,6 +5436,8 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     related_message_ids=decision.related_message_ids,
                     semantic_replan_count=decision.semantic_replan_count,
                     semantic_replan_reason=decision.semantic_replan_reason,
+                    planner_status=decision.planner_status,
+                    planner_latency_ms=decision.planner_latency_ms,
                     scene_context=planner_scene_context,
                     self_history_candidate_count=decision.self_history_candidate_count,
                     self_history_selected_count=decision.self_history_selected_count,
@@ -5217,6 +5572,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     mentioned=mentioned,
                     reply_mode=decision.reply_mode,
                     answer=answer,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5258,6 +5614,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     self_history_chars=decision.self_history_chars,
                     self_history_selected_message_ids=decision.self_history_selected_message_ids,
                     self_history_reasons=decision.self_history_reasons,
+                    **semantic_relation_audit_fields(decision),
                     event_time=item.get("time"),
                 )
                 if decision.reply_mode == "knowledge":
@@ -5274,6 +5631,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     mentioned=mentioned,
                     reply_mode=decision.reply_mode,
                     model_latency_ms=model_latency_ms,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5326,6 +5684,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         reply_mode=decision.reply_mode,
                         model_latency_ms=model_latency_ms,
                         answer=answer,
+                        **semantic_relation_audit_fields(decision),
                         event_time=event_time,
                     )
                     continue
@@ -5385,6 +5744,8 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 related_message_ids=decision.related_message_ids,
                 semantic_replan_count=decision.semantic_replan_count,
                 semantic_replan_reason=decision.semantic_replan_reason,
+                planner_status=decision.planner_status,
+                planner_latency_ms=decision.planner_latency_ms,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
@@ -5409,7 +5770,8 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             if decision.reply_mode == "knowledge":
                 mark_topic_replied(group_id, current_topic_key)
         except Exception as exc:
-            terminal = False
+            failure_action = handle_pending_worker_failure(item, repr(exc))
+            terminal = failure_action == "delivered"
             print(f"{lane} worker error:", repr(exc))
             write_message_audit(
                 decision="error",
@@ -5918,6 +6280,8 @@ def chat_worker() -> None:
                 related_message_ids=decision.related_message_ids,
                 semantic_replan_count=decision.semantic_replan_count,
                 semantic_replan_reason=decision.semantic_replan_reason,
+                planner_status=decision.planner_status,
+                planner_latency_ms=decision.planner_latency_ms,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
@@ -5940,7 +6304,8 @@ def chat_worker() -> None:
                 turn_id=turn_id,
             )
         except Exception as exc:
-            terminal = False
+            failure_action = handle_pending_worker_failure(item, repr(exc))
+            terminal = failure_action == "delivered"
             print("Chat worker error:", repr(exc))
             write_message_audit(
                 decision="error",
@@ -6010,6 +6375,7 @@ class Handler(BaseHTTPRequestHandler):
                 scene_groups = len(group_chat_scenes)
                 scene_updating = len(chat_scene_running)
             memory_status = chat_memory_manager.status() if chat_memory_manager else {}
+            pending_counts = pending_status_counts()
             self._json(
                 200,
                 {
@@ -6024,7 +6390,11 @@ class Handler(BaseHTTPRequestHandler):
                     "normal_queued": normal_message_queue.qsize(),
                     "chat_queued": chat_queue.qsize(),
                     "fragment_buffered": len(group_fragment_buffers),
-                    "pending": pending_message_count(),
+                    "pending": pending_counts.get("queued", 0) + pending_counts.get("retry", 0),
+                    "pending_retry": pending_counts.get("retry", 0),
+                    "pending_dispatching": pending_counts.get("dispatching", 0),
+                    "pending_dead_letter": pending_counts.get("dead_letter", 0),
+                    "pending_sent_unknown": pending_counts.get("sent_unknown", 0),
                     "scene_groups": scene_groups,
                     "scene_updating": scene_updating,
                     "memory_messages": memory_status.get("messages", 0),
@@ -6221,6 +6591,10 @@ class Handler(BaseHTTPRequestHandler):
             now=context_now,
             focus_sequence=chat_sequence,
         )
+        explicit_knowledge_command = bool(
+            settings.command_prefix
+            and text.strip().startswith(settings.command_prefix)
+        )
         ok, question = should_respond(text, settings.command_prefix, settings.bot_qq, raw_message)
         print("Group event", group_id, "mentioned", mentioned, "queued", ok, "question", question)
         Path("work/last_onebot_event.json").parent.mkdir(exist_ok=True)
@@ -6274,6 +6648,7 @@ class Handler(BaseHTTPRequestHandler):
             "received_time": received_time,
             "content_segments": list(content_segments),
             "message_status": "active",
+            "explicit_knowledge_command": explicit_knowledge_command,
         }
         fragment_audience = classify_fragment_audience(item)
         try:

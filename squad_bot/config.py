@@ -93,16 +93,16 @@ class Settings:
         "CHAT_MODEL"
     ) or os.getenv("LLM_MODEL", "deepseek-chat")
     semantic_planner_timeout_seconds: int = int(
-        os.getenv("SEMANTIC_PLANNER_TIMEOUT_SECONDS", "15")
+        os.getenv("SEMANTIC_PLANNER_TIMEOUT_SECONDS", "3")
     )
     semantic_planner_min_confidence: float = float(
         os.getenv("SEMANTIC_PLANNER_MIN_CONFIDENCE", "0.68")
     )
     semantic_planner_context_messages: int = int(
-        os.getenv("SEMANTIC_PLANNER_CONTEXT_MESSAGES", "10")
+        os.getenv("SEMANTIC_PLANNER_CONTEXT_MESSAGES", "8")
     )
     semantic_planner_context_max_chars: int = int(
-        os.getenv("SEMANTIC_PLANNER_CONTEXT_MAX_CHARS", "3200")
+        os.getenv("SEMANTIC_PLANNER_CONTEXT_MAX_CHARS", "2400")
     )
     semantic_planner_memory_max_chars: int = int(
         os.getenv("SEMANTIC_PLANNER_MEMORY_MAX_CHARS", "800")
@@ -110,6 +110,12 @@ class Settings:
     semantic_replan_enabled: bool = os.getenv(
         "SEMANTIC_REPLAN_ENABLED", "true"
     ).lower() in {"1", "true", "yes", "on"}
+    semantic_planner_circuit_failures: int = int(
+        os.getenv("SEMANTIC_PLANNER_CIRCUIT_FAILURES", "3")
+    )
+    semantic_planner_circuit_seconds: int = int(
+        os.getenv("SEMANTIC_PLANNER_CIRCUIT_SECONDS", "60")
+    )
     chat_relevance_check_enabled: bool = os.getenv(
         "CHAT_RELEVANCE_CHECK_ENABLED", "true"
     ).lower() in {"1", "true", "yes", "on"}
@@ -141,6 +147,7 @@ class Settings:
     same_topic_cooldown_seconds: int = int(os.getenv("SAME_TOPIC_COOLDOWN_SECONDS", "60"))
     message_audit_log: str = os.getenv("MESSAGE_AUDIT_LOG", "work/message_audit.jsonl")
     pending_queue_db: str = os.getenv("PENDING_QUEUE_DB", "work/pending_queue.sqlite3")
+    pending_retry_max_attempts: int = int(os.getenv("PENDING_RETRY_MAX_ATTEMPTS", "3"))
     chat_memory_enabled: bool = os.getenv("CHAT_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     chat_memory_db: str = os.getenv("CHAT_MEMORY_DB", "work/chat_memory.sqlite3")
     chat_memory_shadow_mode: bool = os.getenv("CHAT_MEMORY_SHADOW_MODE", "false").lower() in {"1", "true", "yes", "on"}
