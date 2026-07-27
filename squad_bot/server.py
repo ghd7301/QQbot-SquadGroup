@@ -1797,6 +1797,84 @@ def latest_group_user_sequence(group_id: int) -> int:
         )
 
 
+def locked_send_context_change(
+    group_id: int,
+    reviewed_revision: int,
+    item: dict,
+) -> tuple[bool, tuple[str, ...], str]:
+    """Classify messages that arrived after review without calling a model under the send lock."""
+    bot_qq = str(settings.bot_qq or "")
+    original_user_id = str(item.get("user_id") or "")
+    trigger_message_ids = set(_message_ids(item))
+    direct_to_bot = bool(
+        item.get("mentioned")
+        or (
+            bot_qq
+            and str(item.get("reply_target_user_id") or "") == bot_qq
+        )
+    )
+    with chat_history_lock:
+        delta = tuple(
+            message
+            for message in group_chat_history.get(int(group_id), ())
+            if message.sequence > reviewed_revision
+            and message.user_id != bot_qq
+            and message.message_status == "active"
+        )
+    if not delta:
+        return False, (), "unchanged"
+
+    delta_ids = tuple(
+        message.message_id or f"sequence:{message.sequence}"
+        for message in delta
+    )
+    human_thread_by_sender: dict[str, tuple[str, float]] = {}
+    continuation_window = max(
+        0.0,
+        float(getattr(settings, "message_fragment_max_wait_seconds", 8)),
+    )
+
+    for message in delta:
+        reply_target = str(message.reply_target_user_id or "")
+        if message.reply_message_id:
+            if not reply_target:
+                return True, delta_ids, "new reply target could not be resolved"
+            if reply_target == bot_qq or message.reply_message_id in trigger_message_ids:
+                return True, delta_ids, "new message directly extends or answers the bot turn"
+            human_thread_by_sender[message.user_id] = (
+                reply_target,
+                message.received_time,
+            )
+            continue
+        if message.mentioned_bot:
+            if message.user_id == original_user_id:
+                return True, delta_ids, "original sender sent another message to the bot"
+            continue
+        if message.mentioned_user_ids:
+            human_thread_by_sender[message.user_id] = (
+                str(message.mentioned_user_ids[0]),
+                message.received_time,
+            )
+            continue
+        if message.user_id == original_user_id:
+            human_thread = human_thread_by_sender.get(message.user_id)
+            if (
+                human_thread
+                and human_thread[0] != bot_qq
+                and 0 <= message.received_time - human_thread[1] <= continuation_window
+            ):
+                human_thread_by_sender[message.user_id] = (
+                    human_thread[0],
+                    message.received_time,
+                )
+                continue
+            return True, delta_ids, "original sender added an ambiguous follow-up"
+        if not direct_to_bot:
+            return True, delta_ids, "unsolicited reply has a newer ambiguous group message"
+
+    return False, delta_ids, "only unrelated directed messages arrived"
+
+
 def unsafe_or_repeated_reply(group_id: int, answer: str, *, limit: int = 10) -> str:
     if re.search(r"\bmember_[0-9a-f]{6,}\b", answer, flags=re.I):
         return "internal member id leaked"
@@ -4904,22 +4982,46 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         event_time=event_time,
                     )
                     continue
-                if (
-                    decision.reply_mode not in {"bot_meta", "identity"}
-                    and latest_group_user_sequence(group_id) > reviewed_revision
-                ):
+                context_invalidated = False
+                delta_message_ids: tuple[str, ...] = ()
+                lock_context_reason = ""
+                if decision.reply_mode not in {"bot_meta", "identity"}:
+                    (
+                        context_invalidated,
+                        delta_message_ids,
+                        lock_context_reason,
+                    ) = locked_send_context_change(
+                        group_id,
+                        reviewed_revision,
+                        item,
+                    )
+                if context_invalidated:
                     write_message_audit(
                         decision="skipped",
-                        reason="context changed while waiting for group send lock",
+                        reason=(
+                            "context invalidated while waiting for group send lock: "
+                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}"
+                        ),
                         group_id=group_id,
                         user_id=user_id,
                         question=question,
                         mentioned=mentioned,
                         reply_mode=decision.reply_mode,
                         model_latency_ms=model_latency_ms,
+                        answer=answer,
                         event_time=event_time,
                     )
                     continue
+                if delta_message_ids:
+                    review_reason = "; ".join(
+                        value
+                        for value in (
+                            review_reason,
+                            "send-lock context preserved: "
+                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}",
+                        )
+                        if value
+                    )
                 bot_message_id = send_group_msg(
                     settings.onebot_api_url,
                     group_id,
@@ -5395,18 +5497,41 @@ def chat_worker() -> None:
                         event_time=event_time,
                     )
                     continue
-                if latest_group_user_sequence(group_id) > reviewed_revision:
+                (
+                    context_invalidated,
+                    delta_message_ids,
+                    lock_context_reason,
+                ) = locked_send_context_change(
+                    group_id,
+                    reviewed_revision,
+                    item,
+                )
+                if context_invalidated:
                     write_message_audit(
                         decision="skipped",
-                        reason="context changed while waiting for group send lock",
+                        reason=(
+                            "context invalidated while waiting for group send lock: "
+                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}"
+                        ),
                         group_id=group_id,
                         user_id=user_id,
                         question=question,
                         reply_mode="chat",
                         model_latency_ms=model_latency_ms,
+                        answer=answer,
                         event_time=event_time,
                     )
                     continue
+                if delta_message_ids:
+                    review_reason = "; ".join(
+                        value
+                        for value in (
+                            review_reason,
+                            "send-lock context preserved: "
+                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}",
+                        )
+                        if value
+                    )
                 bot_message_id = send_group_msg(
                     settings.onebot_api_url,
                     group_id,

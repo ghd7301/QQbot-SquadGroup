@@ -1499,6 +1499,126 @@ class ChatStateTests(unittest.TestCase):
             server.record_group_chat_message(1, "2", "话题已经继续了", 102)
             self.assertTrue(server.group_chat_has_newer_user_message(1, candidate_sequence))
 
+    def test_direct_bot_reply_survives_human_reply_and_its_followup(self) -> None:
+        configured = routing_settings(
+            chat_context_seconds=300,
+            chat_context_messages=12,
+            message_fragment_max_wait_seconds=8,
+        )
+        with patch.object(server, "settings", configured):
+            reviewed_revision = server.record_group_chat_message(
+                1,
+                "sender",
+                "他被我干烂了",
+                100,
+                message_id="current",
+                reply_message_id="bot-old",
+                reply_target_user_id="999",
+                mentioned_bot=True,
+            )
+            server.record_group_chat_message(
+                1,
+                "sender",
+                "十三是主动送上门的",
+                110,
+                message_id="human-reply",
+                reply_message_id="human-old",
+                reply_target_user_id="other",
+            )
+            server.record_group_chat_message(
+                1,
+                "sender",
+                "不一样",
+                112,
+                message_id="human-followup",
+            )
+            invalidated, delta_ids, reason = server.locked_send_context_change(
+                1,
+                reviewed_revision,
+                {
+                    "user_id": "sender",
+                    "message_id": "current",
+                    "mentioned": True,
+                    "reply_target_user_id": "999",
+                },
+            )
+
+        self.assertFalse(invalidated)
+        self.assertEqual(delta_ids, ("human-reply", "human-followup"))
+        self.assertIn("unrelated", reason)
+
+    def test_same_sender_ambiguous_followup_invalidates_bot_reply(self) -> None:
+        configured = routing_settings(
+            chat_context_seconds=300,
+            chat_context_messages=12,
+            message_fragment_max_wait_seconds=8,
+        )
+        with patch.object(server, "settings", configured):
+            reviewed_revision = server.record_group_chat_message(
+                1,
+                "sender",
+                "队标怎么考",
+                100,
+                message_id="current",
+                mentioned_bot=True,
+            )
+            server.record_group_chat_message(
+                1,
+                "sender",
+                "还要问晋升路线",
+                104,
+                message_id="supplement",
+            )
+            invalidated, delta_ids, reason = server.locked_send_context_change(
+                1,
+                reviewed_revision,
+                {
+                    "user_id": "sender",
+                    "message_id": "current",
+                    "mentioned": True,
+                },
+            )
+
+        self.assertTrue(invalidated)
+        self.assertEqual(delta_ids, ("supplement",))
+        self.assertIn("ambiguous follow-up", reason)
+
+    def test_reply_to_original_message_invalidates_pending_reply(self) -> None:
+        configured = routing_settings(
+            chat_context_seconds=300,
+            chat_context_messages=12,
+        )
+        with patch.object(server, "settings", configured):
+            reviewed_revision = server.record_group_chat_message(
+                1,
+                "sender",
+                "这个怎么处理",
+                100,
+                message_id="current",
+                mentioned_bot=True,
+            )
+            server.record_group_chat_message(
+                1,
+                "other",
+                "这样就行",
+                101,
+                message_id="answer",
+                reply_message_id="current",
+                reply_target_user_id="sender",
+            )
+            invalidated, _, reason = server.locked_send_context_change(
+                1,
+                reviewed_revision,
+                {
+                    "user_id": "sender",
+                    "message_id": "current",
+                    "mentioned": True,
+                },
+            )
+
+        self.assertTrue(invalidated)
+        self.assertIn("answers the bot turn", reason)
+
     def test_context_can_stop_at_scene_snapshot_sequence(self) -> None:
         with patch.object(
             server,
