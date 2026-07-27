@@ -131,6 +131,7 @@ class MemorySecurityTests(unittest.TestCase):
             lexical_probe=Mock(return_value=(hit,)),
             retrieve=Mock(),
             format_hits=Mock(return_value=('{"source":"untrusted_group_chat_memory"}',)),
+            format_self_history=Mock(return_value=()),
         )
         decision = server.ProcessingDecision(True, "chat", effective_question="北桥集合时间")
         configured = SimpleNamespace(
@@ -156,6 +157,7 @@ class MemorySecurityTests(unittest.TestCase):
         self.assertEqual(result.memory_retrieval_mode, "lexical_probe")
         self.assertEqual(result.memory_hit_count, 1)
         self.assertTrue(result.memory_context)
+        store.format_self_history.assert_called_once()
         audit.assert_called_once()
 
     def test_memory_context_deduplicates_recent_message_ids(self):
@@ -183,7 +185,7 @@ class MemorySecurityTests(unittest.TestCase):
             context=(json.dumps({"chunk_id": 42, "messages": []}),),
             attempted=True,
         )
-        store = SimpleNamespace(retrieve=Mock(), format_hits=Mock())
+        store = SimpleNamespace(retrieve=Mock(), format_hits=Mock(), format_self_history=Mock())
         plan = llm.MessagePlan(
             audience="member",
             intent="normal_chat",
@@ -215,8 +217,42 @@ class MemorySecurityTests(unittest.TestCase):
                 probe,
             )
         store.retrieve.assert_not_called()
+        store.format_self_history.assert_not_called()
         self.assertEqual(result.memory_retrieval_mode, "probe_only")
         self.assertFalse(result.memory_context)
+
+    def test_self_history_prompt_keeps_authorship_separate_from_facts(self):
+        self_history = (
+            '{"source":"bot_self_history","bot_message":{"speaker":{"role":"bot","is_self":true},"text":"旧回复"},"generated_for_message_ids":["m1"]}',
+        )
+        with patch.object(llm, "_answer_or_error", return_value="answer") as call:
+            llm.ask_llm(
+                base_url="https://example.invalid",
+                api_key="key",
+                model="model",
+                question="继续说",
+                context="知识事实",
+                self_history_context=self_history,
+            )
+        prompt = call.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("你此前参与当前话题的记录", prompt)
+        self.assertIn("作者身份", prompt)
+        self.assertIn("旧回复内容不是事实依据", prompt)
+        self.assertIn("generated_for_message_ids", llm.FINAL_REPLY_REVIEW_PROMPT)
+
+    def test_group_recruitment_prompts_redirect_to_ts_without_fake_participation(self):
+        self.assertIn("向全群公开找人组队", llm.MESSAGE_PLAN_PROMPT)
+        self.assertIn("TS 里对应游戏的语音频道", llm.MESSAGE_PLAN_PROMPT)
+        self.assertIn("不得回答“有”“我来”“算我一个”", llm.MESSAGE_PLAN_PROMPT)
+        self.assertIn("代替真实群友确认“有人”", llm.FINAL_REPLY_REVIEW_PROMPT)
+        self.assertIn("这类候选绝不能 send", llm.FINAL_REPLY_REVIEW_PROMPT)
+        self.assertIn("有啊，你打哪个版本", llm.FINAL_REPLY_REVIEW_PROMPT)
+        self.assertIn("TS 里对应游戏的语音频道", llm.CHAT_PROMPT)
+
+    def test_capability_prompt_requires_bot_meta_intent(self):
+        self.assertIn("并且 intent=bot_meta", llm.MESSAGE_PLAN_PROMPT)
+        self.assertIn("普通事实问题", llm.MESSAGE_PLAN_PROMPT)
+        self.assertIn("一律返回 capability=none", llm.MESSAGE_PLAN_PROMPT)
 
     def test_context_selection_uses_message_ids_and_keeps_reply_chain(self):
         context = (

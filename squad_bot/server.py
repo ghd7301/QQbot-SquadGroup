@@ -120,6 +120,12 @@ class ProcessingDecision:
     recent_context_selected_ids: tuple[str, ...] = ()
     memory_selected_chunk_ids: tuple[int, ...] = ()
     memory_selected_by_planner: bool = False
+    self_history_context: tuple[str, ...] = ()
+    self_history_candidate_count: int = 0
+    self_history_selected_count: int = 0
+    self_history_chars: int = 0
+    self_history_selected_message_ids: tuple[str, ...] = ()
+    self_history_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,10 @@ class ConversationState:
     reply_mode: str = "knowledge"
     bot_message_id: str = ""
     user_message_id: str = ""
+    trigger_message_ids: tuple[str, ...] = ()
+    turn_id: str = ""
+    semantic_intent: str = ""
+    semantic_topic: str = ""
 
 
 @dataclass
@@ -162,6 +172,10 @@ class GroupChatMessage:
     mentioned_bot: bool = False
     mentioned_user_ids: tuple[str, ...] = ()
     display_name: str = ""
+    generated_for_message_ids: tuple[str, ...] = ()
+    turn_id: str = ""
+    reply_mode: str = ""
+    semantic_topic: str = ""
 
 
 @dataclass
@@ -852,6 +866,14 @@ def write_message_audit(
     recent_context_selected_ids: Sequence[str] = (),
     memory_selected_chunk_ids: Sequence[int] = (),
     memory_selected_by_planner: bool = False,
+    self_history_candidate_count: int = 0,
+    self_history_selected_count: int = 0,
+    self_history_chars: int = 0,
+    self_history_selected_message_ids: Sequence[str] = (),
+    self_history_reasons: Sequence[str] = (),
+    bot_message_id: str = "",
+    generated_for_message_ids: Sequence[str] = (),
+    turn_id: str = "",
     event_time=None,
 ) -> None:
     try:
@@ -902,6 +924,14 @@ def write_message_audit(
         "recent_context_selected_ids": list(recent_context_selected_ids),
         "memory_selected_chunk_ids": [int(value) for value in memory_selected_chunk_ids],
         "memory_selected_by_planner": bool(memory_selected_by_planner),
+        "self_history_candidate_count": int(self_history_candidate_count),
+        "self_history_selected_count": int(self_history_selected_count),
+        "self_history_chars": int(self_history_chars),
+        "self_history_selected_message_ids": list(self_history_selected_message_ids),
+        "self_history_reasons": list(self_history_reasons),
+        "bot_message_id": str(bot_message_id or ""),
+        "generated_for_message_ids": list(generated_for_message_ids),
+        "turn_id": str(turn_id or ""),
     }
     log_path = Path(settings.message_audit_log)
     try:
@@ -1266,6 +1296,8 @@ def remember_conversation(
     answer: str = "",
     bot_message_id: str = "",
     user_message_id: str = "",
+    trigger_message_ids: Sequence[str] = (),
+    turn_id: str = "",
     persist: bool = True,
     db_path: str | Path | None = None,
 ) -> None:
@@ -1278,6 +1310,14 @@ def remember_conversation(
         reply_mode=decision.reply_mode,
         bot_message_id=str(bot_message_id or ""),
         user_message_id=str(user_message_id or ""),
+        trigger_message_ids=tuple(dict.fromkeys(
+            str(value or "").strip()
+            for value in trigger_message_ids
+            if str(value or "").strip()
+        )),
+        turn_id=str(turn_id or "").strip(),
+        semantic_intent=decision.semantic_intent,
+        semantic_topic=decision.semantic_topic,
     )
     if persist:
         try:
@@ -1317,6 +1357,10 @@ def record_group_chat_message(
     mentioned_bot: bool = False,
     mentioned_user_ids: Sequence[str] = (),
     display_name: str = "",
+    generated_for_message_ids: Sequence[str] = (),
+    turn_id: str = "",
+    reply_mode: str = "",
+    semantic_topic: str = "",
 ) -> int:
     global chat_message_sequence
     normalized = text.strip()
@@ -1342,6 +1386,14 @@ def record_group_chat_message(
             bool(mentioned_bot),
             tuple(str(value) for value in mentioned_user_ids if str(value).strip()),
             str(display_name or "").strip(),
+            tuple(dict.fromkeys(
+                str(value).strip()
+                for value in generated_for_message_ids
+                if str(value).strip()
+            )),
+            str(turn_id or "").strip(),
+            str(reply_mode or "").strip(),
+            str(semantic_topic or "").strip(),
         )
         history = group_chat_history.setdefault(group_id, [])
         history.append(entry)
@@ -1364,6 +1416,10 @@ def record_group_chat_message(
                 reply_speaker_id=stable_member_id(group_id, entry.reply_target_user_id),
                 quoted_text=entry.reply_text,
                 mentions=tuple(stable_member_id(group_id, value) for value in entry.mentioned_user_ids),
+                generated_for_message_ids=entry.generated_for_message_ids,
+                turn_id=entry.turn_id,
+                reply_mode=entry.reply_mode,
+                semantic_topic=entry.semantic_topic,
             )
         )
     return sequence
@@ -1443,6 +1499,7 @@ def _context_message_payload(
         "speaker": {
             "id": speaker_id,
             "role": "bot" if speaker_id == "bot" else "member",
+            "is_self": speaker_id == "bot",
             "display_name": (
                 item.display_name
                 if speaker_id != "bot"
@@ -1455,6 +1512,10 @@ def _context_message_payload(
             for user_id in item.mentioned_user_ids
         ],
         "mentions_bot": item.mentioned_bot,
+        "generated_for_message_ids": list(item.generated_for_message_ids),
+        "turn_id": item.turn_id,
+        "reply_mode": item.reply_mode,
+        "semantic_topic": item.semantic_topic,
     }
     if item.reply_message_id:
         target_id = stable_member_id(group_id, item.reply_target_user_id)
@@ -1774,6 +1835,7 @@ def review_and_refresh_answer(
             candidate_reply=candidate,
             original_context=original_context,
             latest_context=latest_context,
+            self_history_context=decision.self_history_context,
             reply_mode=decision.reply_mode,
             mentioned=mentioned,
             topic_summary=decision.semantic_topic,
@@ -1890,6 +1952,10 @@ def save_chat_history(path: str | Path | None = None) -> None:
                         "mentioned_bot": m.mentioned_bot,
                         "mentioned_user_ids": list(m.mentioned_user_ids),
                         "display_name": m.display_name,
+                        "generated_for_message_ids": list(m.generated_for_message_ids),
+                        "turn_id": m.turn_id,
+                        "reply_mode": m.reply_mode,
+                        "semantic_topic": m.semantic_topic,
                     }
                     for m in messages
                 ]
@@ -1969,6 +2035,12 @@ def load_chat_history(path: str | Path | None = None) -> int:
                         mentioned_bot=bool(m.get("mentioned_bot")),
                         mentioned_user_ids=tuple(m.get("mentioned_user_ids") or ()),
                         display_name=m.get("display_name", ""),
+                        generated_for_message_ids=tuple(
+                            m.get("generated_for_message_ids") or ()
+                        ),
+                        turn_id=m.get("turn_id", ""),
+                        reply_mode=m.get("reply_mode", ""),
+                        semantic_topic=m.get("semantic_topic", ""),
                     )
                     history.append(entry)
                     chat_message_sequence = max(chat_message_sequence, entry.sequence)
@@ -2004,6 +2076,10 @@ def migrate_loaded_chat_history_to_memory() -> int:
             reply_speaker_id=stable_member_id(group_id, item.reply_target_user_id),
             quoted_text=item.reply_text,
             mentions=tuple(stable_member_id(group_id, value) for value in item.mentioned_user_ids),
+            generated_for_message_ids=item.generated_for_message_ids,
+            turn_id=item.turn_id,
+            reply_mode=item.reply_mode,
+            semantic_topic=item.semantic_topic,
         )))
     return queued
 
@@ -2647,6 +2723,56 @@ def enrich_decision_with_chat_memory(
             decision.memory_context = formatted
             if formatted:
                 decision.draft_reply = ""
+
+        if decision.should_reply and chat_memory_enabled_for_group(group_id):
+            related_message_ids = list(_message_ids(item))
+            selected_recent_ids = tuple(
+                message_id
+                for line in decision.chat_context
+                if (message_id := context_line_message_id(line))
+            )
+            for message_id in (
+                reply_message_id,
+                *selected_recent_ids,
+                *(message_id for hit in hits for message_id in hit.message_ids),
+            ):
+                value = str(message_id or "").strip()
+                if value and value not in related_message_ids:
+                    related_message_ids.append(value)
+            topic_ids = tuple(dict.fromkeys(hit.topic_id for hit in hits if hit.topic_id))
+            self_history = chat_memory_manager.store.format_self_history(
+                group_id=group_id,
+                related_message_ids=related_message_ids,
+                topic_ids=topic_ids,
+                limit=max(1, getattr(settings, "bot_self_history_max_turns", 3)),
+                max_chars=max(200, getattr(settings, "bot_self_history_max_chars", 1200)),
+            )
+            decision.self_history_context = self_history
+            decision.self_history_candidate_count = len(self_history)
+            decision.self_history_selected_count = len(self_history)
+            decision.self_history_chars = sum(len(line) for line in self_history)
+            selected_bot_ids: list[str] = []
+            for line in self_history:
+                try:
+                    message_id = str(
+                        context_line_payload(line).get("bot_message", {}).get("message_id") or ""
+                    )
+                except (AttributeError, TypeError):
+                    message_id = ""
+                if message_id and message_id not in selected_bot_ids:
+                    selected_bot_ids.append(message_id)
+            decision.self_history_selected_message_ids = tuple(selected_bot_ids)
+            if self_history:
+                # Planner drafts are created before exact prior bot turns are loaded.
+                decision.draft_reply = ""
+            reasons: list[str] = []
+            if reply_message_id:
+                reasons.append("qq_reply")
+            if selected_recent_ids:
+                reasons.append("selected_recent_context")
+            if hits:
+                reasons.append("retrieved_topic")
+            decision.self_history_reasons = tuple(reasons)
     except Exception as exc:
         decision.memory_rejection_reason = f"retrieval error: {type(exc).__name__}"
         print("Chat memory retrieval failed:", type(exc).__name__, repr(exc))
@@ -2672,6 +2798,11 @@ def enrich_decision_with_chat_memory(
             recent_context_selected_ids=decision.recent_context_selected_ids,
             memory_selected_chunk_ids=decision.memory_selected_chunk_ids,
             memory_selected_by_planner=decision.memory_selected_by_planner,
+            self_history_candidate_count=decision.self_history_candidate_count,
+            self_history_selected_count=decision.self_history_selected_count,
+            self_history_chars=decision.self_history_chars,
+            self_history_selected_message_ids=decision.self_history_selected_message_ids,
+            self_history_reasons=decision.self_history_reasons,
             event_time=item.get("time"),
         )
     return decision
@@ -2715,6 +2846,7 @@ def answer_question(
     allow_fallback: bool = True,
     chat_context: Sequence[str] = (),
     memory_context: Sequence[str] = (),
+    self_history_context: Sequence[str] = (),
     semantic_context: str = "",
     timeout: int | None = None,
 ) -> str:
@@ -2740,6 +2872,7 @@ def answer_question(
                 question=llm_question,
                 context=tuple(chat_context[-8:]),
                 memory_context=tuple(memory_context),
+                self_history_context=tuple(self_history_context),
                 semantic_context=semantic_context,
                 timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
             )
@@ -2754,6 +2887,7 @@ def answer_question(
         context=result.context,
         chat_context=tuple(chat_context[-8:]),
         memory_context=tuple(memory_context),
+        self_history_context=tuple(self_history_context),
         semantic_context=semantic_context,
         timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
     )
@@ -2785,6 +2919,7 @@ def answer_for_decision(
             question=llm_question,
             context=decision.chat_context,
             memory_context=decision.memory_context,
+            self_history_context=decision.self_history_context,
             semantic_context=semantic_context,
             timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
         )
@@ -2797,6 +2932,7 @@ def answer_for_decision(
             message=question,
             context=decision.chat_context,
             memory_context=decision.memory_context,
+            self_history_context=decision.self_history_context,
             semantic_context=semantic_context,
             timeout=timeout or getattr(settings, "chat_generation_timeout_seconds", 7),
         )
@@ -2808,6 +2944,7 @@ def answer_for_decision(
         allow_fallback=False,
         chat_context=decision.chat_context,
         memory_context=decision.memory_context,
+        self_history_context=decision.self_history_context,
         semantic_context=semantic_context,
         timeout=timeout,
     )
@@ -2891,6 +3028,24 @@ def open_pending_queue_db(db_path: str | Path | None = None) -> sqlite3.Connecti
         "CREATE INDEX IF NOT EXISTS idx_conversation_user_time "
         "ON conversation_turns (group_id, user_id, created_at)"
     )
+    existing_turn_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(conversation_turns)")
+    }
+    turn_migrations = {
+        "trigger_message_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "turn_id": "TEXT NOT NULL DEFAULT ''",
+        "semantic_intent": "TEXT NOT NULL DEFAULT ''",
+        "semantic_topic": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, definition in turn_migrations.items():
+        if column not in existing_turn_columns:
+            connection.execute(
+                f"ALTER TABLE conversation_turns ADD COLUMN {column} {definition}"
+            )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_turn_id "
+        "ON conversation_turns (group_id, turn_id)"
+    )
     connection.commit()
     return connection
 
@@ -2909,8 +3064,9 @@ def persist_conversation_turn(
             """
             INSERT INTO conversation_turns (
                 group_id, user_id, user_message_id, bot_message_id,
-                question, answer, reply_mode, sources_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                question, answer, reply_mode, sources_json, created_at,
+                trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(group_id),
@@ -2922,6 +3078,10 @@ def persist_conversation_turn(
                 state.reply_mode,
                 json.dumps(list(state.sources), ensure_ascii=False),
                 state.timestamp,
+                json.dumps(list(state.trigger_message_ids), ensure_ascii=False),
+                state.turn_id,
+                state.semantic_intent,
+                state.semantic_topic,
             ),
         )
         connection.commit()
@@ -2944,6 +3104,10 @@ def _conversation_state_from_row(row) -> ConversationState:
         reply_mode=str(row[6] or ""),
         bot_message_id=str(row[3] or ""),
         user_message_id=str(row[2] or ""),
+        trigger_message_ids=tuple(json.loads(row[9] or "[]")),
+        turn_id=str(row[10] or ""),
+        semantic_intent=str(row[11] or ""),
+        semantic_topic=str(row[12] or ""),
     )
 
 
@@ -2961,7 +3125,8 @@ def load_conversation_turn_by_bot_message_id(
         row = connection.execute(
             """
             SELECT id, user_id, user_message_id, bot_message_id,
-                   question, answer, reply_mode, sources_json, created_at
+                   question, answer, reply_mode, sources_json, created_at,
+                   trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
             FROM conversation_turns
             WHERE group_id = ? AND bot_message_id = ?
             ORDER BY created_at DESC LIMIT 1
@@ -2991,7 +3156,8 @@ def load_recent_conversation_states(
         rows = connection.execute(
             """
             SELECT group_id, user_id, user_message_id, bot_message_id,
-                   question, answer, reply_mode, sources_json, created_at
+                   question, answer, reply_mode, sources_json, created_at,
+                   trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
             FROM conversation_turns
             WHERE created_at >= ? AND reply_mode IN ('knowledge', 'fallback')
             ORDER BY created_at ASC
@@ -3139,6 +3305,13 @@ def _message_ids(item: dict) -> list[str]:
         if value and value not in result:
             result.append(value)
     return result
+
+
+def bot_turn_metadata(item: dict, bot_message_id) -> tuple[tuple[str, ...], str]:
+    trigger_ids = tuple(_message_ids(item))
+    bot_id = str(bot_message_id or "").strip()
+    turn_id = f"bot:{bot_id}" if bot_id else ""
+    return trigger_ids, turn_id
 
 
 def _new_fragment_buffer(item: dict, audience: str, now: float) -> MessageFragmentBuffer:
@@ -3616,6 +3789,11 @@ def should_process_message(
         chat_context = context_selected_by_plan(chat_context, usable_plan)
         query_text = usable_plan.standalone_question or query_text
         explicitly_addressed = mentioned or reply_target_user_id == settings.bot_qq
+        validated_capability = (
+            usable_plan.capability
+            if usable_plan.intent == "bot_meta"
+            else "none"
+        )
         if usable_plan.audience == "member" and not mentioned:
             return ProcessingDecision(
                 False,
@@ -3624,10 +3802,10 @@ def should_process_message(
                 semantic_intent=usable_plan.intent,
                 semantic_topic=usable_plan.topic_summary,
                 implicit_meaning=usable_plan.implicit_meaning,
-                capability=usable_plan.capability,
+                capability=validated_capability,
                 semantic_confidence=usable_plan.confidence,
             )
-        if usable_plan.capability != "none":
+        if usable_plan.intent == "bot_meta" and validated_capability != "none":
             if explicitly_addressed and usable_plan.audience == "bot":
                 return ProcessingDecision(
                     True,
@@ -3635,10 +3813,10 @@ def should_process_message(
                     effective_question=query_text,
                     reply_mode="bot_meta",
                     chat_context=tuple(chat_context),
-                    semantic_intent="bot_meta",
+                    semantic_intent=usable_plan.intent,
                     semantic_topic=usable_plan.topic_summary,
                     implicit_meaning=usable_plan.implicit_meaning,
-                    capability=usable_plan.capability,
+                    capability=validated_capability,
                     semantic_confidence=usable_plan.confidence,
                 )
             return ProcessingDecision(
@@ -3656,7 +3834,7 @@ def should_process_message(
                     semantic_intent=usable_plan.intent,
                     semantic_topic=usable_plan.topic_summary,
                     implicit_meaning=usable_plan.implicit_meaning,
-                    capability=usable_plan.capability,
+                    capability=validated_capability,
                     semantic_confidence=usable_plan.confidence,
                 )
             return ProcessingDecision(False, "semantic plan: bot meta requires explicit bot address")
@@ -3821,7 +3999,11 @@ def should_process_message(
                 semantic_intent=usable_plan.intent if usable_plan else "",
                 semantic_topic=usable_plan.topic_summary if usable_plan else "",
                 implicit_meaning=usable_plan.implicit_meaning if usable_plan else "",
-                capability=usable_plan.capability if usable_plan else "none",
+                capability=(
+                    usable_plan.capability
+                    if usable_plan and usable_plan.intent == "bot_meta"
+                    else "none"
+                ),
                 semantic_confidence=usable_plan.confidence if usable_plan else 0.0,
             )
 
@@ -3870,7 +4052,11 @@ def should_process_message(
                 semantic_intent=usable_plan.intent,
                 semantic_topic=usable_plan.topic_summary,
                 implicit_meaning=usable_plan.implicit_meaning,
-                capability=usable_plan.capability,
+                capability=(
+                    usable_plan.capability
+                    if usable_plan.intent == "bot_meta"
+                    else "none"
+                ),
                 semantic_confidence=usable_plan.confidence,
             )
         return ProcessingDecision(
@@ -3913,7 +4099,11 @@ def should_process_message(
             semantic_intent=usable_plan.intent if usable_plan else "",
             semantic_topic=usable_plan.topic_summary if usable_plan else "",
             implicit_meaning=usable_plan.implicit_meaning if usable_plan else "",
-            capability=usable_plan.capability if usable_plan else "none",
+            capability=(
+                usable_plan.capability
+                if usable_plan and usable_plan.intent == "bot_meta"
+                else "none"
+            ),
             semantic_confidence=usable_plan.confidence if usable_plan else 0.0,
         )
 
@@ -4073,11 +4263,19 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         settings.onebot_access_token,
                         reply_to_message_id=str(item.get("message_id") or ""),
                     )
+                    trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
                     record_group_chat_message(
                         group_id,
                         settings.bot_qq,
                         answer,
                         message_id=bot_message_id,
+                        reply_message_id=str(item.get("message_id") or ""),
+                        reply_target_user_id=str(user_id or ""),
+                        reply_text=question,
+                        generated_for_message_ids=trigger_message_ids,
+                        turn_id=turn_id,
+                        reply_mode="admin",
+                        semantic_topic=command,
                     )
                 print("Answered admin command", group_id, user_id, command)
                 write_message_audit(
@@ -4198,6 +4396,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     implicit_meaning=decision.implicit_meaning,
                     capability=decision.capability,
                     semantic_confidence=decision.semantic_confidence,
+                    self_history_candidate_count=decision.self_history_candidate_count,
+                    self_history_selected_count=decision.self_history_selected_count,
+                    self_history_chars=decision.self_history_chars,
+                    self_history_selected_message_ids=decision.self_history_selected_message_ids,
+                    self_history_reasons=decision.self_history_reasons,
                     event_time=item.get("time"),
                 )
                 continue
@@ -4356,6 +4559,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     implicit_meaning=decision.implicit_meaning,
                     capability=decision.capability,
                     semantic_confidence=decision.semantic_confidence,
+                    self_history_candidate_count=decision.self_history_candidate_count,
+                    self_history_selected_count=decision.self_history_selected_count,
+                    self_history_chars=decision.self_history_chars,
+                    self_history_selected_message_ids=decision.self_history_selected_message_ids,
+                    self_history_reasons=decision.self_history_reasons,
                     event_time=item.get("time"),
                 )
                 remember_conversation(
@@ -4427,11 +4635,21 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         str(item.get("message_id") or "") if mentioned else ""
                     ),
                 )
+                trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
                 record_group_chat_message(
                     group_id,
                     settings.bot_qq,
                     answer,
                     message_id=bot_message_id,
+                    reply_message_id=(
+                        str(item.get("message_id") or "") if mentioned else ""
+                    ),
+                    reply_target_user_id=str(user_id or "") if mentioned else "",
+                    reply_text=question if mentioned else "",
+                    generated_for_message_ids=trigger_message_ids,
+                    turn_id=turn_id,
+                    reply_mode=decision.reply_mode,
+                    semantic_topic=decision.semantic_topic,
                 )
             print("Answered group", group_id, "question", question)
             write_message_audit(
@@ -4458,6 +4676,14 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 implicit_meaning=decision.implicit_meaning,
                 capability=decision.capability,
                 semantic_confidence=decision.semantic_confidence,
+                self_history_candidate_count=decision.self_history_candidate_count,
+                self_history_selected_count=decision.self_history_selected_count,
+                self_history_chars=decision.self_history_chars,
+                self_history_selected_message_ids=decision.self_history_selected_message_ids,
+                self_history_reasons=decision.self_history_reasons,
+                bot_message_id=str(bot_message_id or ""),
+                generated_for_message_ids=trigger_message_ids,
+                turn_id=turn_id,
                 event_time=item.get("time"),
             )
             remember_conversation(
@@ -4468,6 +4694,8 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 answer=answer,
                 bot_message_id=bot_message_id,
                 user_message_id=str(item.get("message_id") or ""),
+                trigger_message_ids=trigger_message_ids,
+                turn_id=turn_id,
             )
             if decision.reply_mode == "knowledge":
                 mark_topic_replied(group_id, current_topic_key)
@@ -4623,6 +4851,7 @@ def chat_worker() -> None:
                     scene_context=scene_context,
                     semantic_context=semantic_context_for_decision(decision),
                     memory_context=decision.memory_context,
+                    self_history_context=decision.self_history_context,
                     timeout=generation_timeout,
                 )
             else:
@@ -4853,11 +5082,16 @@ def chat_worker() -> None:
                     settings.onebot_access_token,
                     mention_user_id=mention_user_id,
                 )
+                trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
                 record_group_chat_message(
                     group_id,
                     settings.bot_qq,
                     answer,
                     message_id=bot_message_id,
+                    generated_for_message_ids=trigger_message_ids,
+                    turn_id=turn_id,
+                    reply_mode="chat",
+                    semantic_topic=decision.semantic_topic,
                 )
                 mark_chat_replied(group_id)
             if social_event_kind:
@@ -4889,6 +5123,14 @@ def chat_worker() -> None:
                 implicit_meaning=decision.implicit_meaning,
                 capability=decision.capability,
                 semantic_confidence=decision.semantic_confidence,
+                self_history_candidate_count=decision.self_history_candidate_count,
+                self_history_selected_count=decision.self_history_selected_count,
+                self_history_chars=decision.self_history_chars,
+                self_history_selected_message_ids=decision.self_history_selected_message_ids,
+                self_history_reasons=decision.self_history_reasons,
+                bot_message_id=str(bot_message_id or ""),
+                generated_for_message_ids=trigger_message_ids,
+                turn_id=turn_id,
                 event_time=event_time,
             )
             remember_conversation(
@@ -4899,6 +5141,8 @@ def chat_worker() -> None:
                 answer=answer,
                 bot_message_id=bot_message_id,
                 user_message_id=str(item.get("message_id") or ""),
+                trigger_message_ids=trigger_message_ids,
+                turn_id=turn_id,
             )
         except Exception as exc:
             terminal = False

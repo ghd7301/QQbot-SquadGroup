@@ -143,6 +143,8 @@ class Settings:
     )
     chat_memory_max_hits: int = int(os.getenv("CHAT_MEMORY_MAX_HITS", "6"))
     chat_memory_max_chars: int = int(os.getenv("CHAT_MEMORY_MAX_CHARS", "2400"))
+    bot_self_history_max_turns: int = int(os.getenv("BOT_SELF_HISTORY_MAX_TURNS", "3"))
+    bot_self_history_max_chars: int = int(os.getenv("BOT_SELF_HISTORY_MAX_CHARS", "1200"))
     chat_memory_probe_max_hits: int = int(os.getenv("CHAT_MEMORY_PROBE_MAX_HITS", "8"))
     chat_memory_probe_max_chars: int = int(os.getenv("CHAT_MEMORY_PROBE_MAX_CHARS", "1600"))
     planned_chat_context_messages: int = int(os.getenv("PLANNED_CHAT_CONTEXT_MESSAGES", "10"))

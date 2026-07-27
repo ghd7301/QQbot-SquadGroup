@@ -258,6 +258,11 @@ class FollowupContextTests(unittest.TestCase):
                 last_answer="FOB是范围，HAB才是出生建筑。",
                 reply_mode="knowledge",
                 bot_message_id="bot-1",
+                user_message_id="user-1",
+                trigger_message_ids=("user-1", "user-2"),
+                turn_id="bot:bot-1",
+                semantic_intent="knowledge",
+                semantic_topic="FOB 与 HAB",
             )
             server.persist_conversation_turn(1, state, db_path=db_path)
             server.clear_conversation_state()
@@ -269,6 +274,9 @@ class FollowupContextTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertIsNotNone(match)
         self.assertEqual(match.state.last_answer, "FOB是范围，HAB才是出生建筑。")
+        self.assertEqual(match.state.trigger_message_ids, ("user-1", "user-2"))
+        self.assertEqual(match.state.turn_id, "bot:bot-1")
+        self.assertEqual(match.state.semantic_topic, "FOB 与 HAB")
 
 
 if __name__ == "__main__":

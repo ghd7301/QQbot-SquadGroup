@@ -332,6 +332,32 @@ class MessageFragmentTests(unittest.TestCase):
         history = server.group_chat_history[100]
         self.assertEqual([entry.text for entry in history], ["第一段", "第二段"])
 
+    def test_bot_turn_fields_survive_chat_history_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "chat_history.json"
+            with patch.object(server, "settings", fragment_settings(bot_qq="999")):
+                server.clear_chat_state()
+                server.record_group_chat_message(
+                    100,
+                    "999",
+                    "我刚才回的是第一段",
+                    1002,
+                    message_id="bot-1",
+                    generated_for_message_ids=("1", "2"),
+                    turn_id="bot:bot-1",
+                    reply_mode="chat",
+                    semantic_topic="分段消息",
+                )
+                server.save_chat_history(history_path)
+                server.clear_chat_state()
+                self.assertEqual(server.load_chat_history(history_path), 1)
+
+        restored = server.group_chat_history[100][0]
+        self.assertEqual(restored.generated_for_message_ids, ("1", "2"))
+        self.assertEqual(restored.turn_id, "bot:bot-1")
+        self.assertEqual(restored.reply_mode, "chat")
+        self.assertEqual(restored.semantic_topic, "分段消息")
+
     def test_semantic_classifier_parses_structured_result(self):
         with patch.object(
             llm,

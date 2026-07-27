@@ -72,6 +72,10 @@ class MemoryMessage:
     reply_speaker_id: str = ""
     quoted_text: str = ""
     mentions: tuple[str, ...] = ()
+    generated_for_message_ids: tuple[str, ...] = ()
+    turn_id: str = ""
+    reply_mode: str = ""
+    semantic_topic: str = ""
 
 
 @dataclass(frozen=True)
@@ -164,7 +168,40 @@ class ChatMemoryStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS message_relations (
+                    id INTEGER PRIMARY KEY,
+                    group_id INTEGER NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    target_message_id TEXT NOT NULL,
+                    relation_type TEXT NOT NULL,
+                    relation_basis TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at REAL NOT NULL,
+                    UNIQUE(group_id, source_message_id, target_message_id, relation_type)
+                );
+                CREATE INDEX IF NOT EXISTS message_relations_source
+                    ON message_relations(group_id, source_message_id, relation_type);
+                CREATE INDEX IF NOT EXISTS message_relations_target
+                    ON message_relations(group_id, target_message_id, relation_type);
                 """
+            )
+            existing_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(chat_messages)")
+            }
+            migrations = {
+                "generated_for_message_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "turn_id": "TEXT NOT NULL DEFAULT ''",
+                "reply_mode": "TEXT NOT NULL DEFAULT ''",
+                "semantic_topic": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in migrations.items():
+                if column not in existing_columns:
+                    connection.execute(
+                        f"ALTER TABLE chat_messages ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS chat_messages_topic_role_time "
+                "ON chat_messages(group_id, topic_id, speaker_role, event_time DESC)"
             )
 
     def add_message(self, message: MemoryMessage) -> bool:
@@ -174,13 +211,16 @@ class ChatMemoryStore:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO chat_messages
                    (group_id,message_id,speaker_id,display_name,speaker_role,text,event_time,
-                    reply_message_id,reply_speaker_id,quoted_text,mentions_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    reply_message_id,reply_speaker_id,quoted_text,mentions_json,
+                    generated_for_message_ids_json,turn_id,reply_mode,semantic_topic)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     message.group_id, message.message_id, message.speaker_id,
                     message.display_name, message.speaker_role, message.text, message.event_time,
                     message.reply_message_id, message.reply_speaker_id, message.quoted_text,
                     json.dumps(message.mentions, ensure_ascii=False),
+                    json.dumps(message.generated_for_message_ids, ensure_ascii=False),
+                    message.turn_id, message.reply_mode, message.semantic_topic,
                 ),
             )
             if not cursor.rowcount:
@@ -200,14 +240,106 @@ class ChatMemoryStore:
                 "UPDATE topic_sessions SET updated_at=? WHERE id=?",
                 (message.event_time, topic_id),
             )
+            if message.reply_message_id:
+                self._add_relation(
+                    connection,
+                    group_id=message.group_id,
+                    source_message_id=message.message_id,
+                    target_message_id=message.reply_message_id,
+                    relation_type="qq_reply",
+                    relation_basis="onebot",
+                    confidence=1.0,
+                    created_at=message.event_time,
+                )
+                replied = connection.execute(
+                    "SELECT speaker_role FROM chat_messages WHERE group_id=? AND message_id=?",
+                    (message.group_id, message.reply_message_id),
+                ).fetchone()
+                if replied and str(replied["speaker_role"]) == "bot":
+                    self._add_relation(
+                        connection,
+                        group_id=message.group_id,
+                        source_message_id=message.message_id,
+                        target_message_id=message.reply_message_id,
+                        relation_type="feedback_to",
+                        relation_basis="qq_reply",
+                        confidence=1.0,
+                        created_at=message.event_time,
+                    )
+            for target_message_id in message.generated_for_message_ids:
+                self._add_relation(
+                    connection,
+                    group_id=message.group_id,
+                    source_message_id=message.message_id,
+                    target_message_id=target_message_id,
+                    relation_type="generated_for",
+                    relation_basis="program",
+                    confidence=1.0,
+                    created_at=message.event_time,
+                )
             return True
+
+    @staticmethod
+    def _add_relation(
+        connection: sqlite3.Connection,
+        *,
+        group_id: int,
+        source_message_id: str,
+        target_message_id: str,
+        relation_type: str,
+        relation_basis: str,
+        confidence: float,
+        created_at: float,
+    ) -> bool:
+        source = str(source_message_id or "").strip()
+        target = str(target_message_id or "").strip()
+        if not source or not target or source == target:
+            return False
+        cursor = connection.execute(
+            """INSERT OR REPLACE INTO message_relations
+               (group_id,source_message_id,target_message_id,relation_type,
+                relation_basis,confidence,created_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (
+                int(group_id), source, target, str(relation_type),
+                str(relation_basis), max(0.0, min(1.0, float(confidence))),
+                float(created_at),
+            ),
+        )
+        return bool(cursor.rowcount)
+
+    def add_relation(
+        self,
+        *,
+        group_id: int,
+        source_message_id: str,
+        target_message_id: str,
+        relation_type: str,
+        relation_basis: str = "semantic",
+        confidence: float = 1.0,
+        created_at: float | None = None,
+    ) -> bool:
+        with self._write_lock, self.connect() as connection:
+            return self._add_relation(
+                connection,
+                group_id=group_id,
+                source_message_id=source_message_id,
+                target_message_id=target_message_id,
+                relation_type=relation_type,
+                relation_basis=relation_basis,
+                confidence=confidence,
+                created_at=time.time() if created_at is None else created_at,
+            )
 
     def _choose_topic(self, connection: sqlite3.Connection, message: MemoryMessage) -> int:
         terms = set(lexical_terms(message.text))
-        if message.reply_message_id:
+        hard_targets = (*message.generated_for_message_ids, message.reply_message_id)
+        for target_message_id in hard_targets:
+            if not target_message_id:
+                continue
             row = connection.execute(
                 "SELECT topic_id FROM chat_messages WHERE group_id=? AND message_id=? AND recalled=0",
-                (message.group_id, message.reply_message_id),
+                (message.group_id, target_message_id),
             ).fetchone()
             if row and row["topic_id"]:
                 return int(row["topic_id"])
@@ -240,7 +372,12 @@ class ChatMemoryStore:
         ).fetchone()
         if row and message.event_time - float(row["ended_at"]) <= 12:
             speakers = json.loads(row["speaker_ids_json"])
-            if speakers and speakers[-1] == message.speaker_id and not message.reply_message_id:
+            if (
+                speakers
+                and speakers[-1] == message.speaker_id
+                and not message.reply_message_id
+                and not message.generated_for_message_ids
+            ):
                 return int(row["utterance_id"]), int(row["id"])
         return int(time.time_ns() & 0x7FFFFFFFFFFFFFFF), 0
 
@@ -300,6 +437,11 @@ class ChatMemoryStore:
                 return False
             found = True
             connection.execute("UPDATE chat_messages SET recalled=1,searchable=0 WHERE id=?", (row["id"],))
+            connection.execute(
+                "DELETE FROM message_relations WHERE group_id=? "
+                "AND (source_message_id=? OR target_message_id=?)",
+                (group_id, str(message_id), str(message_id)),
+            )
             chunk_rows = connection.execute(
                 "SELECT id,message_ids_json FROM memory_chunks WHERE group_id=? AND active=1",
                 (group_id,),
@@ -472,7 +614,8 @@ class ChatMemoryStore:
                 for message_id in hit.message_ids:
                     row = connection.execute(
                         """SELECT message_id,speaker_id,speaker_role,text,event_time,reply_message_id,
-                                  reply_speaker_id,quoted_text,mentions_json
+                                  reply_speaker_id,quoted_text,mentions_json,
+                                  generated_for_message_ids_json,turn_id,reply_mode,semantic_topic
                            FROM chat_messages
                            WHERE group_id=? AND message_id=? AND recalled=0 AND searchable=1""",
                         (hit.group_id, message_id),
@@ -484,17 +627,28 @@ class ChatMemoryStore:
                         reply_to = {
                             "message_id": str(row["reply_message_id"]),
                             "speaker_id": str(row["reply_speaker_id"] or "unknown_member"),
+                            "speaker_role": (
+                                "bot" if str(row["reply_speaker_id"]) == "bot" else "member"
+                            ),
                             "quoted_text": redact_for_model(str(row["quoted_text"])),
                         }
+                    role = str(row["speaker_role"])
                     messages.append({
                         "message_id": str(row["message_id"]),
                         "speaker": {
                             "id": str(row["speaker_id"]),
-                            "role": str(row["speaker_role"]),
+                            "role": role,
+                            "is_self": role == "bot",
                         },
                         "text": redact_for_model(str(row["text"])),
                         "reply_to": reply_to,
                         "mentions": list(json.loads(row["mentions_json"] or "[]")),
+                        "generated_for_message_ids": list(
+                            json.loads(row["generated_for_message_ids_json"] or "[]")
+                        ),
+                        "turn_id": str(row["turn_id"] or ""),
+                        "reply_mode": str(row["reply_mode"] or ""),
+                        "semantic_topic": redact_for_model(str(row["semantic_topic"] or "")),
                     })
                 lines.append(json.dumps({
                     "source": "untrusted_group_chat_memory",
@@ -505,6 +659,137 @@ class ChatMemoryStore:
                     "reasons": list(hit.reasons),
                 }, ensure_ascii=False, separators=(",", ":")))
         return tuple(lines)
+
+    def format_self_history(
+        self,
+        *,
+        group_id: int,
+        related_message_ids: Sequence[str] = (),
+        topic_ids: Sequence[int] = (),
+        limit: int = 3,
+        max_chars: int = 1200,
+    ) -> tuple[str, ...]:
+        """Load exact bot turns for selected messages/topics without treating them as facts."""
+        message_ids = tuple(dict.fromkeys(
+            str(value or "").strip() for value in related_message_ids if str(value or "").strip()
+        ))
+        selected_topics = {int(value) for value in topic_ids if int(value) > 0}
+        direct_bot_ids: set[str] = set()
+        with self.connect() as connection:
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                rows = connection.execute(
+                    f"""SELECT message_id,speaker_role,topic_id,reply_message_id
+                        FROM chat_messages
+                        WHERE group_id=? AND recalled=0 AND message_id IN ({placeholders})""",
+                    (group_id, *message_ids),
+                ).fetchall()
+                for row in rows:
+                    if row["topic_id"]:
+                        selected_topics.add(int(row["topic_id"]))
+                    if str(row["speaker_role"]) == "bot":
+                        direct_bot_ids.add(str(row["message_id"]))
+                    replied_id = str(row["reply_message_id"] or "")
+                    if replied_id:
+                        replied = connection.execute(
+                            "SELECT speaker_role FROM chat_messages WHERE group_id=? AND message_id=?",
+                            (group_id, replied_id),
+                        ).fetchone()
+                        if replied and str(replied["speaker_role"]) == "bot":
+                            direct_bot_ids.add(replied_id)
+                relation_rows = connection.execute(
+                    f"""SELECT target_message_id FROM message_relations
+                        WHERE group_id=? AND source_message_id IN ({placeholders})
+                          AND relation_type='feedback_to'""",
+                    (group_id, *message_ids),
+                ).fetchall()
+                direct_bot_ids.update(str(row["target_message_id"]) for row in relation_rows)
+
+            conditions = []
+            parameters: list[object] = [group_id]
+            if direct_bot_ids:
+                placeholders = ",".join("?" for _ in direct_bot_ids)
+                conditions.append(f"message_id IN ({placeholders})")
+                parameters.extend(sorted(direct_bot_ids))
+            if selected_topics:
+                placeholders = ",".join("?" for _ in selected_topics)
+                conditions.append(f"topic_id IN ({placeholders})")
+                parameters.extend(sorted(selected_topics))
+            if not conditions:
+                return ()
+            rows = connection.execute(
+                f"""SELECT * FROM chat_messages
+                    WHERE group_id=? AND speaker_role='bot' AND recalled=0 AND searchable=1
+                      AND ({' OR '.join(conditions)})
+                    ORDER BY event_time DESC,id DESC LIMIT ?""",
+                (*parameters, max(1, int(limit) * 3)),
+            ).fetchall()
+
+            output: list[str] = []
+            used = 0
+            for row in rows:
+                generated_for = tuple(json.loads(row["generated_for_message_ids_json"] or "[]"))
+                triggers = []
+                for target_id in generated_for:
+                    trigger = connection.execute(
+                        """SELECT message_id,speaker_id,speaker_role,text,event_time
+                           FROM chat_messages WHERE group_id=? AND message_id=? AND recalled=0""",
+                        (group_id, str(target_id)),
+                    ).fetchone()
+                    if trigger:
+                        triggers.append({
+                            "message_id": str(trigger["message_id"]),
+                            "speaker": {
+                                "id": str(trigger["speaker_id"]),
+                                "role": str(trigger["speaker_role"]),
+                                "is_self": str(trigger["speaker_role"]) == "bot",
+                            },
+                            "text": redact_for_model(str(trigger["text"])),
+                        })
+                feedback_rows = connection.execute(
+                    """SELECT DISTINCT m.message_id,m.speaker_id,m.speaker_role,m.text,m.event_time
+                       FROM message_relations r
+                       JOIN chat_messages m
+                         ON m.group_id=r.group_id AND m.message_id=r.source_message_id
+                       WHERE r.group_id=? AND r.target_message_id=?
+                         AND r.relation_type='feedback_to' AND m.recalled=0
+                       ORDER BY m.event_time ASC LIMIT 4""",
+                    (group_id, str(row["message_id"])),
+                ).fetchall()
+                feedback = [{
+                    "message_id": str(item["message_id"]),
+                    "speaker": {
+                        "id": str(item["speaker_id"]),
+                        "role": str(item["speaker_role"]),
+                        "is_self": str(item["speaker_role"]) == "bot",
+                    },
+                    "text": redact_for_model(str(item["text"])),
+                } for item in feedback_rows]
+                payload = {
+                    "source": "bot_self_history",
+                    "authorship": "authoritative",
+                    "fact_status": "untrusted_previous_output",
+                    "topic_id": int(row["topic_id"] or 0),
+                    "turn_id": str(row["turn_id"] or ""),
+                    "reply_mode": str(row["reply_mode"] or ""),
+                    "semantic_topic": redact_for_model(str(row["semantic_topic"] or "")),
+                    "trigger_messages": triggers,
+                    "bot_message": {
+                        "message_id": str(row["message_id"]),
+                        "speaker": {"id": "bot", "role": "bot", "is_self": True},
+                        "text": redact_for_model(str(row["text"])),
+                        "generated_for_message_ids": list(generated_for),
+                    },
+                    "feedback_messages": feedback,
+                }
+                line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                if output and used + len(line) > max(200, int(max_chars)):
+                    continue
+                output.append(line)
+                used += len(line)
+                if len(output) >= max(1, int(limit)) or used >= max_chars:
+                    break
+            return tuple(output)
 
     def status(self) -> dict[str, int | str]:
         with self.connect() as connection:
@@ -520,6 +805,7 @@ class ChatMemoryStore:
             connection.execute("DELETE FROM memory_chunks WHERE group_id=?", (group_id,))
             connection.execute("DELETE FROM chat_messages WHERE group_id=?", (group_id,))
             connection.execute("DELETE FROM topic_sessions WHERE group_id=?", (group_id,))
+            connection.execute("DELETE FROM message_relations WHERE group_id=?", (group_id,))
 
     def rebuild_group(self, group_id: int) -> int:
         with self._write_lock, self.connect() as connection:
@@ -540,6 +826,12 @@ class ChatMemoryStore:
                     event_time=float(row["event_time"]), reply_message_id=str(row["reply_message_id"]),
                     reply_speaker_id=str(row["reply_speaker_id"]), quoted_text=str(row["quoted_text"]),
                     mentions=tuple(json.loads(row["mentions_json"] or "[]")),
+                    generated_for_message_ids=tuple(
+                        json.loads(row["generated_for_message_ids_json"] or "[]")
+                    ),
+                    turn_id=str(row["turn_id"] or ""),
+                    reply_mode=str(row["reply_mode"] or ""),
+                    semantic_topic=str(row["semantic_topic"] or ""),
                 )
                 topic_id = self._choose_topic(connection, message)
                 utterance_id, chunk_id = self._choose_utterance(connection, message, topic_id)
@@ -564,6 +856,7 @@ class ChatMemoryStore:
             connection.execute("DELETE FROM memory_chunks WHERE ended_at<?", (cutoff,))
             cursor = connection.execute("DELETE FROM chat_messages WHERE event_time<?", (cutoff,))
             connection.execute("DELETE FROM topic_sessions WHERE updated_at<?", (cutoff,))
+            connection.execute("DELETE FROM message_relations WHERE created_at<?", (cutoff,))
             return cursor.rowcount
 
 

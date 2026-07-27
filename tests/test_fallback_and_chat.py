@@ -129,6 +129,47 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.capability, "knowledge_files")
         retrieve.assert_called_once()
 
+    def test_inconsistent_capability_cannot_override_ordinary_knowledge_intent(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="knowledge",
+            reply_worthy=True,
+            standalone_question="中国考驾照有啥要求",
+            implicit_meaning="",
+            topic_summary="中国驾驶证报考要求",
+            relevant_context_indices=(),
+            capability="knowledge_files",
+            confidence=0.94,
+        )
+        configured = routing_settings()
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+        ):
+            admin_decision = server.should_process_message(
+                "中国考驾照有啥要求",
+                True,
+                group_id=1,
+                user_id="3466734955",
+            )
+            member_decision = server.should_process_message(
+                "中国考驾照有啥要求",
+                True,
+                group_id=1,
+                user_id="329481106",
+            )
+
+        for decision in (admin_decision, member_decision):
+            self.assertTrue(decision.should_reply)
+            self.assertEqual(decision.reply_mode, "fallback")
+            self.assertEqual(decision.semantic_intent, "knowledge")
+            self.assertEqual(decision.capability, "none")
+            self.assertNotIn("bot capability", decision.reason)
     def test_bot_meta_statement_requires_explicit_bot_address(self) -> None:
         plan = MessagePlan(
             audience="bot",
@@ -166,7 +207,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             "semantic plan: bot capability requires explicit bot address",
         )
 
-    def test_explicit_capability_wins_over_inconsistent_knowledge_intent(self) -> None:
+    def test_explicit_capability_does_not_override_inconsistent_knowledge_intent(self) -> None:
         plan = MessagePlan(
             audience="bot",
             intent="knowledge",
@@ -198,8 +239,9 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             )
 
         self.assertTrue(decision.should_reply)
-        self.assertEqual(decision.reply_mode, "bot_meta")
-        self.assertEqual(decision.capability, "knowledge_files")
+        self.assertEqual(decision.reply_mode, "fallback")
+        self.assertEqual(decision.semantic_intent, "knowledge")
+        self.assertEqual(decision.capability, "none")
 
     def test_group_runtime_status_never_exposes_local_paths(self) -> None:
         with patch.object(server, "settings", routing_settings(knowledge_dir="knowledge")):
