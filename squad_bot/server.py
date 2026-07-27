@@ -17,7 +17,7 @@ from urllib.parse import parse_qs
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
-from .knowledge import KnowledgeBase
+from .knowledge import ContextResult, KnowledgeBase
 from .llm import (
     MessagePlan,
     SemanticTopicCandidate,
@@ -33,7 +33,6 @@ from .llm import (
     review_candidate_reply,
     rewrite_contextual_question,
     should_auto_reply,
-    should_reply_to_chat,
 )
 from .onebot import (
     extract_content_segments,
@@ -61,9 +60,6 @@ audit_lock = threading.Lock()
 auto_reply_enabled = settings.auto_reply_enabled
 topic_cooldown_lock = threading.Lock()
 recent_reply_topics: dict[tuple[int, str], float] = {}
-followup_lock = threading.Lock()
-user_followup_state: dict[tuple[int, str], "ConversationState"] = {}
-group_followup_state: dict[int, "ConversationState"] = {}
 chat_history_lock = threading.Lock()
 group_chat_history: dict[int, list["GroupChatMessage"]] = {}
 chat_message_sequence = 0
@@ -100,6 +96,8 @@ class ProcessingDecision:
     chat_context: tuple[str, ...] = ()
     retrieval_score: float = 0.0
     retrieval_coverage: float = 0.0
+    knowledge_query: str = ""
+    knowledge_result: ContextResult | None = None
     semantic_intent: str = ""
     semantic_topic: str = ""
     implicit_meaning: str = ""
@@ -666,113 +664,6 @@ GRADUATION_DISCUSSION_CUES = (
     "没毕业",
 )
 
-FOLLOWUP_PREFIX_CUES = (
-    "那",
-    "那么",
-    "那要是",
-    "那如果",
-    "那为什么",
-    "那为啥",
-    "那接下来",
-    "所以",
-    "所以说",
-    "这么说",
-    "照这么说",
-    "按你说的",
-    "按这个说法",
-    "也就是说",
-    "这个",
-    "这种",
-    "这样",
-    "然后",
-    "然后呢",
-    "还有呢",
-    "还有什么",
-    "还有别的",
-    "另外呢",
-    "再然后",
-    "接下来",
-    "下一步",
-    "怎么说",
-    "怎么处理",
-    "怎么弄",
-    "咋办",
-    "怎么办",
-    "要不要",
-    "还要",
-    "还需要",
-    "具体呢",
-    "比如呢",
-    "多久呢",
-    "多少呢",
-    "为什么呢",
-    "为啥呢",
-    "先奶",
-    "奶满",
-    "补满",
-    "先拉",
-    "拉起来",
-    "一堆人",
-    "倒一起",
-    "上车",
-    "转点",
-)
-
-FOLLOWUP_REFERENCE_CUES = (
-    "刚才",
-    "刚刚",
-    "前面说",
-    "上面说",
-    "看前面",
-    "看上面",
-    "上一条",
-    "上一句",
-    "你说的",
-    "你刚说",
-    "你提到的",
-    "刚提到",
-    "前者",
-    "后者",
-    "第一个",
-    "第二个",
-    "第三个",
-    "这个情况下",
-    "这种情况下",
-)
-
-FOLLOWUP_NON_CONTINUATION_PREFIXES = (
-    "哪里",
-    "那里",
-    "哪些",
-    "哪个",
-    "哪种",
-    "哪张",
-    "哪边",
-)
-
-FOLLOWUP_NEW_TOPIC_CUES = (
-    "闲聊",
-    "机器人",
-    "bot",
-    "知识库",
-    "提示词",
-    "api",
-    "bug",
-    "回复机制",
-    "追问机制",
-)
-
-FOLLOWUP_TOPIC_GROUPS = {
-    "spawn_network": ("fob", "hab", "radio", "电台", "无线电", "兵站", "队包", "复活点", "出生点"),
-    "voice": ("ts", "ts3", "语音", "麦克风", "耳机", "b键", "v键", "g键"),
-    "medic": ("医疗兵", "医生", "先奶", "奶满", "先拉", "拉起来"),
-    "anti_tank": ("反坦", "轻反", "重反", "lat", "hat"),
-    "vehicle": ("载具", "装甲", "坦克", "步战", "轮战", "车组", "载具兵"),
-    "server": ("服务器", "进服", "选服", "搜不到", "无法连接", "卡三点", "跑小人"),
-    "logistics": ("后勤", "logi", "补给", "卸货", "卸建", "卸弹", "建设点", "弹药点"),
-    "command": ("小队长", "指挥官", "指挥", "指挥频道", "批车", "要车"),
-}
-
 COMMAND_ALIASES = {
     "重载知识库": "reload",
     "reload": "reload",
@@ -1048,7 +939,6 @@ def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") 
         with kb_lock:
             count = kb.reload()
             stats = kb.last_reload_stats
-        clear_conversation_state()
         return (
             f"知识库已重载，共 {count} 个片段；新增 {stats.added}，修改 {stats.changed}，"
             f"删除 {stats.removed}，复用 {stats.reused}。"
@@ -1161,63 +1051,6 @@ def mark_topic_replied(group_id: int, key: str) -> None:
         recent_reply_topics[(group_id, key)] = time.time()
 
 
-def cleanup_followup_state(now: float) -> None:
-    max_window = max(
-        settings.followup_same_user_seconds,
-        settings.followup_group_seconds,
-        settings.followup_mention_seconds,
-    )
-    if max_window <= 0:
-        return
-    with followup_lock:
-        user_expired = [
-            state_key
-            for state_key, state in user_followup_state.items()
-            if now - state.timestamp > max_window
-        ]
-        for state_key in user_expired:
-            user_followup_state.pop(state_key, None)
-        group_expired = [
-            group_id
-            for group_id, state in group_followup_state.items()
-            if now - state.timestamp > max_window
-        ]
-        for group_id in group_expired:
-            group_followup_state.pop(group_id, None)
-
-
-def looks_like_followup(question: str, mentioned: bool = False) -> bool:
-    normalized = question.strip().lower()
-    if not normalized:
-        return False
-    has_reference = any(cue in normalized for cue in FOLLOWUP_REFERENCE_CUES)
-    if has_reference:
-        return True
-    if normalized.startswith(FOLLOWUP_NON_CONTINUATION_PREFIXES):
-        return False
-    if any(cue in normalized for cue in FOLLOWUP_NEW_TOPIC_CUES):
-        return False
-    return normalized.startswith(FOLLOWUP_PREFIX_CUES)
-
-
-def followup_topics(message: str) -> set[str]:
-    lowered = message.lower()
-    topics = {keyword for keyword in AUTO_REPLY_KEYWORDS if keyword in lowered}
-    for topic, aliases in FOLLOWUP_TOPIC_GROUPS.items():
-        if any(alias in lowered for alias in aliases):
-            topics.add(topic)
-    return topics
-
-
-def implicit_followup_matches_state(question: str, state: ConversationState) -> bool:
-    normalized = question.strip().lower()
-    if any(cue in normalized for cue in FOLLOWUP_REFERENCE_CUES):
-        return True
-    current_topics = followup_topics(normalized)
-    previous_topics = followup_topics(state.last_question)
-    return not (current_topics and previous_topics and current_topics.isdisjoint(previous_topics))
-
-
 def followup_context_for(
     group_id: int,
     user_id,
@@ -1259,44 +1092,9 @@ def followup_context_for(
         # An explicit reply must never silently bind to an unrelated recent turn.
         return None
 
-    if (
-        settings.followup_same_user_seconds <= 0
-        and settings.followup_group_seconds <= 0
-        and settings.followup_mention_seconds <= 0
-    ):
-        return None
-    cleanup_followup_state(now)
-    if not looks_like_followup(question, mentioned):
-        return None
-    user_key = str(user_id) if user_id is not None else ""
-    user_ttl = settings.followup_mention_seconds if mentioned else settings.followup_same_user_seconds
-    group_ttl = settings.followup_mention_seconds if mentioned else settings.followup_group_seconds
-
-    candidates: list[tuple[int, ConversationState, str]] = []
-    if user_key:
-        with followup_lock:
-            state = user_followup_state.get((group_id, user_key))
-        if (
-            state
-            and now - state.timestamp <= user_ttl
-            and implicit_followup_matches_state(question, state)
-        ):
-            candidates.append((2, state, "user"))
-
-    with followup_lock:
-        group_state = group_followup_state.get(group_id)
-    if (
-        group_state
-        and now - group_state.timestamp <= group_ttl
-        and implicit_followup_matches_state(question, group_state)
-    ):
-        candidates.append((1, group_state, "group"))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item[0], item[1].timestamp), reverse=True)
-    _priority, state, scope = candidates[0]
-    return FollowupMatch(state=state, scope=scope)
+    # Without an explicit QQ reply, relation selection belongs to the semantic
+    # planner, which sees speaker IDs, message IDs and parallel topic anchors.
+    return None
 
 
 def build_effective_question(question: str, followup_match: FollowupMatch | None) -> str:
@@ -1328,7 +1126,6 @@ def remember_conversation(
     user_message_id: str = "",
     trigger_message_ids: Sequence[str] = (),
     turn_id: str = "",
-    persist: bool = True,
     db_path: str | Path | None = None,
 ) -> None:
     state = ConversationState(
@@ -1349,29 +1146,10 @@ def remember_conversation(
         semantic_intent=decision.semantic_intent,
         semantic_topic=decision.semantic_topic,
     )
-    if persist:
-        try:
-            persist_conversation_turn(group_id, state, db_path=db_path)
-        except Exception as exc:
-            print("Persist conversation turn failed:", repr(exc))
-    if (
-        settings.followup_same_user_seconds <= 0
-        and settings.followup_group_seconds <= 0
-        and settings.followup_mention_seconds <= 0
-    ):
-        return
-    if decision.reply_mode not in {"knowledge", "fallback"}:
-        return
-    with followup_lock:
-        if user_id is not None:
-            user_followup_state[(group_id, str(user_id))] = state
-        group_followup_state[group_id] = state
-
-
-def clear_conversation_state() -> None:
-    with followup_lock:
-        user_followup_state.clear()
-        group_followup_state.clear()
+    try:
+        persist_conversation_turn(group_id, state, db_path=db_path)
+    except Exception as exc:
+        print("Persist conversation turn failed:", repr(exc))
 
 
 def record_group_chat_message(
@@ -1873,6 +1651,39 @@ def locked_send_context_change(
             return True, delta_ids, "unsolicited reply has a newer ambiguous group message"
 
     return False, delta_ids, "only unrelated directed messages arrived"
+
+
+def validate_locked_send(
+    group_id: int,
+    item: dict,
+    reviewed_revision: int,
+    *,
+    check_context: bool = True,
+) -> tuple[bool, str, str]:
+    """Return whether a candidate may send, a blocking reason, and an audit note."""
+    if message_already_covered_by_bot(group_id, item.get("message_id")):
+        return False, "message covered while waiting to send", ""
+    if not check_context:
+        return True, "", ""
+    invalidated, delta_message_ids, relation = locked_send_context_change(
+        group_id,
+        reviewed_revision,
+        item,
+    )
+    delta_text = ",".join(delta_message_ids)
+    if invalidated:
+        return (
+            False,
+            "context invalidated while waiting for group send lock: "
+            f"{relation}; delta={delta_text}",
+            "",
+        )
+    note = (
+        f"send-lock context preserved: {relation}; delta={delta_text}"
+        if delta_message_ids
+        else ""
+    )
+    return True, "", note
 
 
 def unsafe_or_repeated_reply(group_id: int, answer: str, *, limit: int = 10) -> str:
@@ -2580,6 +2391,16 @@ def retrieve_knowledge(query: str, max_chars: int):
         return kb.build_context_with_metrics(query, max_chars)
 
 
+def attach_knowledge_result(
+    decision: ProcessingDecision,
+    query: str,
+    result: ContextResult,
+) -> ProcessingDecision:
+    decision.knowledge_query = query
+    decision.knowledge_result = result
+    return decision
+
+
 def is_strong_knowledge_match(top_score: float, query_coverage: float) -> bool:
     return (
         top_score >= settings.knowledge_strong_min_score
@@ -3124,6 +2945,7 @@ def answer_question(
     memory_context: Sequence[str] = (),
     self_history_context: Sequence[str] = (),
     semantic_context: str = "",
+    knowledge_result: ContextResult | None = None,
     timeout: int | None = None,
 ) -> str:
     if is_identity_question(question):
@@ -3134,7 +2956,10 @@ def answer_question(
         )
 
     llm_question = effective_question or question
-    result = retrieve_knowledge(retrieval_question or llm_question, settings.max_context_chars)
+    result = knowledge_result or retrieve_knowledge(
+        retrieval_question or llm_question,
+        settings.max_context_chars,
+    )
     strong_match = is_strong_knowledge_match(
         result.top_score,
         result.query_coverage,
@@ -3222,6 +3047,11 @@ def answer_for_decision(
         memory_context=decision.memory_context,
         self_history_context=decision.self_history_context,
         semantic_context=semantic_context,
+        knowledge_result=(
+            decision.knowledge_result
+            if decision.knowledge_query == (decision.effective_question or question)
+            else None
+        ),
         timeout=timeout,
     )
 
@@ -3414,44 +3244,6 @@ def load_conversation_turn_by_bot_message_id(
     return _conversation_state_from_row(row) if row else None
 
 
-def load_recent_conversation_states(
-    *,
-    now: float | None = None,
-    db_path: str | Path | None = None,
-) -> int:
-    current_time = time.time() if now is None else now
-    max_window = max(
-        settings.followup_same_user_seconds,
-        settings.followup_group_seconds,
-        settings.followup_mention_seconds,
-    )
-    if max_window <= 0:
-        return 0
-    connection = open_pending_queue_db(db_path)
-    try:
-        rows = connection.execute(
-            """
-            SELECT group_id, user_id, user_message_id, bot_message_id,
-                   question, answer, reply_mode, sources_json, created_at,
-                   trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
-            FROM conversation_turns
-            WHERE created_at >= ? AND reply_mode IN ('knowledge', 'fallback')
-            ORDER BY created_at ASC
-            """,
-            (current_time - max_window,),
-        ).fetchall()
-    finally:
-        connection.close()
-    with followup_lock:
-        for row in rows:
-            group_id = int(row[0])
-            state = _conversation_state_from_row((0, *row[1:]))
-            if state.user_id:
-                user_followup_state[(group_id, state.user_id)] = state
-            group_followup_state[group_id] = state
-    return len(rows)
-
-
 def persist_pending_message(
     priority: int,
     sequence: int,
@@ -3588,6 +3380,43 @@ def bot_turn_metadata(item: dict, bot_message_id) -> tuple[tuple[str, ...], str]
     bot_id = str(bot_message_id or "").strip()
     turn_id = f"bot:{bot_id}" if bot_id else ""
     return trigger_ids, turn_id
+
+
+def send_and_record_bot_turn(
+    *,
+    group_id: int,
+    item: dict,
+    answer: str,
+    reply_mode: str,
+    semantic_topic: str = "",
+    mention_user_id: str = "",
+    reply_to_trigger: bool = False,
+) -> tuple[object, tuple[str, ...], str]:
+    trigger_message_id = str(item.get("message_id") or "")
+    user_id = str(item.get("user_id") or "")
+    bot_message_id = send_group_msg(
+        settings.onebot_api_url,
+        group_id,
+        answer,
+        settings.onebot_access_token,
+        mention_user_id=mention_user_id,
+        reply_to_message_id=trigger_message_id if reply_to_trigger else "",
+    )
+    trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
+    record_group_chat_message(
+        group_id,
+        settings.bot_qq,
+        answer,
+        message_id=bot_message_id,
+        reply_message_id=trigger_message_id if reply_to_trigger else "",
+        reply_target_user_id=user_id if reply_to_trigger else "",
+        reply_text=str(item.get("question") or "") if reply_to_trigger else "",
+        generated_for_message_ids=trigger_message_ids,
+        turn_id=turn_id,
+        reply_mode=reply_mode,
+        semantic_topic=semantic_topic,
+    )
+    return bot_message_id, trigger_message_ids, turn_id
 
 
 def message_already_covered_by_bot(group_id: int, message_id) -> bool:
@@ -4080,24 +3909,28 @@ def should_process_message(
 
     normalized = question.strip()
     query_text = effective_question or normalized
-    initial_result = retrieve_knowledge(query_text, min(settings.max_context_chars, 1200))
+    initial_result = retrieve_knowledge(query_text, settings.max_context_chars)
     initial_strong_match = is_strong_knowledge_match(
         initial_result.top_score,
         initial_result.query_coverage,
     )
     if mentioned and initial_strong_match:
-        return ProcessingDecision(
-            True,
-            "mentioned with strong knowledge context",
-            True,
-            tuple(initial_result.sources),
+        return attach_knowledge_result(
+            ProcessingDecision(
+                True,
+                "mentioned with strong knowledge context",
+                True,
+                tuple(initial_result.sources),
+                query_text,
+                followup_of,
+                followup_scope,
+                "knowledge",
+                tuple(chat_context),
+                initial_result.top_score,
+                initial_result.query_coverage,
+            ),
             query_text,
-            followup_of,
-            followup_scope,
-            "knowledge",
-            tuple(chat_context),
-            initial_result.top_score,
-            initial_result.query_coverage,
+            initial_result,
         )
     plan = semantic_plan_for_message(
         normalized,
@@ -4241,7 +4074,7 @@ def should_process_message(
     result = (
         initial_result
         if query_text == (effective_question or normalized)
-        else retrieve_knowledge(query_text, min(settings.max_context_chars, 1200))
+        else retrieve_knowledge(query_text, settings.max_context_chars)
     )
     context = result.context
     sources = result.sources
@@ -4262,7 +4095,7 @@ def should_process_message(
             if confidence >= minimum_confidence and standalone_question != query_text:
                 candidate = retrieve_knowledge(
                     standalone_question,
-                    min(settings.max_context_chars, 1200),
+                    settings.max_context_chars,
                 )
                 candidate_is_strong = is_strong_knowledge_match(
                     candidate.top_score,
@@ -4363,27 +4196,31 @@ def should_process_message(
 
     if usable_plan and usable_plan.intent == "knowledge":
         if mentioned or (auto_reply_enabled and usable_plan.reply_worthy):
-            return ProcessingDecision(
-                True,
-                "semantic plan: knowledge question",
-                True,
-                tuple(sources),
-                query_text,
-                followup_of,
-                followup_scope,
-                "knowledge",
-                tuple(chat_context),
-                result.top_score,
-                result.query_coverage,
-                semantic_intent=usable_plan.intent,
-                semantic_topic=usable_plan.topic_summary,
-                implicit_meaning=usable_plan.implicit_meaning,
-                capability=(
-                    usable_plan.capability
-                    if usable_plan.intent == "bot_meta"
-                    else "none"
+            return attach_knowledge_result(
+                ProcessingDecision(
+                    True,
+                    "semantic plan: knowledge question",
+                    True,
+                    tuple(sources),
+                    query_text,
+                    followup_of,
+                    followup_scope,
+                    "knowledge",
+                    tuple(chat_context),
+                    result.top_score,
+                    result.query_coverage,
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    capability=(
+                        usable_plan.capability
+                        if usable_plan.intent == "bot_meta"
+                        else "none"
+                    ),
+                    semantic_confidence=usable_plan.confidence,
                 ),
-                semantic_confidence=usable_plan.confidence,
+                query_text,
+                result,
             )
         return ProcessingDecision(
             False,
@@ -4410,27 +4247,31 @@ def should_process_message(
 
     if mentioned:
         print("Mention reply: knowledge context found", normalized)
-        return ProcessingDecision(
-            True,
-            "mentioned with strong knowledge context",
-            True,
-            tuple(sources),
-            query_text,
-            followup_of,
-            followup_scope,
-            "knowledge",
-            tuple(chat_context),
-            result.top_score,
-            result.query_coverage,
-            semantic_intent=usable_plan.intent if usable_plan else "",
-            semantic_topic=usable_plan.topic_summary if usable_plan else "",
-            implicit_meaning=usable_plan.implicit_meaning if usable_plan else "",
-            capability=(
-                usable_plan.capability
-                if usable_plan and usable_plan.intent == "bot_meta"
-                else "none"
+        return attach_knowledge_result(
+            ProcessingDecision(
+                True,
+                "mentioned with strong knowledge context",
+                True,
+                tuple(sources),
+                query_text,
+                followup_of,
+                followup_scope,
+                "knowledge",
+                tuple(chat_context),
+                result.top_score,
+                result.query_coverage,
+                semantic_intent=usable_plan.intent if usable_plan else "",
+                semantic_topic=usable_plan.topic_summary if usable_plan else "",
+                implicit_meaning=usable_plan.implicit_meaning if usable_plan else "",
+                capability=(
+                    usable_plan.capability
+                    if usable_plan and usable_plan.intent == "bot_meta"
+                    else "none"
+                ),
+                semantic_confidence=usable_plan.confidence if usable_plan else 0.0,
             ),
-            semantic_confidence=usable_plan.confidence if usable_plan else 0.0,
+            query_text,
+            result,
         )
 
     if not auto_reply_enabled:
@@ -4479,18 +4320,22 @@ def should_process_message(
 
     if has_auto_reply_keyword(query_text):
         print("Auto reply: matched Squad keyword", normalized)
-        return ProcessingDecision(
-            True,
-            "matched Squad keyword with strong context",
-            True,
-            tuple(sources),
+        return attach_knowledge_result(
+            ProcessingDecision(
+                True,
+                "matched Squad keyword with strong context",
+                True,
+                tuple(sources),
+                query_text,
+                followup_of,
+                followup_scope,
+                "knowledge",
+                tuple(chat_context),
+                result.top_score,
+                result.query_coverage,
+            ),
             query_text,
-            followup_of,
-            followup_scope,
-            "knowledge",
-            tuple(chat_context),
-            result.top_score,
-            result.query_coverage,
+            result,
         )
 
     should_reply = should_auto_reply(
@@ -4500,18 +4345,22 @@ def should_process_message(
         message=query_text,
     )
     print("Auto reply router:", "YES" if should_reply else "NO", normalized)
-    return ProcessingDecision(
-        should_reply,
-        "llm router accepted" if should_reply else "llm router rejected",
-        True,
-        tuple(sources),
+    return attach_knowledge_result(
+        ProcessingDecision(
+            should_reply,
+            "llm router accepted" if should_reply else "llm router rejected",
+            True,
+            tuple(sources),
+            query_text,
+            followup_of,
+            followup_scope,
+            "knowledge",
+            tuple(chat_context),
+            result.top_score,
+            result.query_coverage,
+        ),
         query_text,
-        followup_of,
-        followup_scope,
-        "knowledge",
-        tuple(chat_context),
-        result.top_score,
-        result.query_coverage,
+        result,
     )
 
 
@@ -4912,15 +4761,6 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     self_history_reasons=decision.self_history_reasons,
                     event_time=item.get("time"),
                 )
-                remember_conversation(
-                    group_id,
-                    user_id,
-                    question,
-                    decision,
-                    answer=answer,
-                    user_message_id=str(item.get("message_id") or ""),
-                    persist=False,
-                )
                 if decision.reply_mode == "knowledge":
                     mark_topic_replied(group_id, current_topic_key)
                 continue
@@ -4969,39 +4809,16 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     )
                     model_latency_ms = int((time.monotonic() - model_started) * 1000)
             with group_send_lock(group_id):
-                if message_already_covered_by_bot(group_id, item.get("message_id")):
+                can_send, blocked_reason, context_note = validate_locked_send(
+                    group_id,
+                    item,
+                    reviewed_revision,
+                    check_context=decision.reply_mode not in {"bot_meta", "identity"},
+                )
+                if not can_send:
                     write_message_audit(
                         decision="skipped",
-                        reason="message covered while waiting to send",
-                        group_id=group_id,
-                        user_id=user_id,
-                        question=question,
-                        mentioned=mentioned,
-                        reply_mode=decision.reply_mode,
-                        model_latency_ms=model_latency_ms,
-                        event_time=event_time,
-                    )
-                    continue
-                context_invalidated = False
-                delta_message_ids: tuple[str, ...] = ()
-                lock_context_reason = ""
-                if decision.reply_mode not in {"bot_meta", "identity"}:
-                    (
-                        context_invalidated,
-                        delta_message_ids,
-                        lock_context_reason,
-                    ) = locked_send_context_change(
-                        group_id,
-                        reviewed_revision,
-                        item,
-                    )
-                if context_invalidated:
-                    write_message_audit(
-                        decision="skipped",
-                        reason=(
-                            "context invalidated while waiting for group send lock: "
-                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}"
-                        ),
+                        reason=blocked_reason,
                         group_id=group_id,
                         user_id=user_id,
                         question=question,
@@ -5012,41 +4829,24 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         event_time=event_time,
                     )
                     continue
-                if delta_message_ids:
+                if context_note:
                     review_reason = "; ".join(
                         value
-                        for value in (
-                            review_reason,
-                            "send-lock context preserved: "
-                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}",
-                        )
+                        for value in (review_reason, context_note)
                         if value
                     )
-                bot_message_id = send_group_msg(
-                    settings.onebot_api_url,
-                    group_id,
-                    answer,
-                    settings.onebot_access_token,
-                    mention_user_id=mention_user_id,
-                    reply_to_message_id=(
-                        str(item.get("message_id") or "") if mentioned else ""
-                    ),
-                )
-                trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
-                record_group_chat_message(
-                    group_id,
-                    settings.bot_qq,
-                    answer,
-                    message_id=bot_message_id,
-                    reply_message_id=(
-                        str(item.get("message_id") or "") if mentioned else ""
-                    ),
-                    reply_target_user_id=str(user_id or "") if mentioned else "",
-                    reply_text=question if mentioned else "",
-                    generated_for_message_ids=trigger_message_ids,
-                    turn_id=turn_id,
+                (
+                    bot_message_id,
+                    trigger_message_ids,
+                    turn_id,
+                ) = send_and_record_bot_turn(
+                    group_id=group_id,
+                    item=item,
+                    answer=answer,
                     reply_mode=decision.reply_mode,
                     semantic_topic=decision.semantic_topic,
+                    mention_user_id=mention_user_id,
+                    reply_to_trigger=mentioned,
                 )
             print("Answered group", group_id, "question", question)
             write_message_audit(
@@ -5485,34 +5285,15 @@ def chat_worker() -> None:
                         event_time=event_time,
                     )
                     continue
-                if message_already_covered_by_bot(group_id, item.get("message_id")):
-                    write_message_audit(
-                        decision="skipped",
-                        reason="message covered while waiting to send",
-                        group_id=group_id,
-                        user_id=user_id,
-                        question=question,
-                        reply_mode="chat",
-                        model_latency_ms=model_latency_ms,
-                        event_time=event_time,
-                    )
-                    continue
-                (
-                    context_invalidated,
-                    delta_message_ids,
-                    lock_context_reason,
-                ) = locked_send_context_change(
+                can_send, blocked_reason, context_note = validate_locked_send(
                     group_id,
-                    reviewed_revision,
                     item,
+                    reviewed_revision,
                 )
-                if context_invalidated:
+                if not can_send:
                     write_message_audit(
                         decision="skipped",
-                        reason=(
-                            "context invalidated while waiting for group send lock: "
-                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}"
-                        ),
+                        reason=blocked_reason,
                         group_id=group_id,
                         user_id=user_id,
                         question=question,
@@ -5522,33 +5303,23 @@ def chat_worker() -> None:
                         event_time=event_time,
                     )
                     continue
-                if delta_message_ids:
+                if context_note:
                     review_reason = "; ".join(
                         value
-                        for value in (
-                            review_reason,
-                            "send-lock context preserved: "
-                            f"{lock_context_reason}; delta={','.join(delta_message_ids)}",
-                        )
+                        for value in (review_reason, context_note)
                         if value
                     )
-                bot_message_id = send_group_msg(
-                    settings.onebot_api_url,
-                    group_id,
-                    answer,
-                    settings.onebot_access_token,
-                    mention_user_id=mention_user_id,
-                )
-                trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
-                record_group_chat_message(
-                    group_id,
-                    settings.bot_qq,
-                    answer,
-                    message_id=bot_message_id,
-                    generated_for_message_ids=trigger_message_ids,
-                    turn_id=turn_id,
+                (
+                    bot_message_id,
+                    trigger_message_ids,
+                    turn_id,
+                ) = send_and_record_bot_turn(
+                    group_id=group_id,
+                    item=item,
+                    answer=answer,
                     reply_mode="chat",
                     semantic_topic=decision.semantic_topic,
+                    mention_user_id=mention_user_id,
                 )
                 mark_chat_replied(group_id)
             if social_event_kind:
@@ -5990,9 +5761,6 @@ def main() -> None:
         migrated = migrate_loaded_chat_history_to_memory()
         if migrated:
             print(f"Queued chat history migration: {migrated} entries")
-    restored_turns = load_recent_conversation_states()
-    if restored_turns:
-        print(f"Restored conversation turns: {restored_turns}")
     threading.Thread(
         target=worker,
         args=(message_queue, "priority"),

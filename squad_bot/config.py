@@ -127,11 +127,6 @@ class Settings:
         os.getenv("CHAT_GENERATION_TIMEOUT_SECONDS", "7")
     )
     same_topic_cooldown_seconds: int = int(os.getenv("SAME_TOPIC_COOLDOWN_SECONDS", "60"))
-    followup_same_user_seconds: int = int(
-        os.getenv("FOLLOWUP_SAME_USER_SECONDS", os.getenv("FOLLOWUP_CONTEXT_SECONDS", "120"))
-    )
-    followup_group_seconds: int = int(os.getenv("FOLLOWUP_GROUP_SECONDS", "30"))
-    followup_mention_seconds: int = int(os.getenv("FOLLOWUP_MENTION_SECONDS", "180"))
     message_audit_log: str = os.getenv("MESSAGE_AUDIT_LOG", "work/message_audit.jsonl")
     pending_queue_db: str = os.getenv("PENDING_QUEUE_DB", "work/pending_queue.sqlite3")
     chat_memory_enabled: bool = os.getenv("CHAT_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

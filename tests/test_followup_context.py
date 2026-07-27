@@ -10,20 +10,10 @@ from squad_bot.knowledge import ContextResult
 
 
 def followup_settings() -> SimpleNamespace:
-    return SimpleNamespace(
-        followup_same_user_seconds=120,
-        followup_group_seconds=30,
-        followup_mention_seconds=180,
-    )
+    return SimpleNamespace()
 
 
 class FollowupContextTests(unittest.TestCase):
-    def setUp(self) -> None:
-        server.clear_conversation_state()
-
-    def tearDown(self) -> None:
-        server.clear_conversation_state()
-
     def test_explicit_reply_uses_exact_persisted_bot_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "pending.sqlite3"
@@ -103,14 +93,6 @@ class FollowupContextTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "pending.sqlite3"
             with patch.object(server, "settings", followup_settings()):
-                server.remember_conversation(
-                    1,
-                    "100",
-                    "完全无关的旧问题",
-                    server.ProcessingDecision(True, "test", reply_mode="knowledge"),
-                    answer="旧回答",
-                    persist=False,
-                )
                 match = server.followup_context_for(
                     1,
                     "100",
@@ -139,21 +121,8 @@ class FollowupContextTests(unittest.TestCase):
         self.assertIn("强制复活冷却", match.state.last_answer)
         self.assertIsNone(missing)
 
-    def test_implicit_followup_requires_a_real_continuation(self) -> None:
+    def test_implicit_followup_is_left_to_semantic_planner(self) -> None:
         with patch.object(server, "settings", followup_settings()):
-            server.remember_conversation(
-                1,
-                "100",
-                "医疗兵怎么玩",
-                server.ProcessingDecision(
-                    True,
-                    "test",
-                    sources=("医疗兵",),
-                    reply_mode="knowledge",
-                ),
-                answer="先保命再救人。",
-                persist=False,
-            )
             continued = server.followup_context_for(1, "100", "那倒一片先救谁", False)
             complete_new_question = server.followup_context_for(
                 1, "100", "TS地址是什么", True
@@ -162,8 +131,7 @@ class FollowupContextTests(unittest.TestCase):
                 1, "100", "这个TS地址是什么", True
             )
 
-        self.assertIsNotNone(continued)
-        self.assertEqual(continued.scope, "user")
+        self.assertIsNone(continued)
         self.assertIsNone(complete_new_question)
         self.assertIsNone(different_topic)
 
@@ -223,31 +191,7 @@ class FollowupContextTests(unittest.TestCase):
         retrieve.assert_called_once_with(retrieval_question, 4500)
         self.assertEqual(ask.call_args.kwargs["question"], generation_question)
 
-    def test_expanded_continuation_phrases(self) -> None:
-        for message in (
-            "照这么说还得先找掩体？",
-            "按你说的那该怎么放",
-            "也就是说敌人靠近就没了？",
-            "你刚才说的第二种呢",
-            "上一条具体是什么意思",
-            "接下来干什么",
-            "还有别的吗",
-        ):
-            with self.subTest(message=message):
-                self.assertTrue(server.looks_like_followup(message))
-
-        for message in (
-            "TS地址是什么",
-            "医疗兵怎么玩",
-            "为什么我进不去服务器",
-            "那里有水吗",
-            "哪个地图有桥",
-            "这个闲聊为什么不回",
-        ):
-            with self.subTest(message=message):
-                self.assertFalse(server.looks_like_followup(message, mentioned=True))
-
-    def test_recent_turns_restore_from_sqlite_after_memory_clear(self) -> None:
+    def test_persisted_turn_is_available_for_explicit_reply(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "pending.sqlite3"
             state = server.ConversationState(
@@ -265,13 +209,18 @@ class FollowupContextTests(unittest.TestCase):
                 semantic_topic="FOB 与 HAB",
             )
             server.persist_conversation_turn(1, state, db_path=db_path)
-            server.clear_conversation_state()
 
-            with patch.object(server, "settings", followup_settings()):
-                count = server.load_recent_conversation_states(db_path=db_path)
-                match = server.followup_context_for(1, "100", "那兵站呢", False)
+            match = server.followup_context_for(
+                1,
+                "100",
+                "那兵站呢",
+                True,
+                reply_message_id="bot-1",
+                reply_target_user_id="999",
+                bot_qq="999",
+                db_path=db_path,
+            )
 
-        self.assertEqual(count, 1)
         self.assertIsNotNone(match)
         self.assertEqual(match.state.last_answer, "FOB是范围，HAB才是出生建筑。")
         self.assertEqual(match.state.trigger_message_ids, ("user-1", "user-2"))

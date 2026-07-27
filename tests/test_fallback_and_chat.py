@@ -10,7 +10,6 @@ from squad_bot import llm, server
 from squad_bot.knowledge import ContextResult
 from squad_bot.llm import (
     CHAT_PROMPT,
-    CHAT_ROUTER_PROMPT,
     FALLBACK_PROMPT,
     FINAL_REPLY_REVIEW_PROMPT,
     PERSONA_CORE,
@@ -354,14 +353,12 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 "retrieve_knowledge",
                 return_value=ContextResult("", [], 0.0, 0.0),
             ),
-            patch.object(server, "should_reply_to_chat") as chat_router,
             patch.object(server, "auto_reply_enabled", True),
         ):
             decision = server.should_process_message("这个新武器要怎么玩？", False, group_id=1)
 
         self.assertFalse(decision.should_reply)
         self.assertNotEqual(decision.reply_mode, "fallback")
-        chat_router.assert_not_called()
 
     def test_unmentioned_casual_question_can_use_chat(self) -> None:
         with (
@@ -423,7 +420,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 return_value=ContextResult("", [], 0.0, 0.0),
             ),
             patch.object(server, "chat_reply_quota_reason", return_value=""),
-            patch.object(server, "should_reply_to_chat") as chat_router,
             patch.object(server, "auto_reply_enabled", True),
         ):
             decision = server.should_process_message(
@@ -437,7 +433,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "chat")
         self.assertEqual(decision.chat_context, context)
         self.assertEqual(decision.reason, "chat candidate queued")
-        chat_router.assert_not_called()
 
     def test_casual_message_can_chat_even_if_search_matches_incidentally(self) -> None:
         with (
@@ -448,7 +443,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 return_value=ContextResult("某个载具资料", ["载具入门"], 0.3, 1.0),
             ),
             patch.object(server, "chat_reply_quota_reason", return_value=""),
-            patch.object(server, "should_reply_to_chat") as chat_router,
             patch.object(server, "auto_reply_enabled", True),
         ):
             decision = server.should_process_message(
@@ -460,7 +454,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
 
         self.assertTrue(decision.should_reply)
         self.assertEqual(decision.reply_mode, "chat")
-        chat_router.assert_not_called()
 
     def test_chat_filters_links_and_messages_directed_at_others(self) -> None:
         with (
@@ -470,7 +463,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 "retrieve_knowledge",
                 return_value=ContextResult("", [], 0.0, 0.0),
             ),
-            patch.object(server, "should_reply_to_chat") as chat_router,
             patch.object(server, "auto_reply_enabled", True),
         ):
             link = server.should_process_message("这个链接 https://example.com", False, group_id=1)
@@ -483,7 +475,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
 
         self.assertFalse(link.should_reply)
         self.assertFalse(directed.should_reply)
-        chat_router.assert_not_called()
 
     def test_birthday_celebration_can_join_even_when_someone_is_mentioned(self) -> None:
         with (
@@ -578,7 +569,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
 
     def test_prompts_are_separate_and_keep_plain_term_rule(self) -> None:
         self.assertNotEqual(FALLBACK_PROMPT, SYSTEM_PROMPT)
-        self.assertNotEqual(CHAT_PROMPT, CHAT_ROUTER_PROMPT)
         self.assertIn("队包", FALLBACK_PROMPT)
         self.assertIn("通读最近所有群聊", CHAT_PROMPT)
         self.assertIn("不要", CHAT_PROMPT)
@@ -825,6 +815,102 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
 
         self.assertEqual(answer, "对，就是 TeamSpeak 3。")
         self.assertEqual(ask.call_args.kwargs["chat_context"], decision.chat_context)
+
+    def test_knowledge_decision_reuses_routing_retrieval_for_generation(self) -> None:
+        configured = routing_settings()
+        result = ContextResult("TS资料", ["TS教程"], 2.0, 1.0)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "retrieve_knowledge", return_value=result) as retrieve,
+            patch.object(server, "ask_llm", return_value="对，就是 TeamSpeak 3。"),
+        ):
+            decision = server.should_process_message(
+                "语音是那个语音软件吗？",
+                True,
+                group_id=1,
+            )
+            answer = server.answer_for_decision(
+                "语音是那个语音软件吗？",
+                decision,
+                "语音是那个语音软件吗？",
+            )
+
+        self.assertEqual(answer, "对，就是 TeamSpeak 3。")
+        retrieve.assert_called_once_with("语音是那个语音软件吗？", 4500)
+
+    def test_rewritten_knowledge_query_is_retrieved_only_before_generation(self) -> None:
+        configured = routing_settings(
+            contextual_query_enabled=True,
+            contextual_query_min_confidence=0.75,
+        )
+        weak = ContextResult("", [], 0.0, 0.0)
+        strong = ContextResult("TS资料", ["TS教程"], 2.0, 1.0)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "retrieve_knowledge", side_effect=(weak, strong)) as retrieve,
+            patch.object(
+                server,
+                "contextual_retrieval_question",
+                return_value=("ST 战队 TS 地址是多少？", 0.92),
+            ),
+            patch.object(server, "ask_llm", return_value="地址见 TS 教程。"),
+        ):
+            decision = server.should_process_message(
+                "那个地址是多少？",
+                True,
+                group_id=1,
+                chat_context=("群友A：ST 战队平时用 TS",),
+            )
+            answer = server.answer_for_decision(
+                "那个地址是多少？",
+                decision,
+                "那个地址是多少？",
+            )
+
+        self.assertEqual(answer, "地址见 TS 教程。")
+        self.assertEqual(decision.knowledge_query, "ST 战队 TS 地址是多少？")
+        self.assertEqual(retrieve.call_count, 2)
+
+    def test_semantic_planner_resolves_followup_without_phrase_rules(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="knowledge",
+            reply_worthy=True,
+            standalone_question="敌人进入队包 30 米范围后会怎样？",
+            implicit_meaning="询问上一条队包说明的敌军接近机制",
+            topic_summary="队包被踩",
+            relevant_context_indices=(1, 2),
+            capability="none",
+            confidence=0.94,
+        )
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+        )
+        weak = ContextResult("", [], 0.0, 0.0)
+        strong = ContextResult("队包资料", ["出生点与工事"], 2.0, 1.0)
+        context = (
+            "群友A：队包是 60 秒复活一轮",
+            "机器人：敌人靠近时队包也有额外限制",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(server, "retrieve_knowledge", side_effect=(weak, strong)) as retrieve,
+        ):
+            decision = server.should_process_message(
+                "摸到附近以后会发生啥？",
+                True,
+                group_id=1,
+                chat_context=context,
+                user_id="100",
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "knowledge")
+        self.assertEqual(decision.effective_question, plan.standalone_question)
+        self.assertEqual(decision.followup_of, "")
+        self.assertEqual(retrieve.call_count, 2)
 
     def test_chat_answer_for_decision_uses_dedicated_chat_model(self) -> None:
         configured = routing_settings(chat_model="mimo-v2.5")
