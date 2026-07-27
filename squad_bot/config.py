@@ -113,6 +113,7 @@ class Settings:
     final_reply_review_timeout_seconds: int = int(
         os.getenv("FINAL_REPLY_REVIEW_TIMEOUT_SECONDS", "4")
     )
+    final_reply_review_mode: str = os.getenv("FINAL_REPLY_REVIEW_MODE", "adaptive").strip().lower()
     mentioned_reply_total_timeout_seconds: int = int(
         os.getenv("MENTIONED_REPLY_TOTAL_TIMEOUT_SECONDS", "15")
     )

@@ -113,6 +113,7 @@ class ProcessingDecision:
     memory_candidate_count: int = 0
     memory_rejection_reason: str = ""
     recent_context_candidate_count: int = 0
+    risk_flags: tuple[str, ...] = ()
     recent_context_selected_count: int = 0
     recent_context_chars: int = 0
     memory_context_chars: int = 0
@@ -1813,6 +1814,7 @@ def review_and_refresh_answer(
     mentioned: bool,
     admin: bool,
     deadline: float,
+    baseline_revision: int | None = None,
 ) -> tuple[str, str, int]:
     original_context = tuple(decision.chat_context)
     candidate = answer
@@ -1820,6 +1822,38 @@ def review_and_refresh_answer(
 
     while True:
         latest_revision = latest_group_user_sequence(group_id)
+        review_mode = getattr(settings, "final_reply_review_mode", "adaptive")
+        risky_intents = {
+            "banter_at_bot",
+            "control_attempt",
+            "third_party_attack",
+            "genuine_criticism",
+            "hostile_abuse",
+            "action",
+            "unclear",
+        }
+        context_changed = baseline_revision is None or latest_revision > baseline_revision
+        requires_model_review = (
+            review_mode == "always"
+            or context_changed
+            or regenerated
+            or bool(decision.risk_flags)
+            or decision.semantic_intent in risky_intents
+            or bool(decision.self_history_context)
+            or decision.reply_mode == "fallback"
+            or (
+                decision.reply_mode == "chat"
+                and (
+                    decision.semantic_intent != "normal_chat"
+                    or decision.semantic_confidence < 0.8
+                )
+            )
+        )
+        if not requires_model_review:
+            unsafe_reason = unsafe_or_repeated_reply(group_id, candidate)
+            if unsafe_reason:
+                return "", unsafe_reason, latest_revision
+            return candidate, "adaptive final review skipped", latest_revision
         latest_context = recent_group_chat_context(group_id, now=time.time())
         review_timeout = remaining_reply_timeout(
             deadline,
@@ -1884,6 +1918,7 @@ def review_and_refresh_answer(
         )
         if not candidate:
             return "", "regeneration produced no answer", latest_revision
+        baseline_revision = latest_revision
 
 
 def clear_chat_state() -> None:
@@ -4374,6 +4409,8 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 selected_plan[0] if selected_plan else None,
                 memory_probe,
             )
+            if selected_plan:
+                decision.risk_flags = selected_plan[0].risk_flags
             if not decision.should_reply:
                 print("Skip message: model/router decided no reply", group_id, question)
                 write_message_audit(
@@ -4439,6 +4476,9 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
                 continue
 
+            baseline_revision = int(
+                item.get("chat_sequence") or latest_group_user_sequence(group_id)
+            )
             if decision.reply_mode in {"bot_meta", "identity"}:
                 generation_timeout = 1 if time.monotonic() < deadline else 0
             else:
@@ -4493,6 +4533,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     mentioned=mentioned,
                     admin=admin_user,
                     deadline=deadline,
+                    baseline_revision=baseline_revision,
                 )
                 if not answer:
                     write_message_audit(
@@ -4814,6 +4855,9 @@ def chat_worker() -> None:
                 group_id,
                 focus_sequence=chat_sequence,
             )
+            baseline_revision = int(
+                item.get("chat_sequence") or latest_group_user_sequence(group_id)
+            )
 
             celebration_target_key = mention_user_id or "unknown"
             if social_event_kind and celebration_was_replied(
@@ -4932,6 +4976,7 @@ def chat_worker() -> None:
                 mentioned=bool(item.get("mentioned")),
                 admin=False,
                 deadline=deadline,
+                baseline_revision=baseline_revision,
             )
             model_latency_ms = routing_latency_ms + int(
                 (time.monotonic() - model_started) * 1000

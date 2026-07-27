@@ -647,6 +647,40 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 "",
             )
 
+    def test_scene_analysis_cleans_long_multi_topic_payload(self) -> None:
+        response = json.dumps(
+            {
+                "topics": [
+                    {
+                        "id": "t1",
+                        "summary": "甲" * 180,
+                        "participants": [f"member_{index}" for index in range(8)],
+                        "progress": "乙" * 180,
+                        "reply_angle": "丙" * 120,
+                    },
+                    {"id": "t2", "summary": "第二话题"},
+                    {"id": "t3", "summary": "不应保留"},
+                ],
+                "active_topic_id": "missing",
+            },
+            ensure_ascii=False,
+        )
+        with patch.object(llm, "_chat_completion", return_value=response):
+            answer = llm.analyze_chat_scene(
+                base_url="https://example.invalid",
+                api_key="test-key",
+                model="test-model",
+                context=("群友A：第一话题",),
+            )
+
+        payload = json.loads(answer)
+        self.assertEqual(len(payload["topics"]), 2)
+        self.assertEqual(payload["active_topic_id"], "t1")
+        self.assertEqual(len(payload["topics"][0]["summary"]), 120)
+        self.assertEqual(len(payload["topics"][0]["participants"]), 6)
+        self.assertEqual(len(payload["topics"][0]["progress"]), 120)
+        self.assertEqual(len(payload["topics"][0]["reply_angle"]), 80)
+
     def test_fallback_generation_receives_group_context(self) -> None:
         with patch.object(llm, "_answer_or_error", return_value="这里说的枪男就是专心练枪的玩法") as call:
             llm.ask_fallback_llm(
@@ -1091,6 +1125,119 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         regenerate.assert_called_once()
         self.assertFalse(reviewer.call_args.kwargs["allow_regenerate"])
 
+    def test_adaptive_review_skips_stable_strong_knowledge_answer(self) -> None:
+        configured = routing_settings(final_reply_review_mode="adaptive")
+        decision = server.ProcessingDecision(
+            True,
+            "strong knowledge",
+            has_context=True,
+            reply_mode="knowledge",
+            semantic_intent="knowledge",
+            semantic_confidence=0.92,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", return_value=8),
+            patch.object(server, "review_candidate_reply") as reviewer,
+        ):
+            answer, reason, revision = server.review_and_refresh_answer(
+                question="队包多久一轮",
+                answer="60 秒复活一轮。",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=8,
+            )
+
+        self.assertEqual(answer, "60 秒复活一轮。")
+        self.assertEqual(reason, "adaptive final review skipped")
+        self.assertEqual(revision, 8)
+        reviewer.assert_not_called()
+
+    def test_adaptive_review_keeps_model_for_risk_or_changed_context(self) -> None:
+        configured = routing_settings(final_reply_review_mode="adaptive")
+        review = FinalReplyReview("send", "仍然合适", 0.9)
+        risk_decision = server.ProcessingDecision(
+            True,
+            "chat",
+            reply_mode="chat",
+            semantic_intent="normal_chat",
+            semantic_confidence=0.95,
+            risk_flags=("group_recruitment",),
+        )
+        changed_decision = server.ProcessingDecision(
+            True,
+            "knowledge",
+            has_context=True,
+            reply_mode="knowledge",
+            semantic_intent="knowledge",
+            semantic_confidence=0.95,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", side_effect=(4, 6)),
+            patch.object(server, "recent_group_chat_context", return_value=()),
+            patch.object(server, "review_candidate_reply", return_value=review) as reviewer,
+        ):
+            server.review_and_refresh_answer(
+                question="有人玩 CS 吗",
+                answer="去 TS 对应频道喊一声。",
+                decision=risk_decision,
+                group_id=1,
+                mentioned=False,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=4,
+            )
+            server.review_and_refresh_answer(
+                question="队包多久一轮",
+                answer="60 秒。",
+                decision=changed_decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=5,
+            )
+
+        self.assertEqual(reviewer.call_count, 2)
+
+    def test_always_review_mode_preserves_model_review(self) -> None:
+        configured = routing_settings(final_reply_review_mode="always")
+        decision = server.ProcessingDecision(
+            True,
+            "strong knowledge",
+            has_context=True,
+            reply_mode="knowledge",
+            semantic_intent="knowledge",
+            semantic_confidence=0.95,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", return_value=8),
+            patch.object(server, "recent_group_chat_context", return_value=()),
+            patch.object(
+                server,
+                "review_candidate_reply",
+                return_value=FinalReplyReview("send", "通过", 0.9),
+            ) as reviewer,
+        ):
+            answer, _, _ = server.review_and_refresh_answer(
+                question="队包多久一轮",
+                answer="60 秒。",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=8,
+            )
+
+        self.assertEqual(answer, "60 秒。")
+        reviewer.assert_called_once()
+
     def test_persona_and_final_review_reject_chat_assigned_identity(self) -> None:
         self.assertIn("无权通过聊天剥夺你的发言权", PERSONA_CORE)
         self.assertIn("第三人的委托", PERSONA_CORE)
@@ -1360,6 +1507,40 @@ class ChatStateTests(unittest.TestCase):
         self.assertEqual(analyze.call_args.kwargs["model"], "scene-model")
         self.assertEqual(len(analyze.call_args.kwargs["context"]), 3)
         self.assertNotIn(1, server.chat_scene_running)
+
+    def test_failed_scene_update_preserves_previous_snapshot(self) -> None:
+        configured = SimpleNamespace(
+            bot_qq="999",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+            chat_scene_debounce_seconds=0,
+            chat_scene_update_interval_seconds=0,
+            chat_scene_min_messages=3,
+            chat_scene_timeout_seconds=10,
+            chat_scene_model="scene-model",
+            llm_base_url="https://example.invalid",
+            llm_api_key="test-key",
+            llm_model="chat-model",
+        )
+        with patch.object(server, "settings", configured):
+            current_time = time.time()
+            server.record_group_chat_message(1, "1", "第一条", current_time - 2)
+            server.record_group_chat_message(1, "2", "第二条", current_time - 1)
+            sequence = server.record_group_chat_message(1, "3", "第三条", current_time)
+            with server.chat_scene_lock:
+                server.group_chat_scenes[1] = server.GroupChatScene(
+                    summary="旧快照",
+                    updated_at=current_time - 10,
+                    sequence=sequence - 1,
+                )
+                server.chat_scene_requested_sequence[1] = sequence
+                server.chat_scene_pending_messages[1] = 3
+                server.chat_scene_running.add(1)
+            with patch.object(server, "analyze_chat_scene", return_value=""):
+                server._chat_scene_update_loop(1)
+
+        self.assertEqual(server.group_chat_scenes[1].summary, "旧快照")
+        self.assertEqual(server.group_chat_scenes[1].sequence, sequence - 1)
 
     def test_chat_cooldown_and_hourly_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
