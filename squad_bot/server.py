@@ -15,7 +15,7 @@ from typing import Sequence
 from urllib.parse import parse_qs
 
 from .config import settings
-from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryMessage
+from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
 from .knowledge import KnowledgeBase
 from .llm import (
@@ -81,6 +81,8 @@ group_fragment_buffers: dict[int, "MessageFragmentBuffer"] = {}
 ready_fragment_buffers: list["MessageFragmentBuffer"] = []
 chat_memory_manager: ChatMemoryManager | None = None
 chat_history_save_event = threading.Event()
+knowledge_gap_lock = threading.Lock()
+recent_knowledge_gap_queries: dict[str, float] = {}
 
 
 @dataclass
@@ -758,6 +760,9 @@ COMMAND_ALIASES = {
     "memory rebuild": "memory_rebuild",
     "清空本群聊天记忆": "memory_clear_request",
     "清空本群聊天记忆 确认": "memory_clear_confirm",
+    "最近知识未命中": "knowledge_gaps",
+    "知识未命中": "knowledge_gaps",
+    "knowledge gaps": "knowledge_gaps",
 }
 
 
@@ -938,8 +943,12 @@ def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") 
     if command == "reload":
         with kb_lock:
             count = kb.reload()
+            stats = kb.last_reload_stats
         clear_conversation_state()
-        return f"知识库已重载，共 {count} 个片段。"
+        return (
+            f"知识库已重载，共 {count} 个片段；新增 {stats.added}，修改 {stats.changed}，"
+            f"删除 {stats.removed}，复用 {stats.reused}。"
+        )
     if command == "health":
         auto_status = "开" if auto_reply_enabled else "关"
         chat_status = "开" if settings.chat_reply_enabled and auto_reply_enabled else "关"
@@ -1005,6 +1014,16 @@ def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") 
             return "确认已失效，请先发送：清空本群聊天记忆"
         chat_memory_manager.store.clear_group(group_id)
         return "本群聊天记忆已清空。"
+    if command == "knowledge_gaps":
+        entries = recent_knowledge_gap_entries()
+        if not entries:
+            return "最近没有记录到知识检索缺口。"
+        lines = []
+        for entry in entries:
+            query = str(entry.get("query") or "")[:36]
+            missing = "、".join(entry.get("missing_tokens") or ())[:50]
+            lines.append(f"{query}（缺：{missing or '无明确词'}）")
+        return "最近知识未命中：\n" + "\n".join(lines)
     return "未知维护命令。"
 
 
@@ -2120,6 +2139,63 @@ def is_identity_question(question: str) -> bool:
     if "介绍一下" in normalized_question:
         return any(keyword in normalized_question for keyword in SELF_REFERENCE_KEYWORDS)
     return False
+
+
+def record_knowledge_gap(query: str, result) -> bool:
+    normalized = " ".join(str(query or "").strip().split())
+    if len(normalized) < 2:
+        return False
+    safe_query = redact_for_model(normalized)[:300]
+    now = time.time()
+    dedupe_seconds = max(0, getattr(settings, "knowledge_gap_dedupe_seconds", 3600))
+    with knowledge_gap_lock:
+        previous = recent_knowledge_gap_queries.get(safe_query, 0)
+        if now - previous < dedupe_seconds:
+            return False
+        recent_knowledge_gap_queries[safe_query] = now
+        cutoff = now - max(dedupe_seconds, 86400)
+        for key, timestamp in tuple(recent_knowledge_gap_queries.items()):
+            if timestamp < cutoff:
+                recent_knowledge_gap_queries.pop(key, None)
+        record = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "query": safe_query,
+            "top_score": round(float(result.top_score), 4),
+            "coverage": round(float(result.query_coverage), 4),
+            "sources": list(result.sources),
+            "matched_tokens": list(result.matched_query_tokens),
+            "missing_tokens": list(result.missing_query_tokens),
+        }
+        path = Path(getattr(settings, "knowledge_gap_log", "work/knowledge_gaps.jsonl"))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return True
+        except OSError as exc:
+            print("Knowledge gap log write failed:", repr(exc))
+            return False
+
+
+def recent_knowledge_gap_entries(limit: int = 5) -> list[dict]:
+    path = Path(getattr(settings, "knowledge_gap_log", "work/knowledge_gaps.jsonl"))
+    if not path.exists():
+        return []
+    entries: list[dict] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+        if len(entries) >= limit:
+            break
+    return entries
 
 
 def retrieve_knowledge(query: str, max_chars: int):
@@ -3372,6 +3448,13 @@ def should_process_message(
                     context = result.context
                     sources = result.sources
                     strong_match = candidate_is_strong
+    if (
+        not strong_match
+        and usable_plan is not None
+        and usable_plan.intent == "knowledge"
+        and getattr(settings, "knowledge_gap_log_enabled", False)
+    ):
+        record_knowledge_gap(query_text, result)
     if not context or not strong_match:
         if (
             not usable_plan

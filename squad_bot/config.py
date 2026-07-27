@@ -43,6 +43,11 @@ class Settings:
     max_context_chars: int = int(os.getenv("MAX_CONTEXT_CHARS", "4500"))
     knowledge_strong_min_score: float = float(os.getenv("KNOWLEDGE_STRONG_MIN_SCORE", "0.18"))
     knowledge_strong_min_coverage: float = float(os.getenv("KNOWLEDGE_STRONG_MIN_COVERAGE", "0.6"))
+    knowledge_gap_log_enabled: bool = os.getenv(
+        "KNOWLEDGE_GAP_LOG_ENABLED", "false"
+    ).lower() in {"1", "true", "yes", "on"}
+    knowledge_gap_log: str = os.getenv("KNOWLEDGE_GAP_LOG", "work/knowledge_gaps.jsonl")
+    knowledge_gap_dedupe_seconds: int = int(os.getenv("KNOWLEDGE_GAP_DEDUPE_SECONDS", "3600"))
     max_answer_chars: int = int(os.getenv("MAX_ANSWER_CHARS", "500"))
     dry_run: bool = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
     max_replies_per_minute: int = int(os.getenv("MAX_REPLIES_PER_MINUTE", "8"))

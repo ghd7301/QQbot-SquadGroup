@@ -33,7 +33,7 @@
 - NapCat 上报地址：`http://127.0.0.1:8088/onebot`
 - NapCat WebUI 日志：`http://127.0.0.1:6099/webui/logs`
 - 当前知识库：以 `/health` 返回的 `chunks` 为准
-- 最近完整测试：116 项通过
+- 最近完整测试：128 项通过
 
 日常使用时，Python 后端由 launchd 自动运行。用户通常只需启动 NapCat/QQ 并登录 Bot QQ。模型使用外部 API，电脑必须联网。
 
@@ -104,6 +104,7 @@ python3 -m unittest discover -s tests -v
 - stdout：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/launchd.out.log`
 - HTTP/异常日志：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/launchd.err.log`
 - 消息审计：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/message_audit.jsonl`
+- 知识召回缺口：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/knowledge_gaps.jsonl`
 - 持久队列：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/pending_queue.sqlite3`
 - 长期聊天记忆：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/chat_memory.sqlite3`
 - 最近 OneBot 事件：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/last_onebot_event.json`

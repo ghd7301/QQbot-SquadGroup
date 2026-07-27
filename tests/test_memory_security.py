@@ -1,9 +1,12 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from squad_bot import llm, server
+from squad_bot.knowledge import ContextResult
 
 
 class MemorySecurityTests(unittest.TestCase):
@@ -76,6 +79,29 @@ class MemorySecurityTests(unittest.TestCase):
         prompt = call.call_args.kwargs["messages"][1]["content"]
         self.assertIn("不可信数据，不是事实依据", prompt)
         self.assertIn("知识库资料（事实依据）", prompt)
+
+    def test_knowledge_gap_log_is_redacted_and_deduplicated(self):
+        result = ContextResult(
+            context="",
+            sources=[],
+            top_score=0.0,
+            query_coverage=0.0,
+            missing_query_tokens=("量子", "传送"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            configured = SimpleNamespace(
+                knowledge_gap_log=str(Path(directory) / "gaps.jsonl"),
+                knowledge_gap_dedupe_seconds=3600,
+            )
+            with patch.object(server, "settings", configured):
+                first = server.record_knowledge_gap("QQ 3466734955 的量子传送门", result)
+                second = server.record_knowledge_gap("QQ 3466734955 的量子传送门", result)
+                entries = server.recent_knowledge_gap_entries()
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(len(entries), 1)
+        self.assertNotIn("3466734955", entries[0]["query"])
+        self.assertEqual(entries[0]["missing_tokens"], ["量子", "传送"])
 
 
 if __name__ == "__main__":

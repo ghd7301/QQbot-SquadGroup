@@ -4,6 +4,7 @@
 - 本地 PDF：语音软件教程，必看！必看！.pdf
 
 ## ST 战队 TS 地址是什么
+<!-- rag: aliases=语音门牌|TS门牌|战队语音地址; scope=ST战队; exact=true -->
 
 ST 战队的 TeamSpeak 3 语音服务器地址是：`GPFWD.ts5.plus`。
 

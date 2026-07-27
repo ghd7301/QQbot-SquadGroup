@@ -1,10 +1,20 @@
+import hashlib
 import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 
 TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-zA-Z0-9_+#.-]+")
+RAG_META_RE = re.compile(r"<!--\s*rag:\s*(.*?)-->", re.I | re.S)
+EXACT_VALUE_RE = re.compile(
+    r"(?i)(?:(?<![/\w])[a-z0-9.-]+\.(?:com|cn|net|org|plus)\b|\d+(?:\.\d+)?\s*(?:米|m|秒|s|分钟|min|票|发|人|倍|g|gb|mb)|\b[VGBC]\s*键\b)"
+)
+EXACT_QUERY_CUES = (
+    "多少", "多久", "几秒", "几分钟", "多远", "距离", "范围", "冷却",
+    "地址", "网址", "服务器", "按键", "哪个键", "多少票", "多少米",
+)
 
 QUESTION_STOP_TOKENS = {
     "是什",
@@ -82,6 +92,7 @@ QUERY_COVERAGE_NOISE = (
     "还有",
     "以及",
     "然后",
+    "分别",
     "一下",
     "要",
     "和",
@@ -333,11 +344,22 @@ def compact_text(text: str) -> str:
     return re.sub(r"\s+", "", text.lower())
 
 
+def contains_exact_value(text: str) -> bool:
+    without_source_urls = re.sub(r"https?://\S+", "", str(text or ""), flags=re.I)
+    return bool(EXACT_VALUE_RE.search(without_source_urls))
+
+
 @dataclass
 class Chunk:
     source: str
     title: str
     text: str
+    section_path: str = ""
+    aliases: tuple[str, ...] = ()
+    provenance: str = "maintained"
+    scope: str = "general"
+    exact_fact: bool = False
+    content_hash: str = ""
 
 
 @dataclass
@@ -346,6 +368,18 @@ class ContextResult:
     sources: list[str]
     top_score: float
     query_coverage: float
+    matched_query_tokens: tuple[str, ...] = ()
+    missing_query_tokens: tuple[str, ...] = ()
+    exact_match: bool = False
+
+
+@dataclass(frozen=True)
+class ReloadStats:
+    total: int = 0
+    added: int = 0
+    changed: int = 0
+    removed: int = 0
+    reused: int = 0
 
 
 def tokenize(text: str) -> list[str]:
@@ -380,21 +414,84 @@ def coverage_tokens(text: str) -> set[str]:
     return tokens
 
 
+def _parse_rag_metadata(text: str) -> dict[str, str]:
+    match = RAG_META_RE.search(text)
+    if not match:
+        return {}
+    metadata: dict[str, str] = {}
+    for item in match.group(1).split(";"):
+        key, separator, value = item.partition("=")
+        if separator and key.strip():
+            metadata[key.strip().lower()] = value.strip()
+    return metadata
+
+
+def _title_aliases(title: str, section_path: str, explicit: str = "") -> tuple[str, ...]:
+    candidates: list[str] = []
+    if explicit:
+        candidates.extend(re.split(r"[|,，、]", explicit))
+    candidates.extend(re.split(r"[/／、｜|（）()：:]", title))
+    candidates.extend(part.strip() for part in section_path.split(" > "))
+    compact = compact_text(title)
+    for suffix in ("是什么", "是什么意思", "怎么做", "怎么玩", "怎么用", "怎么办"):
+        if compact.endswith(suffix) and len(compact) > len(suffix):
+            candidates.append(compact[: -len(suffix)])
+    aliases: list[str] = []
+    for candidate in candidates:
+        value = candidate.strip()
+        if len(value) >= 2 and value != title and value not in aliases:
+            aliases.append(value)
+    return tuple(aliases)
+
+
+def _infer_provenance(raw: str) -> str:
+    lowered = raw.lower()
+    has_official = "squad wiki" in lowered or "官方" in raw
+    has_local = "本地 pdf" in lowered or "服务器规则" in raw or "战队" in raw
+    has_community = "社区经验" in raw or "小黑盒" in raw or "b 站" in lowered
+    kinds = [name for name, enabled in (("official", has_official), ("local", has_local), ("community", has_community)) if enabled]
+    return "+".join(kinds) if kinds else "maintained"
+
+
 def split_markdown(path: Path) -> list[Chunk]:
     raw = path.read_text(encoding="utf-8")
     parts: list[Chunk] = []
     current_title = path.stem
     current_lines: list[str] = []
+    current_level = 1
+    heading_stack: list[tuple[int, str]] = []
+    provenance = _infer_provenance(raw)
 
     def flush() -> None:
         body = "\n".join(current_lines).strip()
         if body:
-            parts.append(Chunk(source=path.name, title=current_title, text=body))
+            metadata = _parse_rag_metadata(body)
+            clean_body = RAG_META_RE.sub("", body).strip()
+            section_path = " > ".join(title for _level, title in heading_stack)
+            aliases = _title_aliases(current_title, section_path, metadata.get("aliases", ""))
+            digest_source = "\n".join((path.name, section_path, clean_body, "|".join(aliases)))
+            parts.append(Chunk(
+                source=path.name,
+                title=current_title,
+                text=clean_body,
+                section_path=section_path or current_title,
+                aliases=aliases,
+                provenance=metadata.get("provenance", provenance),
+                scope=metadata.get("scope", "general"),
+                exact_fact=metadata.get("exact", "").lower() in {"1", "true", "yes"}
+                or contains_exact_value(clean_body),
+                content_hash=hashlib.sha256(digest_source.encode("utf-8")).hexdigest(),
+            ))
 
     for line in raw.splitlines():
-        if line.startswith("#"):
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
             flush()
-            current_title = line.lstrip("#").strip() or path.stem
+            current_level = len(heading.group(1))
+            current_title = heading.group(2).strip() or path.stem
+            while heading_stack and heading_stack[-1][0] >= current_level:
+                heading_stack.pop()
+            heading_stack.append((current_level, current_title))
             current_lines = [line]
         else:
             current_lines.append(line)
@@ -408,20 +505,46 @@ class KnowledgeBase:
         self.chunks: list[Chunk] = []
         self.doc_freq: dict[str, int] = {}
         self.chunk_tokens: list[list[str]] = []
+        self.chunk_title_tokens: list[set[str]] = []
+        self.chunk_alias_tokens: list[set[str]] = []
+        self.last_reload_stats = ReloadStats()
         self.reload()
 
     def reload(self) -> int:
-        self.chunks.clear()
-        self.doc_freq.clear()
-        self.chunk_tokens.clear()
+        previous = {
+            (chunk.source, chunk.section_path): (chunk.content_hash, tokens)
+            for chunk, tokens in zip(self.chunks, self.chunk_tokens)
+        }
+        next_chunks: list[Chunk] = []
+        next_tokens: list[list[str]] = []
+        added = changed = reused = 0
 
         for path in sorted(self.root.glob("**/*.md")):
             for chunk in split_markdown(path):
-                tokens = tokenize(f"{chunk.title}\n{chunk.text}")
-                self.chunks.append(chunk)
-                self.chunk_tokens.append(tokens)
-                for token in set(tokens):
-                    self.doc_freq[token] = self.doc_freq.get(token, 0) + 1
+                key = (chunk.source, chunk.section_path)
+                cached = previous.get(key)
+                if cached and cached[0] == chunk.content_hash:
+                    tokens = cached[1]
+                    reused += 1
+                else:
+                    tokens = tokenize(f"{chunk.section_path}\n{' '.join(chunk.aliases)}\n{chunk.text}")
+                    if cached:
+                        changed += 1
+                    else:
+                        added += 1
+                next_chunks.append(chunk)
+                next_tokens.append(tokens)
+        next_keys = {(chunk.source, chunk.section_path) for chunk in next_chunks}
+        removed = len(set(previous) - next_keys)
+        self.chunks = next_chunks
+        self.chunk_tokens = next_tokens
+        self.chunk_title_tokens = [set(tokenize(chunk.section_path)) for chunk in self.chunks]
+        self.chunk_alias_tokens = [set(tokenize(" ".join(chunk.aliases))) for chunk in self.chunks]
+        self.doc_freq.clear()
+        for tokens in self.chunk_tokens:
+            for token in set(tokens):
+                self.doc_freq[token] = self.doc_freq.get(token, 0) + 1
+        self.last_reload_stats = ReloadStats(len(self.chunks), added, changed, removed, reused)
         return len(self.chunks)
 
     def search(self, query: str, limit: int = 5, min_score: float = 0.08) -> list[tuple[Chunk, float]]:
@@ -429,6 +552,7 @@ class KnowledgeBase:
         if not query_tokens:
             return []
         compact_query = compact_text(query)
+        exact_query = any(cue in compact_query for cue in EXACT_QUERY_CUES) or bool(EXACT_VALUE_RE.search(query))
 
         total_docs = max(len(self.chunks), 1)
         query_set = set(query_tokens)
@@ -442,7 +566,9 @@ class KnowledgeBase:
 
         scored: list[tuple[Chunk, float]] = []
 
-        for chunk, tokens in zip(self.chunks, self.chunk_tokens):
+        for chunk, tokens, title_tokens, alias_tokens in zip(
+            self.chunks, self.chunk_tokens, self.chunk_title_tokens, self.chunk_alias_tokens
+        ):
             if not tokens:
                 continue
             token_count = len(tokens)
@@ -462,6 +588,17 @@ class KnowledgeBase:
             text = chunk.text.lower()
             compact_title = compact_text(chunk.title)
             compact_body = compact_text(chunk.text)
+            compact_aliases = tuple(compact_text(alias) for alias in chunk.aliases)
+            title_overlap = len(query_set.intersection(title_tokens))
+            alias_overlap = len(query_set.intersection(alias_tokens))
+            score += title_overlap * 0.18 + alias_overlap * 0.22
+            if compact_query and compact_query in compact_title:
+                score += 0.65
+            if any(alias and (alias in compact_query or compact_query in alias) for alias in compact_aliases):
+                score += 0.45
+            if any(cue in compact_query for cue in ("是什么", "是啥", "什么意思")):
+                if any(cue in compact_title for cue in ("是什么", "是啥", "什么意思")):
+                    score += 0.28
             for token in query_set:
                 if token in title:
                     if re.fullmatch(r"[a-z0-9_+#.-]+", token):
@@ -479,6 +616,12 @@ class KnowledgeBase:
                     elif any(target in compact_body for target in targets):
                         score += boost * 0.5
 
+            if exact_query and chunk.exact_fact and counts:
+                score += 0.45
+                query_exact_values = set(EXACT_VALUE_RE.findall(query))
+                if query_exact_values and query_exact_values.intersection(EXACT_VALUE_RE.findall(chunk.text)):
+                    score += 0.5
+
             if score >= min_score:
                 scored.append((chunk, score))
 
@@ -491,12 +634,23 @@ class KnowledgeBase:
 
     def build_context_with_metrics(self, query: str, max_chars: int) -> ContextResult:
         matches = self.search(query)
+        matches = self._select_diverse_matches(query, matches)
+        compact_query = compact_text(query)
+        exact_query = any(cue in compact_query for cue in EXACT_QUERY_CUES) or bool(EXACT_VALUE_RE.search(query))
         context_parts: list[str] = []
         sources: list[str] = []
         used = 0
 
         for chunk, _score in matches:
-            block = f"来源：{chunk.source} / {chunk.title}\n{chunk.text.strip()}\n"
+            attributes = [f"出处类型：{chunk.provenance}"]
+            if chunk.scope != "general":
+                attributes.append(f"适用范围：{chunk.scope}")
+            if chunk.exact_fact:
+                attributes.append("包含需精确保持的数值、地址或按键信息")
+            block = (
+                f"来源：{chunk.source} / {chunk.section_path}\n"
+                f"资料属性：{'；'.join(attributes)}\n{chunk.text.strip()}\n"
+            )
             if used + len(block) > max_chars:
                 block = block[: max(0, max_chars - used)]
             if not block.strip():
@@ -510,6 +664,7 @@ class KnowledgeBase:
         top_score = matches[0][1] if matches else 0.0
         query_tokens = coverage_tokens(query)
         query_coverage = 0.0
+        matched_tokens: set[str] = set()
         if matches and query_tokens:
             context_tokens: set[str] = set()
             matched_chunks = {id(chunk) for chunk, _score in matches}
@@ -524,4 +679,33 @@ class KnowledgeBase:
             sources=sources,
             top_score=top_score,
             query_coverage=query_coverage,
+            matched_query_tokens=tuple(sorted(matched_tokens)),
+            missing_query_tokens=tuple(sorted(query_tokens - matched_tokens)),
+            exact_match=bool(exact_query and matches and matches[0][0].exact_fact),
         )
+
+    def _select_diverse_matches(
+        self,
+        query: str,
+        matches: Sequence[tuple[Chunk, float]],
+    ) -> list[tuple[Chunk, float]]:
+        if len(matches) <= 1:
+            return list(matches)
+        query_tokens = coverage_tokens(query)
+        selected: list[tuple[Chunk, float]] = []
+        covered: set[str] = set()
+        remaining = list(matches)
+        while remaining and len(selected) < 5:
+            best_index = 0
+            best_value = float("-inf")
+            for index, (chunk, score) in enumerate(remaining):
+                chunk_terms = set(tokenize(f"{chunk.section_path}\n{' '.join(chunk.aliases)}\n{chunk.text}"))
+                new_coverage = len((query_tokens - covered).intersection(chunk_terms)) / max(1, len(query_tokens))
+                source_bonus = 0.04 if all(existing.source != chunk.source for existing, _ in selected) else 0.0
+                value = score + 0.35 * new_coverage + source_bonus
+                if value > best_value:
+                    best_index, best_value = index, value
+            chunk, score = remaining.pop(best_index)
+            selected.append((chunk, score))
+            covered.update(query_tokens.intersection(tokenize(f"{chunk.section_path}\n{chunk.text}")))
+        return selected

@@ -1,7 +1,8 @@
 import unittest
+import tempfile
 from pathlib import Path
 
-from squad_bot.knowledge import KnowledgeBase
+from squad_bot.knowledge import KnowledgeBase, split_markdown
 from squad_bot.llm import SYSTEM_PROMPT
 
 
@@ -95,6 +96,56 @@ class KnowledgeTermTests(unittest.TestCase):
         self.assertNotIn("FOB/Radio", knowledge)
         self.assertNotIn("FOB：无线电据点范围", knowledge)
         self.assertNotIn("敌方 Radio 没被彻底处理前，它的排斥圈", knowledge)
+
+    def test_exact_fact_metadata_is_in_context(self) -> None:
+        result = self.knowledge_base.build_context_with_metrics("ST战队TS地址是多少", 1200)
+        self.assertTrue(result.exact_match)
+        self.assertIn("包含需精确保持的数值、地址或按键信息", result.context)
+        self.assertIn("GPFWD.ts5.plus", result.context)
+
+    def test_citation_urls_are_not_treated_as_answer_values(self) -> None:
+        fob_document_header = next(
+            chunk
+            for chunk in self.knowledge_base.chunks
+            if chunk.source == "02-出生点与工事.md" and chunk.title == "FOB、HAB、队包和补给"
+        )
+        self.assertFalse(fob_document_header.exact_fact)
+
+    def test_numeric_question_prefers_specific_exact_fact_section(self) -> None:
+        match = self.knowledge_base.search("FOB值多少票", limit=1)[0][0]
+        self.assertEqual(match.title, "FOB的血量以及弹药建材")
+        self.assertIn("一个FOB值20票", match.text)
+
+    def test_missing_query_tokens_are_reported(self) -> None:
+        result = self.knowledge_base.build_context_with_metrics("量子传送门怎么部署", 1200)
+        self.assertTrue(result.missing_query_tokens)
+        self.assertLess(result.query_coverage, 0.6)
+
+    def test_markdown_metadata_and_heading_path_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.md"
+            path.write_text(
+                "# 语音教程\n\n## 连接方法\n<!-- rag: aliases=语音门牌|连接码; scope=ST战队; exact=true -->\n地址是 voice.example.com。\n",
+                encoding="utf-8",
+            )
+            chunk = split_markdown(path)[1]
+        self.assertEqual(chunk.section_path, "语音教程 > 连接方法")
+        self.assertIn("语音门牌", chunk.aliases)
+        self.assertEqual(chunk.scope, "ST战队")
+        self.assertTrue(chunk.exact_fact)
+        self.assertNotIn("rag:", chunk.text)
+
+    def test_reload_reuses_unchanged_chunks_and_reports_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.md"
+            path.write_text("# 文档\n\n## 第一节\n原内容\n", encoding="utf-8")
+            knowledge = KnowledgeBase(directory)
+            knowledge.reload()
+            self.assertEqual(knowledge.last_reload_stats.reused, 2)
+            path.write_text("# 文档\n\n## 第一节\n新内容\n", encoding="utf-8")
+            knowledge.reload()
+            self.assertEqual(knowledge.last_reload_stats.changed, 1)
+            self.assertEqual(knowledge.last_reload_stats.reused, 1)
 
 
 if __name__ == "__main__":

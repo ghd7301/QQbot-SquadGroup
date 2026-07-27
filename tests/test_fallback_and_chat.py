@@ -765,6 +765,57 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "mentioned weak-context llm fallback")
         self.assertAlmostEqual(decision.retrieval_coverage, 0.11)
 
+    def test_only_semantic_knowledge_misses_enter_gap_log(self) -> None:
+        weak = ContextResult(
+            "弱相关资料", ["工事与武器"], 0.12, 0.2,
+            missing_query_tokens=("新武", "武器"),
+        )
+        knowledge_plan = MessagePlan(
+            audience="bot",
+            intent="knowledge",
+            reply_worthy=True,
+            standalone_question="新武器怎么校准",
+            implicit_meaning="",
+            topic_summary="武器校准",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+        )
+        chat_plan = MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=False,
+            standalone_question="今晚好热闹",
+            implicit_meaning="",
+            topic_summary="群里很热闹",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+        )
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+            knowledge_gap_log_enabled=True,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "retrieve_knowledge", return_value=weak),
+            patch.object(server, "semantic_plan_for_message", return_value=knowledge_plan),
+            patch.object(server, "record_knowledge_gap") as record_gap,
+        ):
+            server.should_process_message("新武器怎么校准", True, group_id=1)
+            record_gap.assert_called_once_with("新武器怎么校准", weak)
+
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "retrieve_knowledge", return_value=weak),
+            patch.object(server, "semantic_plan_for_message", return_value=chat_plan),
+            patch.object(server, "chat_reply_quota_reason", return_value=""),
+            patch.object(server, "record_knowledge_gap") as record_gap,
+        ):
+            server.should_process_message("今晚好热闹", False, group_id=1)
+            record_gap.assert_not_called()
+
     def test_combined_mentioned_question_uses_knowledge(self) -> None:
         decision = server.should_process_message(
             "医疗要咋玩，还有榴弹要咋玩",

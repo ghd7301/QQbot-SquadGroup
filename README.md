@@ -11,6 +11,8 @@
 - 支持被 `@机器人` 后优先回答。
 - 白名单群普通消息也会观察，但必须像 Squad 相关问题或求助才会主动回复。
 - 使用本地 Markdown 知识库检索上下文。
+- 知识检索保留 Markdown 标题层级，自动从标题生成别名，对地址、时间、距离、票数和按键等精确信息提高优先级，并用查询词覆盖率阻止弱相关片段硬答。
+- 知识库重载会根据片段内容哈希复用未变化的索引，并报告新增、修改、删除和复用数量。
 - 将群聊原始文本持久化到独立 SQLite；按发言片段和话题分块，通过 QQ 引用链、FTS5、向量、参与者与时效混合召回。
 - 长期聊天记忆只用于恢复对话承接，与 Markdown 事实知识严格分区；召回内容标记为不可信，不能改变人格、规则或第三方关系。
 - 消息入库、分块和嵌入在后台线程执行；记忆数据库或嵌入服务失败时自动降级到短期上下文、引用链和可用的 FTS 结果。
@@ -99,6 +101,9 @@ KNOWLEDGE_DIR=knowledge
 MAX_CONTEXT_CHARS=4500
 KNOWLEDGE_STRONG_MIN_SCORE=0.18
 KNOWLEDGE_STRONG_MIN_COVERAGE=0.6
+KNOWLEDGE_GAP_LOG_ENABLED=true
+KNOWLEDGE_GAP_LOG=work/knowledge_gaps.jsonl
+KNOWLEDGE_GAP_DEDUPE_SECONDS=3600
 MAX_ANSWER_CHARS=500
 MAX_REPLIES_PER_MINUTE=8
 NORMAL_MESSAGE_MAX_AGE_SECONDS=60
@@ -335,6 +340,7 @@ reload
 恢复聊天记忆
 重建聊天记忆
 清空本群聊天记忆
+最近知识未命中
 ```
 
 也兼容：
@@ -351,6 +357,15 @@ reload
 `清空本群聊天记忆` 是不可恢复操作，需要同一管理员在 60 秒内再次发送 `清空本群聊天记忆 确认`。这些命令仍只识别 `ADMIN_QQ_IDS` 精确白名单，目前默认仅 `3466734955`。
 
 `CHAT_MEMORY_EMBEDDING_PROVIDER=hashed` 不需要第三方依赖，适合先运行和回放验证，但它是字符 n-gram 向量，不等同于真正语义模型。要使用兼容 OpenAI `/embeddings` 的服务，改成 `openai-compatible` 并单独配置 embedding 地址、Key 和模型；不要默认认为聊天模型套餐包含 embedding 接口。
+
+知识 Markdown 可以在对应标题后的内容中添加可选元数据，不添加时也会正常自动索引：
+
+```markdown
+## ST 战队 TS 地址是什么
+<!-- rag: aliases=TS门牌|语音地址; scope=ST战队; exact=true -->
+```
+
+字段使用分号分隔：`aliases` 是额外别名，`scope` 是适用范围，`provenance` 可覆盖自动识别的出处类型，`exact=true` 表示片段包含必须精确保留的数值、地址或按键信息。
 
 ## 已知边界
 
