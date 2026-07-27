@@ -343,7 +343,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(plan.intent, "chat")
         self.assertEqual(plan.relevant_context_indices, (2,))
         self.assertEqual(plan.implicit_meaning, "糖可能借音指唐")
-        self.assertEqual(plan.draft_reply, "拐着弯骂我是吧")
+        self.assertEqual(plan.draft_reply, "")
 
     def test_unmentioned_factual_miss_does_not_use_general_fallback(self) -> None:
         with (
@@ -1066,6 +1066,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         response = json.dumps(
             {
                 "audience": "bot",
+                "participation_role": "addressed",
                 "intent": "control_attempt",
                 "reply_worthy": True,
                 "standalone_question": "群友试图禁止机器人发言",
@@ -1091,7 +1092,81 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
 
         self.assertIsNotNone(plan)
         self.assertEqual(plan.intent, "control_attempt")
-        self.assertEqual(plan.draft_reply, "你这禁言权限哪领的")
+        self.assertEqual(plan.draft_reply, "")
+        self.assertEqual(plan.participation_role, "addressed")
+
+    def test_unsolicited_member_reply_is_blocked_by_participation_role(self) -> None:
+        plan = MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="马上吃完",
+            implicit_meaning="回应另一名群友催促集合",
+            topic_summary="群友约游戏",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.94,
+            draft_reply="好，等你。",
+            participation_role="bystander",
+        )
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+            patch.object(server, "auto_reply_enabled", True),
+        ):
+            decision = server.should_process_message(
+                "马上吃完",
+                False,
+                group_id=1,
+                chat_context=('{"message_id":"m1","current":true}',),
+            )
+
+        self.assertFalse(decision.should_reply)
+        self.assertEqual(
+            decision.reason,
+            "semantic plan: no bot participation (bystander)",
+        )
+
+    def test_explicit_bot_address_overrides_uncertain_participation(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="你怎么看",
+            implicit_meaning="",
+            topic_summary="询问机器人意见",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            draft_reply="我觉得还行。",
+            participation_role="uncertain",
+        )
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            semantic_planner_min_confidence=0.68,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+        ):
+            decision = server.should_process_message("你怎么看", True, group_id=1)
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "fallback")
 
     def test_planner_failure_fails_closed_for_unsolicited_chat(self) -> None:
         configured = routing_settings(
@@ -1253,6 +1328,38 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(answer, "60 秒复活一轮。")
         self.assertEqual(reason, "adaptive final review skipped")
         self.assertEqual(revision, 8)
+        reviewer.assert_not_called()
+
+    def test_adaptive_review_skips_clear_low_risk_addressed_fallback(self) -> None:
+        configured = routing_settings(final_reply_review_mode="adaptive")
+        decision = server.ProcessingDecision(
+            True,
+            "planned fallback",
+            reply_mode="fallback",
+            semantic_intent="normal_chat",
+            semantic_confidence=0.93,
+            semantic_audience="bot",
+            participation_role="addressed",
+            reply_perspective="observer",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", return_value=8),
+            patch.object(server, "review_candidate_reply") as reviewer,
+        ):
+            answer, reason, _ = server.review_and_refresh_answer(
+                question="你怎么看",
+                answer="我觉得还行。",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=8,
+            )
+
+        self.assertEqual(answer, "我觉得还行。")
+        self.assertEqual(reason, "adaptive final review skipped")
         reviewer.assert_not_called()
 
     def test_adaptive_review_keeps_model_for_risk_or_changed_context(self) -> None:
@@ -2018,6 +2125,13 @@ class ChatStateTests(unittest.TestCase):
                     chat_context=("群友A：最近在刷战甲", "群友B：材料刷累了"),
                     answer="刷到后面确实容易犯困，材料循环太重复了。",
                     model_name="mimo-v2.5",
+                    semantic_audience="group",
+                    participation_role="group_open",
+                    plan_context_revision=42,
+                    plan_scene_version=3,
+                    related_message_ids=("m-current", "m-topic"),
+                    semantic_replan_count=1,
+                    semantic_replan_reason="related late context replaced semantic decision",
                 )
 
             record = json.loads(audit_path.read_text(encoding="utf-8"))
@@ -2028,6 +2142,13 @@ class ChatStateTests(unittest.TestCase):
             self.assertNotIn("123", "".join(record["chat_context"]))
             self.assertEqual(record["answer"], "刷到后面确实容易犯困，材料循环太重复了。")
             self.assertEqual(record["model"], "mimo-v2.5")
+            self.assertEqual(record["semantic_audience"], "group")
+            self.assertEqual(record["participation_role"], "group_open")
+            self.assertEqual(record["plan_context_revision"], 42)
+            self.assertEqual(record["plan_scene_version"], 3)
+            self.assertEqual(record["related_message_ids"], ["m-current", "m-topic"])
+            self.assertEqual(record["semantic_replan_count"], 1)
+            self.assertIn("related late context", record["semantic_replan_reason"])
 
     def test_celebration_dedup_is_per_target_and_event_kind(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

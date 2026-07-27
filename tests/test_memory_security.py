@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,9 +110,51 @@ class MemorySecurityTests(unittest.TestCase):
                 mentions_other=False,
             )
 
-        self.assertEqual(
-            planner.call_args.kwargs["scene_context"],
-            '{"topics":[{"summary":"当前机器人优化"}]}',
+        compact_scene = json.loads(planner.call_args.kwargs["scene_context"])
+        self.assertEqual(compact_scene["topics"][0]["summary"], "当前机器人优化")
+        self.assertEqual(compact_scene["topics"][0]["participants"], [])
+
+    def test_semantic_planner_input_is_budgeted_but_keeps_current_message(self):
+        configured = SimpleNamespace(
+            semantic_planner_enabled=True,
+            bot_qq="999",
+            llm_base_url="https://example.invalid",
+            llm_api_key="key",
+            llm_model="model",
+            semantic_planner_model="planner",
+            semantic_planner_timeout_seconds=5,
+            semantic_planner_context_messages=3,
+            semantic_planner_context_max_chars=900,
+            semantic_planner_memory_max_chars=200,
+        )
+        context = tuple(
+            json.dumps({
+                "message_id": f"m{index}",
+                "sequence": index,
+                "current": index == 8,
+                "speaker": {"role": "member"},
+                "text": "消息" * 80,
+            })
+            for index in range(1, 9)
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "plan_group_message") as planner,
+        ):
+            server.semantic_plan_for_message(
+                "当前消息",
+                context,
+                memory_candidates=("m" * 300, "n" * 300),
+                mentioned=False,
+                mentions_other=False,
+            )
+
+        planner_context = planner.call_args.kwargs["context"]
+        self.assertLessEqual(len(planner_context), 3)
+        self.assertIn('"message_id": "m8"', planner_context[-1])
+        self.assertLessEqual(
+            sum(len(value) for value in planner.call_args.kwargs["memory_candidates"]),
+            300,
         )
 
     def test_planner_parses_multiple_topic_candidates_with_real_anchors(self):
@@ -352,6 +395,242 @@ class MemorySecurityTests(unittest.TestCase):
         self.assertEqual(decision.reply_perspective, "neutral")
         self.assertEqual(decision.draft_reply, "")
         self.assertIn("self_identity", decision.risk_flags)
+
+    def test_participation_role_uses_hard_address_and_validates_participant(self):
+        bystander = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="马上吃完",
+            implicit_meaning="回应另一名群友的催促",
+            topic_summary="群友约游戏",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            participation_role="bystander",
+        )
+        claimed_participant = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="接着说",
+            implicit_meaning="",
+            topic_summary="旧话题",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            participation_role="participant",
+        )
+
+        self.assertEqual(
+            server.derive_participation_role(
+                bystander,
+                (),
+                explicitly_addressed=True,
+            ),
+            "addressed",
+        )
+        self.assertEqual(
+            server.derive_participation_role(
+                claimed_participant,
+                (),
+                explicitly_addressed=False,
+            ),
+            "uncertain",
+        )
+        bot_context = (json.dumps({"speaker": {"role": "bot"}}),)
+        self.assertEqual(
+            server.derive_participation_role(
+                claimed_participant,
+                bot_context,
+                explicitly_addressed=False,
+            ),
+            "participant",
+        )
+
+    def test_plan_metadata_tracks_shared_decision_versions_and_relations(self):
+        plan = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=False,
+            standalone_question="不了",
+            implicit_meaning="",
+            topic_summary="成员之间确认安排",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            relevant_context_message_ids=("prior",),
+            participation_role="bystander",
+        )
+        decision = server.ProcessingDecision(False, "skip", chat_context=())
+
+        server.apply_semantic_plan_metadata(
+            decision,
+            plan,
+            context_revision=17,
+            scene_context='{"version":4}',
+            target_message_ids=("current",),
+        )
+
+        self.assertEqual(decision.semantic_audience, "group")
+        self.assertEqual(decision.participation_role, "bystander")
+        self.assertEqual(decision.plan_context_revision, 17)
+        self.assertEqual(decision.plan_scene_version, 4)
+        self.assertEqual(decision.related_message_ids, ("current", "prior"))
+
+    def test_related_late_context_replaces_subject_participation_and_perspective(self):
+        original = server.ProcessingDecision(
+            True,
+            "chat candidate",
+            reply_mode="chat",
+            chat_context=(json.dumps({
+                "message_id": "m1",
+                "sequence": 1,
+                "current": True,
+                "speaker": {"role": "member"},
+            }),),
+            semantic_intent="normal_chat",
+            semantic_topic="外部项目",
+            semantic_confidence=0.9,
+            semantic_audience="group",
+            participation_role="group_open",
+            reply_perspective="observer",
+            plan_context_revision=1,
+        )
+        refreshed_plan = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="是在测试当前机器人",
+            implicit_meaning="补充明确了对象",
+            topic_summary="测试当前机器人",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.94,
+            relevant_context_message_ids=("m1", "m2"),
+            subject_candidates=(
+                llm.SubjectCandidate(
+                    "bot",
+                    "当前机器人",
+                    0.95,
+                    evidence_message_ids=("m2",),
+                ),
+            ),
+            subject_ambiguity="clear",
+            participation_role="subject",
+        )
+        latest_context = (
+            original.chat_context[0],
+            json.dumps({
+                "message_id": "m2",
+                "sequence": 2,
+                "current": False,
+                "speaker": {"role": "member"},
+            }),
+        )
+        configured = SimpleNamespace(
+            semantic_replan_enabled=True,
+            semantic_planner_timeout_seconds=5,
+            semantic_planner_min_confidence=0.68,
+            bot_qq="999",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(
+                server,
+                "semantic_plan_for_message",
+                return_value=refreshed_plan,
+            ) as planner,
+        ):
+            refreshed, reason = server.refresh_semantic_decision_for_late_context(
+                original,
+                {
+                    "question": "又优化了",
+                    "message_id": "m1",
+                    "message_ids": ["m1"],
+                    "mentioned": False,
+                },
+                latest_context,
+                scene_context='{"version":2}',
+                deadline=time.monotonic() + 10,
+            )
+
+        self.assertIs(refreshed, original)
+        self.assertIn("m2", reason)
+        self.assertEqual(refreshed.semantic_topic, "测试当前机器人")
+        self.assertEqual(refreshed.participation_role, "subject")
+        self.assertEqual(refreshed.reply_perspective, "first_person")
+        self.assertEqual(refreshed.plan_context_revision, 2)
+        self.assertEqual(refreshed.plan_scene_version, 2)
+        self.assertEqual(refreshed.semantic_replan_count, 1)
+        self.assertEqual(planner.call_args.kwargs["newer_message_ids"], ("m2",))
+
+    def test_unrelated_late_context_does_not_replace_selected_context(self):
+        original_context = (json.dumps({
+            "message_id": "m1",
+            "sequence": 1,
+            "current": True,
+            "speaker": {"role": "member"},
+        }),)
+        decision = server.ProcessingDecision(
+            True,
+            "chat candidate",
+            reply_mode="chat",
+            chat_context=original_context,
+            semantic_intent="normal_chat",
+            semantic_topic="IDE 选择",
+            semantic_confidence=0.9,
+            semantic_audience="group",
+            participation_role="group_open",
+            plan_context_revision=1,
+        )
+        unrelated_plan = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="IDE 用哪个",
+            implicit_meaning="",
+            topic_summary="IDE 选择",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.92,
+            relevant_context_message_ids=("m1",),
+            participation_role="group_open",
+        )
+        latest_context = (*original_context, json.dumps({
+            "message_id": "m2",
+            "sequence": 2,
+            "speaker": {"role": "member"},
+            "text": "晚上吃什么",
+        }))
+        configured = SimpleNamespace(
+            semantic_replan_enabled=True,
+            semantic_planner_timeout_seconds=5,
+            semantic_planner_min_confidence=0.68,
+            bot_qq="999",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(
+                server,
+                "semantic_plan_for_message",
+                return_value=unrelated_plan,
+            ),
+        ):
+            refreshed, reason = server.refresh_semantic_decision_for_late_context(
+                decision,
+                {"question": "IDE 用哪个", "message_id": "m1"},
+                latest_context,
+                scene_context="",
+                deadline=time.monotonic() + 10,
+            )
+
+        self.assertIs(refreshed, decision)
+        self.assertIn("unrelated parallel", reason)
+        self.assertEqual(refreshed.chat_context, original_context)
+        self.assertEqual(refreshed.semantic_topic, "IDE 选择")
+        self.assertEqual(refreshed.plan_context_revision, 2)
+        self.assertEqual(refreshed.semantic_replan_count, 1)
 
     def test_clear_requires_same_admin_confirmation_within_window(self):
         store = SimpleNamespace(clear_group=Mock())

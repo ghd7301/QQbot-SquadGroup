@@ -98,6 +98,18 @@ class Settings:
     semantic_planner_min_confidence: float = float(
         os.getenv("SEMANTIC_PLANNER_MIN_CONFIDENCE", "0.68")
     )
+    semantic_planner_context_messages: int = int(
+        os.getenv("SEMANTIC_PLANNER_CONTEXT_MESSAGES", "10")
+    )
+    semantic_planner_context_max_chars: int = int(
+        os.getenv("SEMANTIC_PLANNER_CONTEXT_MAX_CHARS", "3200")
+    )
+    semantic_planner_memory_max_chars: int = int(
+        os.getenv("SEMANTIC_PLANNER_MEMORY_MAX_CHARS", "800")
+    )
+    semantic_replan_enabled: bool = os.getenv(
+        "SEMANTIC_REPLAN_ENABLED", "true"
+    ).lower() in {"1", "true", "yes", "on"}
     chat_relevance_check_enabled: bool = os.getenv(
         "CHAT_RELEVANCE_CHECK_ENABLED", "true"
     ).lower() in {"1", "true", "yes", "on"}

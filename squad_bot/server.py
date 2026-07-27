@@ -134,6 +134,13 @@ class ProcessingDecision:
     subject_ambiguity: str = "unknown"
     bot_involvement: str = "uncertain"
     reply_perspective: str = "neutral"
+    semantic_audience: str = "unclear"
+    participation_role: str = "uncertain"
+    plan_context_revision: int = 0
+    plan_scene_version: int = 0
+    related_message_ids: tuple[str, ...] = ()
+    semantic_replan_count: int = 0
+    semantic_replan_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -761,6 +768,13 @@ def write_message_audit(
     subject_ambiguity: str = "unknown",
     bot_involvement: str = "uncertain",
     reply_perspective: str = "neutral",
+    semantic_audience: str = "unclear",
+    participation_role: str = "uncertain",
+    plan_context_revision: int = 0,
+    plan_scene_version: int = 0,
+    related_message_ids: Sequence[str] = (),
+    semantic_replan_count: int = 0,
+    semantic_replan_reason: str = "",
     memory_query: str = "",
     memory_hit_count: int = 0,
     memory_retrieval_attempted: bool = False,
@@ -846,6 +860,13 @@ def write_message_audit(
         "subject_ambiguity": subject_ambiguity,
         "bot_involvement": bot_involvement,
         "reply_perspective": reply_perspective,
+        "semantic_audience": semantic_audience,
+        "participation_role": participation_role,
+        "plan_context_revision": int(plan_context_revision),
+        "plan_scene_version": int(plan_scene_version),
+        "related_message_ids": list(related_message_ids),
+        "semantic_replan_count": int(semantic_replan_count),
+        "semantic_replan_reason": semantic_replan_reason,
         "scene_version": int(scene_payload.get("version") or 0) if isinstance(scene_payload, dict) else 0,
         "scene_updated_through_sequence": (
             int(scene_payload.get("updated_through_sequence") or 0)
@@ -1814,8 +1835,18 @@ def review_and_refresh_answer(
             or regenerated
             or bool(decision.risk_flags)
             or decision.semantic_intent in risky_intents
-            or bool(decision.self_history_context)
-            or decision.reply_mode == "fallback"
+            or (
+                bool(decision.self_history_context)
+                and decision.bot_involvement in {"subject", "participant", "uncertain"}
+            )
+            or (
+                decision.reply_mode == "fallback"
+                and (
+                    decision.semantic_audience == "unclear"
+                    or decision.participation_role == "uncertain"
+                    or decision.semantic_confidence < 0.8
+                )
+            )
             or (
                 decision.reply_mode == "chat"
                 and decision.reply_perspective in {"first_person", "neutral"}
@@ -1878,8 +1909,34 @@ def review_and_refresh_answer(
 
         regenerated = True
         decision.reply_regenerated = True
-        updated_question = review.updated_question
-        decision.chat_context = tuple(latest_context)
+        semantic_replan_reason = ""
+        if (
+            target_item
+            and decision.semantic_audience != "unclear"
+            and decision.semantic_replan_count < 1
+        ):
+            refreshed_decision, semantic_replan_reason = (
+                refresh_semantic_decision_for_late_context(
+                    decision,
+                    target_item,
+                    latest_context,
+                    scene_context=current_group_chat_scene(
+                        group_id,
+                        focus_sequence=int(target_item.get("chat_sequence") or 0),
+                    ),
+                    deadline=deadline,
+                )
+            )
+            if refreshed_decision is None:
+                return "", semantic_replan_reason, latest_revision
+            decision = refreshed_decision
+        updated_question = (
+            decision.effective_question
+            if semantic_replan_reason.startswith("related late context")
+            else review.updated_question
+        )
+        if not semantic_replan_reason.startswith("related late context"):
+            decision.chat_context = tuple(latest_context)
         decision.effective_question = updated_question
         decision.draft_reply = ""
         reserve = getattr(settings, "final_reply_review_timeout_seconds", 4)
@@ -2460,6 +2517,7 @@ def semantic_plan_for_message(
     mentioned: bool,
     mentions_other: bool,
     reply_target_user_id: str = "",
+    newer_message_ids: Sequence[str] = (),
     timeout: int | None = None,
 ) -> MessagePlan | None:
     if not getattr(settings, "semantic_planner_enabled", False):
@@ -2470,14 +2528,34 @@ def semantic_plan_for_message(
         reply_target = "member"
     else:
         reply_target = "none"
+    planner_context = budget_recent_context(
+        chat_context,
+        max_messages=max(
+            1,
+            getattr(settings, "semantic_planner_context_messages", 10),
+        ),
+        max_chars=max(
+            800,
+            getattr(settings, "semantic_planner_context_max_chars", 3200),
+        ),
+    )
+    planner_memory = budget_memory_context(
+        memory_candidates,
+        max_hits=3,
+        max_chars=max(
+            200,
+            getattr(settings, "semantic_planner_memory_max_chars", 800),
+        ),
+    )
     return plan_group_message(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=getattr(settings, "semantic_planner_model", settings.llm_model),
         message=question,
-        context=tuple(chat_context),
-        scene_context=scene_context,
-        memory_candidates=tuple(memory_candidates),
+        context=planner_context,
+        scene_context=compact_scene_context(scene_context),
+        memory_candidates=planner_memory,
+        newer_message_ids=tuple(newer_message_ids),
         mentioned=mentioned,
         mentions_other=mentions_other,
         reply_target=reply_target,
@@ -2491,6 +2569,37 @@ def semantic_plan_is_usable(plan: MessagePlan | None) -> bool:
         and plan.confidence
         >= getattr(settings, "semantic_planner_min_confidence", 0.68)
     )
+
+
+def compact_scene_context(scene_context: str) -> str:
+    if not scene_context:
+        return ""
+    try:
+        payload = json.loads(scene_context)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    topics = []
+    for topic in payload.get("topics") or ():
+        if not isinstance(topic, dict) or len(topics) >= 2:
+            continue
+        topics.append({
+            "id": str(topic.get("id") or "")[:30],
+            "summary": str(topic.get("summary") or "")[:120],
+            "participants": list(topic.get("participants") or ())[:6],
+            "anchor_message_ids": list(topic.get("anchor_message_ids") or ())[:4],
+            "confidence": topic.get("confidence", 0),
+        })
+    compact = {
+        "version": int(payload.get("version") or 0),
+        "updated_through_sequence": int(
+            payload.get("updated_through_sequence") or 0
+        ),
+        "active_topic_id": str(payload.get("active_topic_id") or "")[:30],
+        "topics": topics,
+    }
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
 def context_selected_by_plan(
@@ -2581,6 +2690,40 @@ def context_line_message_id(line: str) -> str:
     return str(context_line_payload(line).get("message_id") or "")
 
 
+def context_revision(context: Sequence[str]) -> int:
+    revision = 0
+    for line in context:
+        payload = context_line_payload(line)
+        speaker = payload.get("speaker") or {}
+        if speaker.get("role") == "bot":
+            continue
+        try:
+            revision = max(revision, int(payload.get("sequence") or 0))
+        except (TypeError, ValueError):
+            continue
+    return revision
+
+
+def context_message_ids_after_revision(
+    context: Sequence[str],
+    revision: int,
+) -> tuple[str, ...]:
+    result = []
+    for line in context:
+        payload = context_line_payload(line)
+        speaker = payload.get("speaker") or {}
+        if speaker.get("role") == "bot":
+            continue
+        try:
+            sequence = int(payload.get("sequence") or 0)
+        except (TypeError, ValueError):
+            continue
+        message_id = str(payload.get("message_id") or "").strip()
+        if sequence > revision and message_id and message_id not in result:
+            result.append(message_id)
+    return tuple(result)
+
+
 def budget_recent_context(
     context: Sequence[str],
     *,
@@ -2633,6 +2776,8 @@ def semantic_context_for_decision(decision: ProcessingDecision) -> str:
         )
         parts.append(f"候选话题：{candidates}")
     if decision.semantic_intent or decision.subject_candidates:
+        parts.append(f"语义受众：{decision.semantic_audience}")
+        parts.append(f"机器人参与资格：{decision.participation_role}")
         parts.append(f"讨论对象状态：{decision.subject_ambiguity}")
         parts.append(f"机器人参与关系：{decision.bot_involvement}")
         parts.append(f"要求回复视角：{decision.reply_perspective}")
@@ -2646,6 +2791,23 @@ def semantic_context_for_decision(decision: ProcessingDecision) -> str:
         )
         parts.append(f"讨论对象候选：{subjects}")
     return "\n".join(parts)
+
+
+def semantic_relation_audit_fields(decision: ProcessingDecision) -> dict:
+    return {
+        "topic_candidates": decision.topic_candidates,
+        "subject_candidates": decision.subject_candidates,
+        "subject_ambiguity": decision.subject_ambiguity,
+        "bot_involvement": decision.bot_involvement,
+        "reply_perspective": decision.reply_perspective,
+        "semantic_audience": decision.semantic_audience,
+        "participation_role": decision.participation_role,
+        "plan_context_revision": decision.plan_context_revision,
+        "plan_scene_version": decision.plan_scene_version,
+        "related_message_ids": decision.related_message_ids,
+        "semantic_replan_count": decision.semantic_replan_count,
+        "semantic_replan_reason": decision.semantic_replan_reason,
+    }
 
 
 def derive_bot_reply_perspective(
@@ -2684,14 +2846,80 @@ def derive_bot_reply_perspective(
     return "observer", "observer"
 
 
+def derive_participation_role(
+    plan: MessagePlan,
+    selected_context: Sequence[str],
+    *,
+    explicitly_addressed: bool,
+) -> str:
+    if explicitly_addressed:
+        return "addressed"
+    bot_subject = next(
+        (
+            candidate
+            for candidate in plan.subject_candidates
+            if candidate.entity_type == "bot" and candidate.confidence >= 0.72
+        ),
+        None,
+    )
+    if bot_subject and plan.subject_ambiguity == "clear":
+        return "subject"
+
+    role = plan.participation_role
+    if role == "participant":
+        bot_participated = any(
+            (context_line_payload(line).get("speaker") or {}).get("role") == "bot"
+            for line in selected_context
+        )
+        return "participant" if bot_participated else "uncertain"
+    if role == "group_open":
+        return "group_open" if plan.audience == "group" else "uncertain"
+    if role in {"bystander", "uncertain"}:
+        return role
+    return "uncertain"
+
+
 def apply_semantic_plan_metadata(
     decision: ProcessingDecision,
     plan: MessagePlan,
+    *,
+    explicitly_addressed: bool = False,
+    context_revision: int = 0,
+    scene_context: str = "",
+    target_message_ids: Sequence[str] = (),
 ) -> ProcessingDecision:
     decision.risk_flags = plan.risk_flags
     decision.topic_candidates = plan.topic_candidates
     decision.subject_candidates = plan.subject_candidates
     decision.subject_ambiguity = plan.subject_ambiguity
+    decision.semantic_intent = plan.intent
+    decision.semantic_topic = plan.topic_summary
+    decision.implicit_meaning = plan.implicit_meaning
+    decision.semantic_confidence = plan.confidence
+    decision.effective_question = plan.standalone_question
+    decision.capability = plan.capability if plan.intent == "bot_meta" else "none"
+    decision.draft_reply = ""
+    decision.semantic_audience = plan.audience
+    decision.participation_role = derive_participation_role(
+        plan,
+        decision.chat_context,
+        explicitly_addressed=explicitly_addressed,
+    )
+    decision.plan_context_revision = max(0, int(context_revision or 0))
+    try:
+        scene_payload = json.loads(scene_context) if scene_context else {}
+    except (json.JSONDecodeError, TypeError):
+        scene_payload = {}
+    decision.plan_scene_version = (
+        int(scene_payload.get("version") or 0)
+        if isinstance(scene_payload, dict)
+        else 0
+    )
+    decision.related_message_ids = tuple(dict.fromkeys(
+        str(value or "").strip()
+        for value in (*target_message_ids, *plan.relevant_context_message_ids)
+        if str(value or "").strip()
+    ))
     (
         decision.bot_involvement,
         decision.reply_perspective,
@@ -2704,6 +2932,105 @@ def apply_semantic_plan_metadata(
         # The planner draft may already have committed to the wrong referent.
         decision.draft_reply = ""
     return decision
+
+
+def refresh_semantic_decision_for_late_context(
+    decision: ProcessingDecision,
+    item: dict,
+    latest_context: Sequence[str],
+    *,
+    scene_context: str,
+    deadline: float,
+) -> tuple[ProcessingDecision | None, str]:
+    latest_context = tuple(latest_context)
+    latest_revision = context_revision(latest_context)
+    newer_ids = context_message_ids_after_revision(
+        latest_context,
+        decision.plan_context_revision,
+    )
+    if not newer_ids:
+        return decision, "semantic context unchanged"
+    if (
+        not getattr(settings, "semantic_replan_enabled", True)
+        or decision.semantic_replan_count >= 1
+    ):
+        return decision, "semantic replan already used or disabled"
+
+    timeout = remaining_reply_timeout(
+        deadline,
+        cap=getattr(settings, "semantic_planner_timeout_seconds", 5),
+        reserve=2,
+    )
+    if not timeout:
+        return None, "reply deadline exhausted before semantic replan"
+    plan = semantic_plan_for_message(
+        str(item.get("question") or ""),
+        latest_context,
+        scene_context=scene_context,
+        mentioned=bool(item.get("mentioned")),
+        mentions_other=bool(item.get("mentions_other")),
+        reply_target_user_id=str(item.get("reply_target_user_id") or ""),
+        newer_message_ids=newer_ids,
+        timeout=timeout,
+    )
+    if not semantic_plan_is_usable(plan):
+        if item.get("mentioned"):
+            decision.plan_context_revision = latest_revision
+            return decision, "semantic replan unavailable; explicit address preserved"
+        return None, "semantic replan unavailable; unsolicited reply fails closed"
+
+    related_ids = set(plan.relevant_context_message_ids)
+    related_ids.update(
+        message_id
+        for candidate in plan.topic_candidates
+        for message_id in candidate.anchor_message_ids
+    )
+    related_ids.update(
+        message_id
+        for candidate in plan.subject_candidates
+        for message_id in candidate.evidence_message_ids
+    )
+    related_new_ids = tuple(
+        message_id for message_id in newer_ids if message_id in related_ids
+    )
+    if not related_new_ids:
+        decision.plan_context_revision = latest_revision
+        decision.semantic_replan_count += 1
+        decision.semantic_replan_reason = "new messages were unrelated parallel context"
+        return decision, decision.semantic_replan_reason
+
+    decision.chat_context = context_selected_by_plan(latest_context, plan)
+    apply_semantic_plan_metadata(
+        decision,
+        plan,
+        explicitly_addressed=(
+            bool(item.get("mentioned"))
+            or str(item.get("reply_target_user_id") or "") == settings.bot_qq
+        ),
+        context_revision=latest_revision,
+        scene_context=scene_context,
+        target_message_ids=(*_message_ids(item), *related_new_ids),
+    )
+    decision.semantic_replan_count += 1
+    decision.semantic_replan_reason = (
+        "related late context replaced semantic decision: "
+        + ",".join(related_new_ids)
+    )
+    if (
+        not item.get("mentioned")
+        and decision.participation_role in {"bystander", "uncertain"}
+    ):
+        return None, (
+            "semantic replan removed bot participation: "
+            f"{decision.participation_role}"
+        )
+    if decision.semantic_audience == "member" and not item.get("mentioned"):
+        return None, "semantic replan redirected message to another member"
+    if decision.reply_mode == "chat" and (
+        plan.intent not in SEMANTIC_CHAT_INTENTS or not plan.reply_worthy
+    ):
+        return None, "semantic replan found no natural chat entry"
+    return decision, decision.semantic_replan_reason
 
 
 def chat_memory_enabled_for_group(group_id: int) -> bool:
@@ -2783,6 +3110,8 @@ def budget_memory_context(
     selected: list[str] = []
     used = 0
     for line in context:
+        if not selected and len(line) > max_chars:
+            continue
         if selected and used + len(line) > max(200, max_chars):
             continue
         selected.append(line)
@@ -3017,6 +3346,11 @@ def enrich_decision_with_chat_memory(
             subject_ambiguity=decision.subject_ambiguity,
             bot_involvement=decision.bot_involvement,
             reply_perspective=decision.reply_perspective,
+            semantic_audience=decision.semantic_audience,
+            participation_role=decision.participation_role,
+            plan_context_revision=decision.plan_context_revision,
+            plan_scene_version=decision.plan_scene_version,
+            related_message_ids=decision.related_message_ids,
             event_time=item.get("time"),
         )
     return decision
@@ -4067,6 +4401,11 @@ def should_process_message(
         chat_context = context_selected_by_plan(chat_context, usable_plan)
         query_text = usable_plan.standalone_question or query_text
         explicitly_addressed = mentioned or reply_target_user_id == settings.bot_qq
+        participation_role = derive_participation_role(
+            usable_plan,
+            chat_context,
+            explicitly_addressed=explicitly_addressed,
+        )
         validated_capability = (
             usable_plan.capability
             if usable_plan.intent == "bot_meta"
@@ -4142,6 +4481,18 @@ def should_process_message(
                     f"semantic plan: mentioned {usable_plan.intent}",
                     effective_question=query_text,
                     reply_mode="fallback",
+                    chat_context=tuple(chat_context),
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    draft_reply=usable_plan.draft_reply,
+                    semantic_confidence=usable_plan.confidence,
+                )
+            if participation_role in {"bystander", "uncertain"}:
+                return ProcessingDecision(
+                    False,
+                    f"semantic plan: no bot participation ({participation_role})",
+                    reply_mode="chat",
                     chat_context=tuple(chat_context),
                     semantic_intent=usable_plan.intent,
                     semantic_topic=usable_plan.topic_summary,
@@ -4625,6 +4976,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
             )
             item["_recent_context_candidate_count"] = len(item["chat_context"])
+            planning_context_revision = context_revision(item["chat_context"])
             planner_scene_context = current_group_chat_scene(
                 group_id,
                 focus_sequence=int(item.get("chat_sequence") or 0),
@@ -4680,7 +5032,17 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 item.get("_recent_context_candidate_count") or len(item.get("chat_context") or ())
             )
             if selected_plan:
-                decision = apply_semantic_plan_metadata(decision, selected_plan[0])
+                decision = apply_semantic_plan_metadata(
+                    decision,
+                    selected_plan[0],
+                    explicitly_addressed=(
+                        mentioned
+                        or str(item.get("reply_target_user_id") or "") == settings.bot_qq
+                    ),
+                    context_revision=planning_context_revision,
+                    scene_context=planner_scene_context,
+                    target_message_ids=_message_ids(item),
+                )
             decision = enrich_decision_with_chat_memory(
                 decision,
                 item,
@@ -4714,6 +5076,13 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     subject_ambiguity=decision.subject_ambiguity,
                     bot_involvement=decision.bot_involvement,
                     reply_perspective=decision.reply_perspective,
+                    semantic_audience=decision.semantic_audience,
+                    participation_role=decision.participation_role,
+                    plan_context_revision=decision.plan_context_revision,
+                    plan_scene_version=decision.plan_scene_version,
+                    related_message_ids=decision.related_message_ids,
+                    semantic_replan_count=decision.semantic_replan_count,
+                    semantic_replan_reason=decision.semantic_replan_reason,
                     scene_context=planner_scene_context,
                     self_history_candidate_count=decision.self_history_candidate_count,
                     self_history_selected_count=decision.self_history_selected_count,
@@ -4832,6 +5201,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         semantic_intent=decision.semantic_intent,
                         semantic_topic=decision.semantic_topic,
                         semantic_confidence=decision.semantic_confidence,
+                        **semantic_relation_audit_fields(decision),
                         event_time=event_time,
                     )
                     continue
@@ -4929,6 +5299,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         mentioned=mentioned,
                         reply_mode=decision.reply_mode,
                         model_latency_ms=int((time.monotonic() - model_started) * 1000),
+                        **semantic_relation_audit_fields(decision),
                         event_time=event_time,
                     )
                     continue
@@ -5007,6 +5378,13 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 subject_ambiguity=decision.subject_ambiguity,
                 bot_involvement=decision.bot_involvement,
                 reply_perspective=decision.reply_perspective,
+                semantic_audience=decision.semantic_audience,
+                participation_role=decision.participation_role,
+                plan_context_revision=decision.plan_context_revision,
+                plan_scene_version=decision.plan_scene_version,
+                related_message_ids=decision.related_message_ids,
+                semantic_replan_count=decision.semantic_replan_count,
+                semantic_replan_reason=decision.semantic_replan_reason,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
@@ -5133,20 +5511,53 @@ def chat_worker() -> None:
                 now=time.time(),
                 focus_sequence=chat_sequence,
             )
-            if not decision.semantic_topic:
-                decision.chat_context = latest_context
+            scene_context = current_group_chat_scene(
+                group_id,
+                focus_sequence=chat_sequence,
+            )
+            refreshed_decision, semantic_refresh_reason = (
+                refresh_semantic_decision_for_late_context(
+                    decision,
+                    item,
+                    latest_context,
+                    scene_context=scene_context,
+                    deadline=deadline,
+                )
+            )
+            if refreshed_decision is None:
+                write_message_audit(
+                    decision="skipped",
+                    reason=semantic_refresh_reason,
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    reply_mode="chat",
+                    chat_context=latest_context,
+                    scene_context=scene_context,
+                    semantic_intent=decision.semantic_intent,
+                    semantic_topic=decision.semantic_topic,
+                    semantic_confidence=decision.semantic_confidence,
+                    semantic_audience=decision.semantic_audience,
+                    participation_role=decision.participation_role,
+                    plan_context_revision=decision.plan_context_revision,
+                    plan_scene_version=decision.plan_scene_version,
+                    related_message_ids=decision.related_message_ids,
+                    semantic_replan_count=decision.semantic_replan_count,
+                    semantic_replan_reason=semantic_refresh_reason,
+                    event_time=event_time,
+                )
+                continue
+            decision = refreshed_decision
             decision.memory_context, dropped = deduplicate_memory_context(
                 decision.memory_context,
                 decision.chat_context,
             )
             decision.context_deduplicated_count += dropped
             apply_context_budget(decision)
-            scene_context = current_group_chat_scene(
-                group_id,
-                focus_sequence=chat_sequence,
-            )
             baseline_revision = int(
-                item.get("chat_sequence") or latest_group_user_sequence(group_id)
+                decision.plan_context_revision
+                or item.get("chat_sequence")
+                or latest_group_user_sequence(group_id)
             )
 
             celebration_target_key = mention_user_id or "unknown"
@@ -5215,6 +5626,7 @@ def chat_worker() -> None:
                     implicit_meaning=decision.implicit_meaning,
                     capability=decision.capability,
                     semantic_confidence=decision.semantic_confidence,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5240,6 +5652,7 @@ def chat_worker() -> None:
                     model_name=settings.chat_model,
                     chat_context=decision.chat_context,
                     scene_context=scene_context,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5253,6 +5666,7 @@ def chat_worker() -> None:
                     question=question,
                     reply_mode="chat",
                     answer=answer,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5287,6 +5701,7 @@ def chat_worker() -> None:
                     semantic_topic=decision.semantic_topic,
                     implicit_meaning=decision.implicit_meaning,
                     semantic_confidence=decision.semantic_confidence,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5301,6 +5716,7 @@ def chat_worker() -> None:
                     question=question,
                     reply_mode="chat",
                     answer=answer,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5321,6 +5737,7 @@ def chat_worker() -> None:
                     model_name=settings.chat_model,
                     chat_context=decision.chat_context,
                     scene_context=scene_context,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5344,6 +5761,7 @@ def chat_worker() -> None:
                     scene_context=scene_context,
                     answer=answer,
                     mention_user_id=mention_user_id,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 mark_chat_replied(group_id)
@@ -5367,6 +5785,7 @@ def chat_worker() -> None:
                     model_name=settings.chat_model,
                     chat_context=decision.chat_context,
                     scene_context=scene_context,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5393,6 +5812,7 @@ def chat_worker() -> None:
                         (time.monotonic() - model_started) * 1000
                     ),
                     model_name=settings.chat_model,
+                    **semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
                 continue
@@ -5415,6 +5835,7 @@ def chat_worker() -> None:
                         question=question,
                         reply_mode="chat",
                         model_latency_ms=model_latency_ms,
+                        **semantic_relation_audit_fields(decision),
                         event_time=event_time,
                     )
                     continue
@@ -5433,6 +5854,7 @@ def chat_worker() -> None:
                         reply_mode="chat",
                         model_latency_ms=model_latency_ms,
                         answer=answer,
+                        **semantic_relation_audit_fields(decision),
                         event_time=event_time,
                     )
                     continue
@@ -5489,6 +5911,13 @@ def chat_worker() -> None:
                 subject_ambiguity=decision.subject_ambiguity,
                 bot_involvement=decision.bot_involvement,
                 reply_perspective=decision.reply_perspective,
+                semantic_audience=decision.semantic_audience,
+                participation_role=decision.participation_role,
+                plan_context_revision=decision.plan_context_revision,
+                plan_scene_version=decision.plan_scene_version,
+                related_message_ids=decision.related_message_ids,
+                semantic_replan_count=decision.semantic_replan_count,
+                semantic_replan_reason=decision.semantic_replan_reason,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
