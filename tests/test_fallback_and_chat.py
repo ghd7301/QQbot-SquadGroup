@@ -1285,6 +1285,72 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(revision, 9)
         reviewer.assert_called_once()
 
+    def test_late_same_sender_supplement_is_bound_to_regenerated_turn(self) -> None:
+        configured = routing_settings(
+            final_reply_review_mode="adaptive",
+            knowledge_generation_timeout_seconds=10,
+            final_reply_review_timeout_seconds=4,
+        )
+        decision = server.ProcessingDecision(
+            True,
+            "strong knowledge",
+            has_context=True,
+            sources=("19-ST战队队标考核.md / 队标等级总览",),
+            reply_mode="knowledge",
+            semantic_intent="knowledge",
+            semantic_topic="队标考核",
+            semantic_confidence=0.95,
+            retrieval_score=1.2,
+            retrieval_coverage=1.0,
+        )
+        target_item = {"message_id": "m1", "message_ids": ["m1"]}
+        latest_context = (
+            '{"message_id":"m1","speaker":{"id":"member_a","role":"member"},"text":"队标怎么考"}',
+            '{"message_id":"m2","speaker":{"id":"member_a","role":"member"},"text":"晋升路线是什么"}',
+        )
+        reviews = (
+            FinalReplyReview(
+                "regenerate",
+                "同一发送者补充了同话题问题",
+                0.95,
+                updated_question="ST 队标怎么考，晋升路线是什么？",
+                context_relation="same_topic_update",
+                related_message_ids=("m1", "m2"),
+            ),
+            FinalReplyReview(
+                "send",
+                "已完整回答",
+                0.95,
+                context_relation="unchanged",
+                related_message_ids=("m1", "m2"),
+            ),
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", side_effect=(2, 2)),
+            patch.object(server, "recent_group_chat_context", return_value=latest_context),
+            patch.object(server, "review_candidate_reply", side_effect=reviews) as reviewer,
+            patch.object(server, "answer_for_decision", return_value="合并后的完整回答"),
+        ):
+            answer, _, _ = server.review_and_refresh_answer(
+                question="队标怎么考",
+                answer="只回答了队标",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=1,
+                target_item=target_item,
+            )
+
+        self.assertEqual(answer, "合并后的完整回答")
+        self.assertEqual(target_item["message_ids"], ["m1", "m2"])
+        self.assertEqual(
+            reviewer.call_args.kwargs["knowledge_sources"],
+            decision.sources,
+        )
+
     def test_late_answered_message_drops_stale_bot_reply(self) -> None:
         configured = routing_settings(final_reply_review_mode="adaptive")
         decision = server.ProcessingDecision(

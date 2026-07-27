@@ -358,6 +358,42 @@ class MessageFragmentTests(unittest.TestCase):
         self.assertEqual(restored.reply_mode, "chat")
         self.assertEqual(restored.semantic_topic, "分段消息")
 
+    def test_review_message_ids_accept_only_real_context_messages(self):
+        payload = item("队标怎么考", mentioned=True, message_id="m1")
+        review = llm.FinalReplyReview(
+            "regenerate",
+            "同一发送者补充了问题",
+            0.95,
+            updated_question="队标怎么考，晋升路线是什么？",
+            context_relation="same_topic_update",
+            related_message_ids=("m1", "m2", "m3", "invented"),
+        )
+        context = (
+            '{"message_id":"m1","speaker":{"id":"member_a","role":"member"},"text":"队标怎么考"}',
+            '{"message_id":"m2","speaker":{"id":"member_a","role":"member"},"text":"晋升路线是什么"}',
+            '{"message_id":"m3","speaker":{"id":"member_b","role":"member"},"text":"另一个人的并行话题"}',
+        )
+
+        server.merge_review_message_ids(payload, review, context)
+
+        self.assertEqual(payload["message_ids"], ["m1", "m2"])
+
+    def test_completed_bot_turn_covers_following_fragment(self):
+        configured = fragment_settings(bot_qq="999")
+        with patch.object(server, "settings", configured):
+            server.clear_chat_state()
+            server.record_group_chat_message(
+                100,
+                "999",
+                "合并回答",
+                1002,
+                message_id="bot-1",
+                generated_for_message_ids=("m1", "m2"),
+            )
+
+            self.assertTrue(server.message_already_covered_by_bot(100, "m2"))
+            self.assertFalse(server.message_already_covered_by_bot(100, "m3"))
+
     def test_semantic_classifier_parses_structured_result(self):
         with patch.object(
             llm,

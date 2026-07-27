@@ -1878,6 +1878,7 @@ def review_and_refresh_answer(
     admin: bool,
     deadline: float,
     baseline_revision: int | None = None,
+    target_item: dict | None = None,
 ) -> tuple[str, str, int]:
     original_context = tuple(decision.chat_context)
     candidate = answer
@@ -1936,11 +1937,16 @@ def review_and_refresh_answer(
             reply_mode=decision.reply_mode,
             mentioned=mentioned,
             topic_summary=decision.semantic_topic,
+            original_message_ids=_message_ids(target_item or {}),
+            knowledge_sources=decision.sources,
+            retrieval_score=decision.retrieval_score,
+            retrieval_coverage=decision.retrieval_coverage,
             allow_regenerate=not regenerated,
             timeout=review_timeout,
         )
         if not review or review.confidence < 0.6:
             return "", "final review unavailable or low confidence", latest_revision
+        merge_review_message_ids(target_item, review, latest_context)
         if review.action == "drop":
             return "", f"final review dropped [{review.context_relation}]: {review.reason}", latest_revision
         if review.action == "revise":
@@ -1995,6 +2001,7 @@ def refresh_answer_for_late_context(
     admin: bool,
     deadline: float,
     reviewed_revision: int,
+    target_item: dict | None = None,
 ) -> tuple[str, str, int]:
     """Re-review only when messages arrived after the previous review."""
     latest_revision = latest_group_user_sequence(group_id)
@@ -2009,6 +2016,7 @@ def refresh_answer_for_late_context(
         admin=admin,
         deadline=deadline,
         baseline_revision=reviewed_revision,
+        target_item=target_item,
     )
     if refreshed_answer:
         unsafe_reason = unsafe_or_repeated_reply(group_id, refreshed_answer)
@@ -3504,6 +3512,56 @@ def bot_turn_metadata(item: dict, bot_message_id) -> tuple[tuple[str, ...], str]
     return trigger_ids, turn_id
 
 
+def message_already_covered_by_bot(group_id: int, message_id) -> bool:
+    """Return whether a completed bot turn already covers this incoming message."""
+    target = str(message_id or "").strip()
+    if not target:
+        return False
+    with chat_history_lock:
+        return any(
+            entry.user_id == str(settings.bot_qq or "")
+            and entry.message_status == "active"
+            and target in entry.generated_for_message_ids
+            for entry in group_chat_history.get(int(group_id), ())
+        )
+
+
+def _context_message_speakers(context: Sequence[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in context:
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        message_id = str(payload.get("message_id") or "").strip()
+        if message_id:
+            speaker = payload.get("speaker") if isinstance(payload.get("speaker"), dict) else {}
+            result[message_id] = str(speaker.get("id") or "").strip()
+    return result
+
+
+def merge_review_message_ids(item: dict | None, review, latest_context: Sequence[str]) -> None:
+    """Attach only real context message IDs selected by the semantic reviewer."""
+    if item is None:
+        return
+    existing = _message_ids(item)
+    context_speakers = _context_message_speakers(latest_context)
+    original_speakers = {
+        context_speakers[message_id]
+        for message_id in existing
+        if context_speakers.get(message_id)
+    }
+    for message_id in review.related_message_ids:
+        value = str(message_id or "").strip()
+        same_sender = bool(
+            original_speakers
+            and context_speakers.get(value) in original_speakers
+        )
+        if value and same_sender and value not in existing:
+            existing.append(value)
+    item["message_ids"] = existing
+
+
 def _new_fragment_buffer(item: dict, audience: str, now: float) -> MessageFragmentBuffer:
     buffered_item = dict(item)
     buffered_item["message_ids"] = _message_ids(item)
@@ -4410,6 +4468,18 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
                 continue
 
+            if message_already_covered_by_bot(group_id, item.get("message_id")):
+                write_message_audit(
+                    decision="skipped",
+                    reason="message already covered by an earlier bot turn",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    event_time=event_time,
+                )
+                continue
+
             if is_message_too_old(
                 event_time,
                 mentioned,
@@ -4690,6 +4760,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     admin=admin_user,
                     deadline=deadline,
                     baseline_revision=baseline_revision,
+                    target_item=item,
                 )
                 if not answer:
                     write_message_audit(
@@ -4799,6 +4870,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     admin=admin_user,
                     deadline=deadline,
                     reviewed_revision=reviewed_revision,
+                    target_item=item,
                 )
                 if not answer:
                     write_message_audit(
@@ -4819,6 +4891,19 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     )
                     model_latency_ms = int((time.monotonic() - model_started) * 1000)
             with group_send_lock(group_id):
+                if message_already_covered_by_bot(group_id, item.get("message_id")):
+                    write_message_audit(
+                        decision="skipped",
+                        reason="message covered while waiting to send",
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        mentioned=mentioned,
+                        reply_mode=decision.reply_mode,
+                        model_latency_ms=model_latency_ms,
+                        event_time=event_time,
+                    )
+                    continue
                 if (
                     decision.reply_mode not in {"bot_meta", "identity"}
                     and latest_group_user_sequence(group_id) > reviewed_revision
@@ -5146,6 +5231,7 @@ def chat_worker() -> None:
                 admin=False,
                 deadline=deadline,
                 baseline_revision=baseline_revision,
+                target_item=item,
             )
             model_latency_ms = routing_latency_ms + int(
                 (time.monotonic() - model_started) * 1000
@@ -5258,6 +5344,7 @@ def chat_worker() -> None:
                 admin=False,
                 deadline=deadline,
                 reviewed_revision=reviewed_revision,
+                target_item=item,
             )
             if not answer:
                 write_message_audit(
@@ -5288,6 +5375,18 @@ def chat_worker() -> None:
                     write_message_audit(
                         decision="skipped",
                         reason=f"{quota_reason} while waiting for group send lock",
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        reply_mode="chat",
+                        model_latency_ms=model_latency_ms,
+                        event_time=event_time,
+                    )
+                    continue
+                if message_already_covered_by_bot(group_id, item.get("message_id")):
+                    write_message_audit(
+                        decision="skipped",
+                        reason="message covered while waiting to send",
                         group_id=group_id,
                         user_id=user_id,
                         question=question,
