@@ -1153,7 +1153,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
-        with patch.object(llm, "_chat_completion", return_value=response):
+        with patch.object(llm, "_chat_completion", return_value=response) as completion:
             review = review_candidate_reply(
                 base_url="https://example.invalid",
                 api_key="key",
@@ -1164,11 +1164,16 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 latest_context=("群友A：这个怎么弄", "群友A：但是我没有管理员权限"),
                 reply_mode="fallback",
                 mentioned=True,
+                semantic_context=(
+                    "机器人参与关系：subject\n要求回复视角：first_person"
+                ),
             )
 
         self.assertIsNotNone(review)
         self.assertEqual(review.action, "regenerate")
         self.assertIn("新限制条件", review.updated_question)
+        review_input = completion.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("要求回复视角：first_person", review_input)
 
     def test_review_regenerates_at_most_once(self) -> None:
         configured = routing_settings(

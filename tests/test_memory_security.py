@@ -87,6 +87,33 @@ class MemorySecurityTests(unittest.TestCase):
         self.assertIn("历史群聊候选", planner_prompt)
         self.assertIn('"chunk_id": 42', planner_prompt)
 
+    def test_server_passes_scene_snapshot_to_semantic_planner(self):
+        configured = SimpleNamespace(
+            semantic_planner_enabled=True,
+            bot_qq="999",
+            llm_base_url="https://example.invalid",
+            llm_api_key="key",
+            llm_model="model",
+            semantic_planner_model="planner",
+            semantic_planner_timeout_seconds=4,
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "plan_group_message") as planner,
+        ):
+            server.semantic_plan_for_message(
+                "我又优化了，大家再试试",
+                ('{"message_id":"current","current":true}',),
+                scene_context='{"topics":[{"summary":"当前机器人优化"}]}',
+                mentioned=False,
+                mentions_other=False,
+            )
+
+        self.assertEqual(
+            planner.call_args.kwargs["scene_context"],
+            '{"topics":[{"summary":"当前机器人优化"}]}',
+        )
+
     def test_planner_parses_multiple_topic_candidates_with_real_anchors(self):
         payload = {
             "audience": "group",
@@ -134,6 +161,197 @@ class MemorySecurityTests(unittest.TestCase):
         self.assertEqual(plan.topic_candidates[0].anchor_message_ids, ("m1",))
         self.assertEqual(plan.topic_candidates[1].label, "周五聚餐")
         self.assertEqual(plan.topic_candidates[1].basis, "bridge")
+
+    def test_planner_parses_subject_candidates_and_scene_evidence(self):
+        payload = {
+            "audience": "group",
+            "intent": "normal_chat",
+            "reply_worthy": True,
+            "standalone_question": "我又优化了机器人，大家再试试",
+            "implicit_meaning": "邀请群友继续测试当前机器人",
+            "topic_summary": "机器人优化测试",
+            "subject_candidates": [
+                {
+                    "entity_type": "bot",
+                    "entity_id": "invented",
+                    "label": "当前机器人",
+                    "confidence": 0.92,
+                    "evidence_message_ids": ["bot-turn", "scene-anchor", "missing"],
+                }
+            ],
+            "subject_ambiguity": "clear",
+            "capability": "none",
+            "draft_reply": "行，拿我再测几轮。",
+            "confidence": 0.94,
+        }
+        context = (
+            json.dumps({
+                "message_id": "bot-turn",
+                "speaker": {"id": "bot", "role": "bot"},
+            }),
+            json.dumps({
+                "message_id": "current",
+                "current": True,
+                "speaker": {"id": "member_owner", "role": "member"},
+            }),
+        )
+        scene = json.dumps({
+            "topics": [{
+                "participants": ["bot", "member_owner"],
+                "anchor_message_ids": ["scene-anchor"],
+            }]
+        })
+        with patch.object(llm, "_chat_completion", return_value=json.dumps(payload)) as completion:
+            plan = llm.plan_group_message(
+                base_url="https://example.invalid",
+                api_key="key",
+                model="model",
+                message="我又做了优化，大伙还可以再来试试",
+                context=context,
+                scene_context=scene,
+                mentioned=False,
+                mentions_other=False,
+            )
+
+        self.assertEqual(plan.subject_ambiguity, "clear")
+        self.assertEqual(plan.subject_candidates[0].entity_type, "bot")
+        self.assertEqual(plan.subject_candidates[0].entity_id, "bot")
+        self.assertEqual(
+            plan.subject_candidates[0].evidence_message_ids,
+            ("bot-turn", "scene-anchor"),
+        )
+        planner_input = completion.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("滚动场景快照", planner_input)
+        self.assertIn("scene-anchor", planner_input)
+
+    def test_subject_relation_derives_safe_reply_perspective(self):
+        bot_subject = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="继续测试当前机器人",
+            implicit_meaning="",
+            topic_summary="机器人测试",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            subject_candidates=(
+                llm.SubjectCandidate(
+                    "bot",
+                    "当前机器人",
+                    0.92,
+                    evidence_message_ids=("bot-turn",),
+                ),
+            ),
+            subject_ambiguity="clear",
+        )
+        external_bot = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="学校群里的机器人上下文很好",
+            implicit_meaning="",
+            topic_summary="外部机器人",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            subject_candidates=(
+                llm.SubjectCandidate("external_project", "学校群机器人", 0.94),
+            ),
+            subject_ambiguity="clear",
+        )
+        ambiguous = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="又优化了",
+            implicit_meaning="",
+            topic_summary="不明确的优化对象",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.8,
+            subject_candidates=(
+                llm.SubjectCandidate("external_project", "某个项目", 0.65),
+                llm.SubjectCandidate("bot", "当前机器人", 0.6),
+            ),
+            subject_ambiguity="ambiguous",
+        )
+
+        self.assertEqual(
+            server.derive_bot_reply_perspective(bot_subject, ()),
+            ("subject", "first_person"),
+        )
+        self.assertEqual(
+            server.derive_bot_reply_perspective(external_bot, ()),
+            ("observer", "observer"),
+        )
+        self.assertEqual(
+            server.derive_bot_reply_perspective(ambiguous, ()),
+            ("uncertain", "neutral"),
+        )
+
+    def test_possible_bot_subject_preserves_recent_bot_turn(self):
+        plan = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="再测试当前机器人",
+            implicit_meaning="",
+            topic_summary="机器人测试",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            relevant_context_message_ids=("current",),
+            subject_candidates=(
+                llm.SubjectCandidate("bot", "当前机器人", 0.6),
+            ),
+            subject_ambiguity="ambiguous",
+        )
+        bot_line = json.dumps({
+            "message_id": "bot-turn",
+            "speaker": {"id": "bot", "role": "bot"},
+        })
+        current_line = json.dumps({
+            "message_id": "current",
+            "current": True,
+            "speaker": {"id": "member_owner", "role": "member"},
+        })
+
+        selected = server.context_selected_by_plan((bot_line, current_line), plan)
+
+        self.assertEqual(selected, (bot_line, current_line))
+
+    def test_ambiguous_subject_clears_committed_planner_draft(self):
+        plan = llm.MessagePlan(
+            audience="group",
+            intent="normal_chat",
+            reply_worthy=True,
+            standalone_question="又优化了，大家再试试",
+            implicit_meaning="优化对象不明确",
+            topic_summary="项目优化",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.85,
+            draft_reply="好，我待会儿去试试看。",
+            subject_candidates=(
+                llm.SubjectCandidate("external_project", "某个项目", 0.65),
+                llm.SubjectCandidate("bot", "当前机器人", 0.6),
+            ),
+            subject_ambiguity="ambiguous",
+        )
+        decision = server.ProcessingDecision(
+            True,
+            "semantic plan: chat candidate",
+            reply_mode="chat",
+            draft_reply=plan.draft_reply,
+        )
+
+        server.apply_semantic_plan_metadata(decision, plan)
+
+        self.assertEqual(decision.bot_involvement, "uncertain")
+        self.assertEqual(decision.reply_perspective, "neutral")
+        self.assertEqual(decision.draft_reply, "")
+        self.assertIn("self_identity", decision.risk_flags)
 
     def test_clear_requires_same_admin_confirmation_within_window(self):
         store = SimpleNamespace(clear_group=Mock())

@@ -21,6 +21,7 @@ from .knowledge import ContextResult, KnowledgeBase
 from .llm import (
     MessagePlan,
     SemanticTopicCandidate,
+    SubjectCandidate,
     analyze_chat_scene,
     answer_chat,
     ask_fallback_llm,
@@ -129,6 +130,10 @@ class ProcessingDecision:
     self_history_selected_message_ids: tuple[str, ...] = ()
     self_history_reasons: tuple[str, ...] = ()
     reply_regenerated: bool = False
+    subject_candidates: tuple[SubjectCandidate, ...] = ()
+    subject_ambiguity: str = "unknown"
+    bot_involvement: str = "uncertain"
+    reply_perspective: str = "neutral"
 
 
 @dataclass(frozen=True)
@@ -752,6 +757,10 @@ def write_message_audit(
     capability: str = "none",
     semantic_confidence: float = 0.0,
     topic_candidates: Sequence[SemanticTopicCandidate] = (),
+    subject_candidates: Sequence[SubjectCandidate] = (),
+    subject_ambiguity: str = "unknown",
+    bot_involvement: str = "uncertain",
+    reply_perspective: str = "neutral",
     memory_query: str = "",
     memory_hit_count: int = 0,
     memory_retrieval_attempted: bool = False,
@@ -824,6 +833,19 @@ def write_message_audit(
             }
             for candidate in topic_candidates
         ],
+        "subject_candidates": [
+            {
+                "entity_type": candidate.entity_type,
+                "entity_id": candidate.entity_id,
+                "label": candidate.label,
+                "confidence": round(candidate.confidence, 4),
+                "evidence_message_ids": list(candidate.evidence_message_ids),
+            }
+            for candidate in subject_candidates
+        ],
+        "subject_ambiguity": subject_ambiguity,
+        "bot_involvement": bot_involvement,
+        "reply_perspective": reply_perspective,
         "scene_version": int(scene_payload.get("version") or 0) if isinstance(scene_payload, dict) else 0,
         "scene_updated_through_sequence": (
             int(scene_payload.get("updated_through_sequence") or 0)
@@ -1796,6 +1818,10 @@ def review_and_refresh_answer(
             or decision.reply_mode == "fallback"
             or (
                 decision.reply_mode == "chat"
+                and decision.reply_perspective in {"first_person", "neutral"}
+            )
+            or (
+                decision.reply_mode == "chat"
                 and (
                     decision.semantic_intent != "normal_chat"
                     or decision.semantic_confidence < 0.8
@@ -1826,6 +1852,7 @@ def review_and_refresh_answer(
             reply_mode=decision.reply_mode,
             mentioned=mentioned,
             topic_summary=decision.semantic_topic,
+            semantic_context=semantic_context_for_decision(decision),
             original_message_ids=_message_ids(target_item or {}),
             knowledge_sources=decision.sources,
             retrieval_score=decision.retrieval_score,
@@ -2428,6 +2455,7 @@ def semantic_plan_for_message(
     question: str,
     chat_context: Sequence[str],
     *,
+    scene_context: str = "",
     memory_candidates: Sequence[str] = (),
     mentioned: bool,
     mentions_other: bool,
@@ -2448,6 +2476,7 @@ def semantic_plan_for_message(
         model=getattr(settings, "semantic_planner_model", settings.llm_model),
         message=question,
         context=tuple(chat_context),
+        scene_context=scene_context,
         memory_candidates=tuple(memory_candidates),
         mentioned=mentioned,
         mentions_other=mentions_other,
@@ -2492,6 +2521,19 @@ def context_selected_by_plan(
     required_ids.update(reply_ids)
     for candidate in plan.topic_candidates:
         required_ids.update(candidate.anchor_message_ids)
+    for candidate in plan.subject_candidates:
+        required_ids.update(candidate.evidence_message_ids)
+    bot_is_possible_subject = any(
+        candidate.entity_type == "bot" and candidate.confidence >= 0.5
+        for candidate in plan.subject_candidates
+    )
+    if bot_is_possible_subject:
+        required_ids.update(
+            message_id
+            for line in chat_context
+            if (context_line_payload(line).get("speaker") or {}).get("role") == "bot"
+            if (message_id := context_line_message_id(line))
+        )
     changed = True
     while changed:
         changed = False
@@ -2590,7 +2632,78 @@ def semantic_context_for_decision(decision: ProcessingDecision) -> str:
             for candidate in decision.topic_candidates
         )
         parts.append(f"候选话题：{candidates}")
+    if decision.semantic_intent or decision.subject_candidates:
+        parts.append(f"讨论对象状态：{decision.subject_ambiguity}")
+        parts.append(f"机器人参与关系：{decision.bot_involvement}")
+        parts.append(f"要求回复视角：{decision.reply_perspective}")
+    if decision.subject_candidates:
+        subjects = "；".join(
+            (
+                f"{candidate.label}（类型 {candidate.entity_type}，"
+                f"置信度 {candidate.confidence:.2f}）"
+            )
+            for candidate in decision.subject_candidates
+        )
+        parts.append(f"讨论对象候选：{subjects}")
     return "\n".join(parts)
+
+
+def derive_bot_reply_perspective(
+    plan: MessagePlan,
+    selected_context: Sequence[str],
+) -> tuple[str, str]:
+    candidates = sorted(
+        plan.subject_candidates,
+        key=lambda candidate: candidate.confidence,
+        reverse=True,
+    )
+    top = candidates[0] if candidates else None
+    bot_candidate = next(
+        (candidate for candidate in candidates if candidate.entity_type == "bot"),
+        None,
+    )
+    if (
+        bot_candidate
+        and bot_candidate.confidence >= 0.72
+        and plan.subject_ambiguity == "clear"
+        and (top is bot_candidate or bot_candidate.confidence >= top.confidence)
+        and (bool(bot_candidate.evidence_message_ids) or plan.audience == "bot")
+    ):
+        return "subject", "first_person"
+    if bot_candidate and bot_candidate.confidence >= 0.5:
+        return "uncertain", "neutral"
+
+    bot_participated = any(
+        (context_line_payload(line).get("speaker") or {}).get("role") == "bot"
+        for line in selected_context
+    )
+    if plan.subject_ambiguity != "clear" or not top or top.confidence < 0.72:
+        return "uncertain", "neutral"
+    if bot_participated:
+        return "participant", "observer"
+    return "observer", "observer"
+
+
+def apply_semantic_plan_metadata(
+    decision: ProcessingDecision,
+    plan: MessagePlan,
+) -> ProcessingDecision:
+    decision.risk_flags = plan.risk_flags
+    decision.topic_candidates = plan.topic_candidates
+    decision.subject_candidates = plan.subject_candidates
+    decision.subject_ambiguity = plan.subject_ambiguity
+    (
+        decision.bot_involvement,
+        decision.reply_perspective,
+    ) = derive_bot_reply_perspective(plan, decision.chat_context)
+    if decision.bot_involvement in {"subject", "uncertain"}:
+        decision.risk_flags = tuple(dict.fromkeys(
+            (*decision.risk_flags, "self_identity")
+        ))
+    if decision.reply_perspective == "neutral":
+        # The planner draft may already have committed to the wrong referent.
+        decision.draft_reply = ""
+    return decision
 
 
 def chat_memory_enabled_for_group(group_id: int) -> bool:
@@ -2900,6 +3013,10 @@ def enrich_decision_with_chat_memory(
             self_history_selected_message_ids=decision.self_history_selected_message_ids,
             self_history_reasons=decision.self_history_reasons,
             topic_candidates=decision.topic_candidates,
+            subject_candidates=decision.subject_candidates,
+            subject_ambiguity=decision.subject_ambiguity,
+            bot_involvement=decision.bot_involvement,
+            reply_perspective=decision.reply_perspective,
             event_time=item.get("time"),
         )
     return decision
@@ -3896,6 +4013,7 @@ def should_process_message(
     followup_scope: str = "",
     group_id: int = 0,
     chat_context: Sequence[str] = (),
+    scene_context: str = "",
     memory_candidates: Sequence[str] = (),
     mentions_other: bool = False,
     reply_target_user_id: str = "",
@@ -3935,6 +4053,7 @@ def should_process_message(
     plan = semantic_plan_for_message(
         normalized,
         chat_context,
+        scene_context=scene_context,
         memory_candidates=memory_candidates,
         mentioned=mentioned,
         mentions_other=mentions_other,
@@ -4506,6 +4625,10 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 )
             )
             item["_recent_context_candidate_count"] = len(item["chat_context"])
+            planner_scene_context = current_group_chat_scene(
+                group_id,
+                focus_sequence=int(item.get("chat_sequence") or 0),
+            )
             followup_match = followup_context_for(
                 group_id,
                 user_id,
@@ -4544,6 +4667,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 followup_scope=followup_match.scope if followup_match else "",
                 group_id=group_id,
                 chat_context=tuple(item.get("chat_context") or ()),
+                scene_context=planner_scene_context,
                 memory_candidates=memory_probe.context,
                 mentions_other=bool(item.get("mentions_other")),
                 reply_target_user_id=str(item.get("reply_target_user_id") or ""),
@@ -4556,8 +4680,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 item.get("_recent_context_candidate_count") or len(item.get("chat_context") or ())
             )
             if selected_plan:
-                decision.risk_flags = selected_plan[0].risk_flags
-                decision.topic_candidates = selected_plan[0].topic_candidates
+                decision = apply_semantic_plan_metadata(decision, selected_plan[0])
             decision = enrich_decision_with_chat_memory(
                 decision,
                 item,
@@ -4586,6 +4709,12 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     implicit_meaning=decision.implicit_meaning,
                     capability=decision.capability,
                     semantic_confidence=decision.semantic_confidence,
+                    topic_candidates=decision.topic_candidates,
+                    subject_candidates=decision.subject_candidates,
+                    subject_ambiguity=decision.subject_ambiguity,
+                    bot_involvement=decision.bot_involvement,
+                    reply_perspective=decision.reply_perspective,
+                    scene_context=planner_scene_context,
                     self_history_candidate_count=decision.self_history_candidate_count,
                     self_history_selected_count=decision.self_history_selected_count,
                     self_history_chars=decision.self_history_chars,
@@ -4874,6 +5003,10 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 capability=decision.capability,
                 semantic_confidence=decision.semantic_confidence,
                 topic_candidates=decision.topic_candidates,
+                subject_candidates=decision.subject_candidates,
+                subject_ambiguity=decision.subject_ambiguity,
+                bot_involvement=decision.bot_involvement,
+                reply_perspective=decision.reply_perspective,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
@@ -5352,6 +5485,10 @@ def chat_worker() -> None:
                 capability=decision.capability,
                 semantic_confidence=decision.semantic_confidence,
                 topic_candidates=decision.topic_candidates,
+                subject_candidates=decision.subject_candidates,
+                subject_ambiguity=decision.subject_ambiguity,
+                bot_involvement=decision.bot_involvement,
+                reply_perspective=decision.reply_perspective,
                 self_history_candidate_count=decision.self_history_candidate_count,
                 self_history_selected_count=decision.self_history_selected_count,
                 self_history_chars=decision.self_history_chars,
