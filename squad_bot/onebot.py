@@ -21,6 +21,31 @@ def extract_plain_text(message) -> str:
     return "".join(parts).strip()
 
 
+def extract_context_text(message) -> str:
+    """Keep lightweight media placeholders so non-text turns remain in context."""
+    if not isinstance(message, list):
+        return extract_plain_text(message)
+    labels = {
+        "image": "[图片]",
+        "face": "[表情]",
+        "mface": "[表情]",
+        "video": "[视频]",
+        "record": "[语音]",
+        "file": "[文件]",
+        "json": "[卡片消息]",
+    }
+    parts: list[str] = []
+    for segment in message:
+        if not isinstance(segment, dict):
+            continue
+        kind = str(segment.get("type") or "")
+        if kind == "text":
+            parts.append(str(segment.get("data", {}).get("text", "")))
+        elif kind in labels:
+            parts.append(labels[kind])
+    return " ".join(part.strip() for part in parts if part.strip()).strip()
+
+
 def extract_reply_message_id(message) -> str:
     if isinstance(message, list):
         for segment in message:

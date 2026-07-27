@@ -128,6 +128,23 @@ class Settings:
     followup_mention_seconds: int = int(os.getenv("FOLLOWUP_MENTION_SECONDS", "180"))
     message_audit_log: str = os.getenv("MESSAGE_AUDIT_LOG", "work/message_audit.jsonl")
     pending_queue_db: str = os.getenv("PENDING_QUEUE_DB", "work/pending_queue.sqlite3")
+    chat_memory_enabled: bool = os.getenv("CHAT_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    chat_memory_db: str = os.getenv("CHAT_MEMORY_DB", "work/chat_memory.sqlite3")
+    chat_memory_shadow_mode: bool = os.getenv("CHAT_MEMORY_SHADOW_MODE", "false").lower() in {"1", "true", "yes", "on"}
+    chat_memory_allowed_group_ids: tuple[str, ...] = tuple(
+        group_id.strip()
+        for group_id in os.getenv("CHAT_MEMORY_ALLOWED_GROUP_IDS", "").split(",")
+        if group_id.strip()
+    )
+    chat_memory_max_hits: int = int(os.getenv("CHAT_MEMORY_MAX_HITS", "6"))
+    chat_memory_max_chars: int = int(os.getenv("CHAT_MEMORY_MAX_CHARS", "2400"))
+    chat_memory_retention_days: int = int(os.getenv("CHAT_MEMORY_RETENTION_DAYS", "90"))
+    chat_memory_embedding_provider: str = os.getenv("CHAT_MEMORY_EMBEDDING_PROVIDER", "hashed")
+    chat_memory_embedding_base_url: str = os.getenv("CHAT_MEMORY_EMBEDDING_BASE_URL", "")
+    chat_memory_embedding_api_key: str = os.getenv("CHAT_MEMORY_EMBEDDING_API_KEY", "")
+    chat_memory_embedding_model: str = os.getenv("CHAT_MEMORY_EMBEDDING_MODEL", "")
+    chat_memory_embedding_dimensions: int = int(os.getenv("CHAT_MEMORY_EMBEDDING_DIMENSIONS", "384"))
+    chat_memory_embedding_timeout_seconds: int = int(os.getenv("CHAT_MEMORY_EMBEDDING_TIMEOUT_SECONDS", "15"))
     auto_reply_enabled: bool = os.getenv("AUTO_REPLY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     llm_fallback_enabled: bool = os.getenv("LLM_FALLBACK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     fallback_only_when_mentioned: bool = os.getenv("FALLBACK_ONLY_WHEN_MENTIONED", "true").lower() in {"1", "true", "yes", "on"}

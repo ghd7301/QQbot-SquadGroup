@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from squad_bot.onebot import (
+    extract_context_text,
     extract_mentioned_user_ids,
     extract_plain_text,
     extract_reply_message_id,
@@ -29,6 +30,14 @@ class FakeResponse:
 
 
 class ReplyDetectionTests(unittest.TestCase):
+    def test_context_text_preserves_media_placeholders(self) -> None:
+        message = [
+            {"type": "text", "data": {"text": "看这个"}},
+            {"type": "image", "data": {"file": "secret.jpg"}},
+            {"type": "face", "data": {"id": "1"}},
+        ]
+        self.assertEqual(extract_context_text(message), "看这个 [图片] [表情]")
+
     def test_extracts_other_mentions_without_bot_or_all(self):
         segments = [
             {"type": "at", "data": {"qq": "3119065126"}},

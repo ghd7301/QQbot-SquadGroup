@@ -15,6 +15,8 @@ from typing import Sequence
 from urllib.parse import parse_qs
 
 from .config import settings
+from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryMessage
+from .embedding import build_embedding_provider
 from .knowledge import KnowledgeBase
 from .llm import (
     MessagePlan,
@@ -34,6 +36,7 @@ from .llm import (
 )
 from .onebot import (
     extract_mentioned_user_ids,
+    extract_context_text,
     extract_plain_text,
     extract_reply_message_id,
     get_message_info,
@@ -72,9 +75,12 @@ chat_scene_pending_messages: dict[int, int] = {}
 chat_scene_running: set[int] = set()
 hostile_reply_lock = threading.Lock()
 hostile_reply_history: dict[tuple[int, str], list[float]] = {}
+memory_clear_confirmations: dict[tuple[int, str], float] = {}
 fragment_condition = threading.Condition()
 group_fragment_buffers: dict[int, "MessageFragmentBuffer"] = {}
 ready_fragment_buffers: list["MessageFragmentBuffer"] = []
+chat_memory_manager: ChatMemoryManager | None = None
+chat_history_save_event = threading.Event()
 
 
 @dataclass
@@ -96,6 +102,10 @@ class ProcessingDecision:
     capability: str = "none"
     draft_reply: str = ""
     semantic_confidence: float = 0.0
+    memory_context: tuple[str, ...] = ()
+    memory_query: str = ""
+    memory_needed: bool = False
+    memory_hit_count: int = 0
 
 
 @dataclass
@@ -737,6 +747,17 @@ COMMAND_ALIASES = {
     "关闭自动回复": "auto_reply_off",
     "关掉自动回复": "auto_reply_off",
     "auto off": "auto_reply_off",
+    "聊天记忆状态": "memory_status",
+    "记忆状态": "memory_status",
+    "memory status": "memory_status",
+    "暂停聊天记忆": "memory_pause",
+    "memory pause": "memory_pause",
+    "恢复聊天记忆": "memory_resume",
+    "memory resume": "memory_resume",
+    "重建聊天记忆": "memory_rebuild",
+    "memory rebuild": "memory_rebuild",
+    "清空本群聊天记忆": "memory_clear_request",
+    "清空本群聊天记忆 确认": "memory_clear_confirm",
 }
 
 
@@ -791,6 +812,8 @@ def write_message_audit(
     implicit_meaning: str = "",
     capability: str = "none",
     semantic_confidence: float = 0.0,
+    memory_query: str = "",
+    memory_hit_count: int = 0,
     event_time=None,
 ) -> None:
     try:
@@ -827,6 +850,8 @@ def write_message_audit(
         "implicit_meaning": implicit_meaning,
         "capability": capability,
         "semantic_confidence": round(float(semantic_confidence), 4),
+        "memory_query": memory_query,
+        "memory_hit_count": int(memory_hit_count),
     }
     log_path = Path(settings.message_audit_log)
     try:
@@ -908,7 +933,7 @@ def recent_audit_entries(limit: int = 5) -> list[dict]:
     return entries
 
 
-def answer_admin_command(command: str) -> str:
+def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") -> str:
     global auto_reply_enabled
     if command == "reload":
         with kb_lock:
@@ -944,6 +969,42 @@ def answer_admin_command(command: str) -> str:
     if command == "auto_reply_off":
         auto_reply_enabled = False
         return "自动回复已关闭。被 @ 时仍可回答。"
+    if command == "memory_status":
+        if not chat_memory_manager:
+            return "聊天记忆没有启用。"
+        status = chat_memory_manager.status()
+        state = "暂停" if status["paused"] else "运行"
+        return (
+            f"聊天记忆{state}，消息 {status['messages']} 条，片段 {status['chunks']} 个，"
+            f"待索引 {status['queued']} 条，向量方式 {status['provider']}。"
+        )
+    if command == "memory_pause":
+        if not chat_memory_manager:
+            return "聊天记忆没有启用。"
+        chat_memory_manager.paused.set()
+        return "聊天记忆索引已暂停，现有短期上下文仍然可用。"
+    if command == "memory_resume":
+        if not chat_memory_manager:
+            return "聊天记忆没有启用。"
+        chat_memory_manager.paused.clear()
+        return "聊天记忆索引已恢复。"
+    if command == "memory_rebuild":
+        if not chat_memory_manager:
+            return "聊天记忆没有启用。"
+        chat_memory_manager.enqueue_rebuild(group_id)
+        return "已安排重建本群聊天记忆索引。"
+    if command == "memory_clear_request":
+        memory_clear_confirmations[(group_id, str(user_id))] = time.time() + 60
+        return "这是不可恢复操作。确认要清空本群聊天记忆，请发送：清空本群聊天记忆 确认"
+    if command == "memory_clear_confirm":
+        if not chat_memory_manager:
+            return "聊天记忆没有启用。"
+        key = (group_id, str(user_id))
+        expires_at = memory_clear_confirmations.pop(key, 0)
+        if time.time() > expires_at:
+            return "确认已失效，请先发送：清空本群聊天记忆"
+        chat_memory_manager.store.clear_group(group_id)
+        return "本群聊天记忆已清空。"
     return "未知维护命令。"
 
 
@@ -1223,7 +1284,25 @@ def record_group_chat_message(
         if window > 0:
             history[:] = [item for item in history if timestamp - item.timestamp <= window]
         history[:] = history[-max(max_messages * 4, 24):]
-        return entry.sequence
+        sequence = entry.sequence
+    if chat_memory_manager:
+        speaker_id = stable_member_id(group_id, entry.user_id)
+        chat_memory_manager.enqueue(
+            MemoryMessage(
+                group_id=group_id,
+                message_id=entry.message_id or f"local:{group_id}:{sequence}",
+                speaker_id=speaker_id,
+                display_name=entry.display_name if speaker_id != "bot" else "机器人",
+                speaker_role="bot" if speaker_id == "bot" else "member",
+                text=entry.text,
+                event_time=entry.timestamp,
+                reply_message_id=entry.reply_message_id,
+                reply_speaker_id=stable_member_id(group_id, entry.reply_target_user_id),
+                quoted_text=entry.reply_text,
+                mentions=tuple(stable_member_id(group_id, value) for value in entry.mentioned_user_ids),
+            )
+        )
+    return sequence
 
 
 def find_group_chat_message(group_id: int, message_id: str) -> GroupChatMessage | None:
@@ -1729,6 +1808,50 @@ def save_chat_history(path: str | Path | None = None) -> None:
         print("Save chat history failed:", repr(exc))
 
 
+def schedule_chat_history_save() -> None:
+    chat_history_save_event.set()
+
+
+def chat_history_save_worker() -> None:
+    while True:
+        chat_history_save_event.wait()
+        time.sleep(0.5)
+        chat_history_save_event.clear()
+        save_chat_history()
+
+
+def initialize_chat_memory() -> bool:
+    global chat_memory_manager
+    if not getattr(settings, "chat_memory_enabled", True):
+        return False
+    try:
+        store = ChatMemoryStore(
+            getattr(settings, "chat_memory_db", "work/chat_memory.sqlite3"),
+            build_embedding_provider(settings),
+        )
+        chat_memory_manager = ChatMemoryManager(
+            store,
+            retention_days=max(0, getattr(settings, "chat_memory_retention_days", 90)),
+        )
+        chat_memory_manager.start()
+        return True
+    except Exception as exc:
+        chat_memory_manager = None
+        print("Chat memory initialization failed:", type(exc).__name__, repr(exc))
+        return False
+
+
+def recall_group_chat_message(group_id: int, message_id: str) -> None:
+    target = str(message_id or "").strip()
+    if not target:
+        return
+    with chat_history_lock:
+        history = group_chat_history.get(group_id, [])
+        history[:] = [item for item in history if item.message_id != target]
+    if chat_memory_manager:
+        chat_memory_manager.enqueue_recall(group_id, target)
+
+
 def load_chat_history(path: str | Path | None = None) -> int:
     """Load persisted chat history on startup."""
     global chat_message_sequence
@@ -1764,6 +1887,34 @@ def load_chat_history(path: str | Path | None = None) -> int:
     except Exception as exc:
         print("Load chat history failed:", repr(exc))
         return 0
+
+
+def migrate_loaded_chat_history_to_memory() -> int:
+    if not chat_memory_manager:
+        return 0
+    with chat_history_lock:
+        snapshot = [
+            (group_id, item)
+            for group_id, messages in group_chat_history.items()
+            for item in messages
+        ]
+    queued = 0
+    for group_id, item in snapshot:
+        speaker_id = stable_member_id(group_id, item.user_id)
+        queued += int(chat_memory_manager.enqueue(MemoryMessage(
+            group_id=group_id,
+            message_id=item.message_id or f"local:{group_id}:{item.sequence}",
+            speaker_id=speaker_id,
+            display_name=item.display_name if speaker_id != "bot" else "机器人",
+            speaker_role="bot" if speaker_id == "bot" else "member",
+            text=item.text,
+            event_time=item.timestamp,
+            reply_message_id=item.reply_message_id,
+            reply_speaker_id=stable_member_id(group_id, item.reply_target_user_id),
+            quoted_text=item.reply_text,
+            mentions=tuple(stable_member_id(group_id, value) for value in item.mentioned_user_ids),
+        )))
+    return queued
 
 
 def chat_reply_quota_reason(
@@ -2067,6 +2218,65 @@ def semantic_context_for_decision(decision: ProcessingDecision) -> str:
     return "\n".join(parts)
 
 
+def chat_memory_enabled_for_group(group_id: int) -> bool:
+    if not chat_memory_manager or not getattr(settings, "chat_memory_enabled", True):
+        return False
+    allowed = getattr(settings, "chat_memory_allowed_group_ids", ())
+    return not allowed or str(group_id) in allowed
+
+
+def enrich_decision_with_chat_memory(
+    decision: ProcessingDecision,
+    item: dict,
+    plan: MessagePlan | None,
+) -> ProcessingDecision:
+    group_id = int(item.get("group_id") or 0)
+    reply_message_id = str(item.get("reply_message_id") or "")
+    memory_needed = bool(reply_message_id or (plan and plan.memory_needed))
+    decision.memory_needed = memory_needed
+    if not memory_needed or not chat_memory_enabled_for_group(group_id):
+        return decision
+    query = (
+        (plan.memory_query if plan else "")
+        or decision.effective_question
+        or str(item.get("question") or "")
+    )
+    decision.memory_query = query
+    try:
+        hits = chat_memory_manager.store.retrieve(
+            group_id=group_id,
+            query=query,
+            speaker_id=stable_member_id(group_id, str(item.get("user_id") or "")),
+            reply_message_id=reply_message_id,
+            exclude_message_id=str(item.get("message_id") or ""),
+            participant_scope=plan.participant_scope if plan else "reply_chain",
+            time_scope=plan.time_scope if plan else "",
+            limit=max(1, getattr(settings, "chat_memory_max_hits", 6)),
+            max_chars=max(200, getattr(settings, "chat_memory_max_chars", 2400)),
+        )
+        formatted = chat_memory_manager.store.format_hits(hits)
+        decision.memory_hit_count = len(formatted)
+        if getattr(settings, "chat_memory_shadow_mode", False):
+            print("Chat memory shadow", group_id, len(formatted), query[:80])
+            write_message_audit(
+                decision="memory_shadow",
+                reason="long-term chat retrieval shadow result",
+                group_id=group_id,
+                user_id=item.get("user_id"),
+                question=str(item.get("question") or ""),
+                memory_query=query,
+                memory_hit_count=len(formatted),
+                event_time=item.get("time"),
+            )
+        else:
+            decision.memory_context = formatted
+            if formatted:
+                decision.draft_reply = ""
+    except Exception as exc:
+        print("Chat memory retrieval failed:", type(exc).__name__, repr(exc))
+    return decision
+
+
 def answer_bot_meta(capability: str, *, admin: bool) -> str:
     knowledge_path = Path(settings.knowledge_dir)
     files = sorted(path.name for path in knowledge_path.glob("*.md"))
@@ -2104,6 +2314,7 @@ def answer_question(
     retrieval_question: str | None = None,
     allow_fallback: bool = True,
     chat_context: Sequence[str] = (),
+    memory_context: Sequence[str] = (),
     semantic_context: str = "",
     timeout: int | None = None,
 ) -> str:
@@ -2128,6 +2339,7 @@ def answer_question(
                 model=settings.llm_model,
                 question=llm_question,
                 context=tuple(chat_context[-8:]),
+                memory_context=tuple(memory_context),
                 semantic_context=semantic_context,
                 timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
             )
@@ -2141,6 +2353,7 @@ def answer_question(
         question=llm_question,
         context=result.context,
         chat_context=tuple(chat_context[-8:]),
+        memory_context=tuple(memory_context),
         semantic_context=semantic_context,
         timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
     )
@@ -2171,6 +2384,7 @@ def answer_for_decision(
             model=settings.llm_model,
             question=llm_question,
             context=decision.chat_context,
+            memory_context=decision.memory_context,
             semantic_context=semantic_context,
             timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
         )
@@ -2182,6 +2396,7 @@ def answer_for_decision(
             model=settings.chat_model,
             message=question,
             context=decision.chat_context,
+            memory_context=decision.memory_context,
             semantic_context=semantic_context,
             timeout=timeout or getattr(settings, "chat_generation_timeout_seconds", 7),
         )
@@ -2192,6 +2407,7 @@ def answer_for_decision(
         retrieval_question=decision.effective_question or question,
         allow_fallback=False,
         chat_context=decision.chat_context,
+        memory_context=decision.memory_context,
         semantic_context=semantic_context,
         timeout=timeout,
     )
@@ -2957,6 +3173,7 @@ def should_process_message(
     user_id: str = "",
     sender_role: str = "",
     planner_timeout: int | None = None,
+    plan_out: list[MessagePlan] | None = None,
 ) -> ProcessingDecision:
     if mentioned and is_identity_question(question):
         return ProcessingDecision(True, "mentioned identity request", reply_mode="identity")
@@ -2991,6 +3208,8 @@ def should_process_message(
         timeout=planner_timeout,
     )
     usable_plan = plan if semantic_plan_is_usable(plan) else None
+    if usable_plan is not None and plan_out is not None:
+        plan_out.append(usable_plan)
     if usable_plan:
         chat_context = context_selected_by_plan(chat_context, usable_plan)
         query_text = usable_plan.standalone_question or query_text
@@ -3422,7 +3641,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 continue
 
             if command:
-                answer = answer_admin_command(command)
+                answer = answer_admin_command(command, group_id=group_id, user_id=str(user_id or ""))
                 if settings.dry_run:
                     print("Dry run admin answer:", group_id, answer)
                     write_message_audit(
@@ -3498,6 +3717,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     event_time=event_time,
                 )
                 continue
+            selected_plan: list[MessagePlan] = []
             decision = should_process_message(
                 question,
                 mentioned,
@@ -3511,6 +3731,12 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 user_id=str(user_id or ""),
                 sender_role=sender_role,
                 planner_timeout=planner_timeout,
+                plan_out=selected_plan,
+            )
+            decision = enrich_decision_with_chat_memory(
+                decision,
+                item,
+                selected_plan[0] if selected_plan else None,
             )
             if not decision.should_reply:
                 print("Skip message: model/router decided no reply", group_id, question)
@@ -3952,6 +4178,7 @@ def chat_worker() -> None:
                     context=decision.chat_context,
                     scene_context=scene_context,
                     semantic_context=semantic_context_for_decision(decision),
+                    memory_context=decision.memory_context,
                     timeout=generation_timeout,
                 )
             else:
@@ -4299,6 +4526,7 @@ class Handler(BaseHTTPRequestHandler):
             with chat_scene_lock:
                 scene_groups = len(group_chat_scenes)
                 scene_updating = len(chat_scene_running)
+            memory_status = chat_memory_manager.status() if chat_memory_manager else {}
             self._json(
                 200,
                 {
@@ -4316,6 +4544,10 @@ class Handler(BaseHTTPRequestHandler):
                     "pending": pending_message_count(),
                     "scene_groups": scene_groups,
                     "scene_updating": scene_updating,
+                    "memory_messages": memory_status.get("messages", 0),
+                    "memory_chunks": memory_status.get("chunks", 0),
+                    "memory_queued": memory_status.get("queued", 0),
+                    "memory_paused": memory_status.get("paused", False),
                 },
             )
             return
@@ -4371,6 +4603,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False, "error": "not found"})
             return
 
+        if event.get("post_type") == "notice" and event.get("notice_type") == "group_recall":
+            group_id = event.get("group_id")
+            if not settings.allowed_group_ids or str(group_id) in settings.allowed_group_ids:
+                try:
+                    recall_group_chat_message(int(group_id), str(event.get("message_id") or ""))
+                except (TypeError, ValueError):
+                    pass
+            self._json(200, {"ok": True, "recalled": True})
+            return
+
         if event.get("message_type") != "group":
             print("Ignored event: not group", event.get("post_type"), event.get("message_type"))
             self._json(200, {"ok": True, "ignored": "not group message"})
@@ -4395,6 +4637,7 @@ class Handler(BaseHTTPRequestHandler):
 
         raw_message = event.get("message", "")
         text = extract_plain_text(raw_message)
+        context_text = extract_context_text(raw_message)
         mentioned = is_mentioned(settings.bot_qq, raw_message)
         mentioned_user_ids = extract_mentioned_user_ids(settings.bot_qq, raw_message)
         user_id = event.get("user_id")
@@ -4415,7 +4658,7 @@ class Handler(BaseHTTPRequestHandler):
         chat_sequence = record_group_chat_message(
             numeric_group_id,
             user_id,
-            text,
+            context_text,
             event.get("time"),
             message_id=str(event.get("message_id") or ""),
             reply_message_id=reply_message_id,
@@ -4429,7 +4672,7 @@ class Handler(BaseHTTPRequestHandler):
                 or ""
             ),
         )
-        save_chat_history()
+        schedule_chat_history_save()
         schedule_chat_scene_update(numeric_group_id, chat_sequence)
 
         try:
@@ -4582,12 +4825,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    memory_started = initialize_chat_memory()
     restored = restore_pending_messages()
     if restored:
         print(f"Restored pending messages: {restored}")
     loaded = load_chat_history()
     if loaded:
         print(f"Loaded chat history: {loaded} entries")
+        migrated = migrate_loaded_chat_history_to_memory()
+        if migrated:
+            print(f"Queued chat history migration: {migrated} entries")
     restored_turns = load_recent_conversation_states()
     if restored_turns:
         print(f"Restored conversation turns: {restored_turns}")
@@ -4595,6 +4842,11 @@ def main() -> None:
         target=worker,
         args=(message_queue, "priority"),
         daemon=True,
+    ).start()
+    threading.Thread(
+        target=chat_history_save_worker,
+        daemon=True,
+        name="chat-history-saver",
     ).start()
     threading.Thread(
         target=fragment_aggregation_worker,
@@ -4610,6 +4862,7 @@ def main() -> None:
     server = ThreadingHTTPServer((settings.host, settings.port), Handler)
     print(f"Squad QQBot MVP listening on http://{settings.host}:{settings.port}")
     print(f"Knowledge chunks: {len(kb.chunks)}")
+    print(f"Chat memory: {'enabled' if memory_started else 'disabled'}")
     print(
         f"Allowed groups: {','.join(settings.allowed_group_ids) or 'all'}, "
         f"max replies/min: {settings.max_replies_per_minute}"

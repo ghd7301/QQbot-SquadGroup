@@ -1,6 +1,6 @@
 # Squad QQBot MVP 交接文档
 
-更新时间：2026-07-23
+更新时间：2026-07-27
 
 ## 一句话状态
 
@@ -20,7 +20,9 @@
 
 `/Users/yuce/Documents/Codex/2026-07-20/wo/outputs/squad-qqbot-mvp/AGENT_HANDOFF.md`
 
-注意：源码目录当前不是 Git 仓库。不要假设可以用 `git status`、`git diff` 或回滚提交。
+远端仓库：`git@github.com:ghd7301/qqbot-for-squad_group.git`
+
+源码目录是 Git 仓库，当前使用 `main` 分支。修改前后都应检查 `git status`，不要覆盖用户未提交的改动。
 
 ## 当前运行状态
 
@@ -30,8 +32,8 @@
 - NapCat OneBot API：`http://127.0.0.1:3000`
 - NapCat 上报地址：`http://127.0.0.1:8088/onebot`
 - NapCat WebUI 日志：`http://127.0.0.1:6099/webui/logs`
-- 当前知识库：17 个 Markdown 文件，健康检查显示约 203 个切片
-- 最近完整测试：53 项通过
+- 当前知识库：以 `/health` 返回的 `chunks` 为准
+- 最近完整测试：116 项通过
 
 日常使用时，Python 后端由 launchd 自动运行。用户通常只需启动 NapCat/QQ 并登录 Bot QQ。模型使用外部 API，电脑必须联网。
 
@@ -103,6 +105,7 @@ python3 -m unittest discover -s tests -v
 - HTTP/异常日志：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/launchd.err.log`
 - 消息审计：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/message_audit.jsonl`
 - 持久队列：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/pending_queue.sqlite3`
+- 长期聊天记忆：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/chat_memory.sqlite3`
 - 最近 OneBot 事件：`/Users/yuce/.codex/qqbot-runtime/squad-qqbot-mvp/work/last_onebot_event.json`
 
 ## 当前配置摘要
@@ -138,9 +141,10 @@ QQ 群消息
   -> NapCat/QQ
   -> HTTP POST /onebot
   -> 解析文本、@、引用消息和发送者
+  -> 短期上下文立即更新；长期聊天记忆后台写入 SQLite
   -> 持久化 SQLite 队列
   -> 优先问答 worker / 普通问答 worker / 闲聊 worker
-  -> Markdown 知识检索或 LLM 兜底/闲聊生成
+  -> Markdown 事实知识检索 + 按需历史聊天混合召回，或 LLM 兜底/闲聊生成
   -> OneBot send_group_msg
   -> QQ 群
 ```
@@ -176,7 +180,9 @@ QQ 群消息
 
 提示词位于 `squad_bot/llm.py` 的 `CHAT_PROMPT`。
 
-剩余限制：无引用时仍以时间顺序和同一发送者连续发言为主要线索，不是真正的语义话题聚类。高活跃群同时聊多条支线时仍可能串线，需要结合审计中的实际 `chat_context` 再判断。
+长期层位于 `squad_bot/chat_memory.py` 和 `squad_bot/embedding.py`：保存稳定匿名成员、QQ 引用链、utterance/topic 分块，使用同群 FTS5 与向量混合召回。默认 `hashed-ngram-v1` 是无依赖回退，不是高质量语义模型。召回历史作为独立 `untrusted_group_chat_memory` 区块传给模型，绝不能当事实知识或用户画像。
+
+管理员可用 `聊天记忆状态`、`暂停聊天记忆`、`恢复聊天记忆`、`重建聊天记忆`。清空必须先发 `清空本群聊天记忆`，再于 60 秒内确认。QQ 撤回通知会从短期历史和长期索引移除对应消息。
 
 ## 引用回复规则
 

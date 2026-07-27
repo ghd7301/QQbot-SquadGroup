@@ -11,6 +11,9 @@
 - 支持被 `@机器人` 后优先回答。
 - 白名单群普通消息也会观察，但必须像 Squad 相关问题或求助才会主动回复。
 - 使用本地 Markdown 知识库检索上下文。
+- 将群聊原始文本持久化到独立 SQLite；按发言片段和话题分块，通过 QQ 引用链、FTS5、向量、参与者与时效混合召回。
+- 长期聊天记忆只用于恢复对话承接，与 Markdown 事实知识严格分区；召回内容标记为不可信，不能改变人格、规则或第三方关系。
+- 消息入库、分块和嵌入在后台线程执行；记忆数据库或嵌入服务失败时自动降级到短期上下文、引用链和可用的 FTS 结果。
 - 使用检索分数和查询词覆盖率区分强命中、弱命中，避免拿弱相关资料硬答。
 - 被 @ 的问题未命中知识库时，由独立的通用模型提示词谨慎兜底。
 - 可在白名单群里低频参与闲聊，使用可配置的近期消息和回复关系作为上下文。
@@ -132,6 +135,18 @@ FOLLOWUP_GROUP_SECONDS=30
 FOLLOWUP_MENTION_SECONDS=180
 MESSAGE_AUDIT_LOG=work/message_audit.jsonl
 PENDING_QUEUE_DB=work/pending_queue.sqlite3
+CHAT_MEMORY_ENABLED=true
+CHAT_MEMORY_DB=work/chat_memory.sqlite3
+CHAT_MEMORY_SHADOW_MODE=false
+CHAT_MEMORY_ALLOWED_GROUP_IDS=
+CHAT_MEMORY_MAX_HITS=6
+CHAT_MEMORY_MAX_CHARS=2400
+CHAT_MEMORY_RETENTION_DAYS=90
+CHAT_MEMORY_EMBEDDING_PROVIDER=hashed
+CHAT_MEMORY_EMBEDDING_BASE_URL=
+CHAT_MEMORY_EMBEDDING_API_KEY=
+CHAT_MEMORY_EMBEDDING_MODEL=
+CHAT_MEMORY_EMBEDDING_DIMENSIONS=384
 AUTO_REPLY_ENABLED=true
 LLM_FALLBACK_ENABLED=true
 FALLBACK_ONLY_WHEN_MENTIONED=true
@@ -315,6 +330,11 @@ reload
 最近跳过
 关闭自动回复
 开启自动回复
+聊天记忆状态
+暂停聊天记忆
+恢复聊天记忆
+重建聊天记忆
+清空本群聊天记忆
 ```
 
 也兼容：
@@ -328,19 +348,23 @@ reload
 
 关闭自动回复后，普通群消息不会主动回复；被 @ 的知识库问题仍可回答。
 
+`清空本群聊天记忆` 是不可恢复操作，需要同一管理员在 60 秒内再次发送 `清空本群聊天记忆 确认`。这些命令仍只识别 `ADMIN_QQ_IDS` 精确白名单，目前默认仅 `3466734955`。
+
+`CHAT_MEMORY_EMBEDDING_PROVIDER=hashed` 不需要第三方依赖，适合先运行和回放验证，但它是字符 n-gram 向量，不等同于真正语义模型。要使用兼容 OpenAI `/embeddings` 的服务，改成 `openai-compatible` 并单独配置 embedding 地址、Key 和模型；不要默认认为聊天模型套餐包含 embedding 接口。
+
 ## 已知边界
 
-- 只有可配置时间窗内的短期闲聊上下文和内存场景快照，没有用户画像或长期聊天记忆；上下文使用稳定匿名成员 ID 和结构化回复关系，重启后场景快照会随新消息重新建立。
+- 不建立用户偏好、情绪档案或人物关系画像。长期聊天记忆只保存消息、匿名说话人、时间、引用和话题索引，用于当前消息的按需召回。
 - 闲聊回复时间写入 SQLite，因此重启服务不会重置 60 秒冷却和每小时上限。
 - 主动回复策略仍需要根据真实群日志继续调优。
-- 当前是关键词和短语检索，还没有向量检索。
+- 默认 `hashed` 向量更接近增强词法召回；需要更好的中文语义召回时，应接入经过验证的 embedding 服务或本地模型。
 - 还没有 ST 私有知识库，涉及本服规则时应以群公告和管理员为准。
 - 当前使用本机 launchd 常驻运行；源码修改后仍需先同步运行副本再重启服务。
 
 ## 后续建议
 
 - 根据审计日志继续校准强命中阈值和闲聊接话风格。
-- 后续可升级 SQLite FTS、embedding 或向量库检索。
+- 先用真实群聊回放校准 `memory_needed`、召回条数和混合排序，再决定是否替换成中文语义 embedding。
 
 ## 公开资料参考
 
