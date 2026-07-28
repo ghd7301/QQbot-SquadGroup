@@ -249,6 +249,37 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 5,
             )
 
+    def test_standalone_fallback_uses_candidates_and_rejects_unsupported_fact(self) -> None:
+        configured = routing_settings()
+        candidate = ContextResult("兵站范围最多90米。", ("兵站",), 0.01, 0.1)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "retrieve_knowledge", return_value=candidate),
+            patch.object(server, "ask_fallback_llm", return_value="兵站范围最多100米。") as ask,
+        ):
+            answer = server.answer_question("兵站范围是多少")
+
+        self.assertEqual(answer, "这个具体数值我没有可靠依据，不能给你拍一个。")
+        self.assertEqual(
+            ask.call_args.kwargs["candidate_knowledge_context"],
+            candidate.context,
+        )
+
+    def test_precise_fact_validation_normalizes_formats_and_keeps_segments_bound(self) -> None:
+        tokens = server.precise_fact_tokens(
+            "九人，百分之九十，版本 v1.2，连接 1.2.3.4:9987"
+        )
+        self.assertIn(("9", "人"), tokens)
+        self.assertIn(("90", "%"), tokens)
+        self.assertIn(("1.2", "version"), tokens)
+        self.assertIn(("1.2.3.4", "ip"), tokens)
+        self.assertIn(("9987", "port"), tokens)
+        unsupported = server.unsupported_fallback_precise_facts(
+            "2人时20米，最多100米。",
+            "2人时20米。\n---\n9人时100米。",
+        )
+        self.assertIn(("100", "米"), unsupported)
+
     def test_reply_to_bot_chat_plan_uses_addressed_lane(self) -> None:
         plan = MessagePlan(
             audience="bot",
@@ -392,6 +423,11 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             patch.object(server, "semantic_plan_for_message", return_value=plan),
             patch.object(
                 server,
+                "verify_bot_capability",
+                return_value="knowledge_files",
+            ) as verify,
+            patch.object(
+                server,
                 "retrieve_knowledge",
                 return_value=ContextResult("弱相关", ["无关.md"], 0.1, 0.1),
             ) as retrieve,
@@ -407,6 +443,97 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "bot_meta")
         self.assertEqual(decision.capability, "knowledge_files")
         retrieve.assert_called_once()
+        verify.assert_called_once()
+
+    def test_identity_discussion_cannot_enter_bot_capability_bypass(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="bot_meta",
+            reply_worthy=True,
+            standalone_question="AI不就是人机吗",
+            implicit_meaning="询问AI与人机的关系，质疑机器人的本质",
+            topic_summary="关于AI与人机定义的讨论",
+            relevant_context_indices=(),
+            capability="knowledge_files",
+            confidence=0.95,
+        )
+        with (
+            patch.object(server, "settings", routing_settings()),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(server, "verify_bot_capability", return_value="none") as verify,
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+        ):
+            decision = server.should_process_message(
+                "AI不就是人机吗",
+                True,
+                group_id=1,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "fallback")
+        self.assertEqual(decision.capability, "none")
+        self.assertEqual(
+            decision.reason,
+            "semantic plan: unverified bot capability fallback",
+        )
+        verify.assert_called_once()
+
+    def test_planner_identity_risk_blocks_capability_without_second_call(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="bot_meta",
+            reply_worthy=True,
+            standalone_question="AI不就是人机吗",
+            implicit_meaning="身份讨论",
+            topic_summary="机器人身份",
+            relevant_context_indices=(),
+            capability="knowledge_files",
+            confidence=0.95,
+            risk_flags=("self_identity",),
+        )
+        with (
+            patch.object(server, "settings", routing_settings()),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(server, "verify_bot_capability") as verify,
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+        ):
+            decision = server.should_process_message(
+                "AI不就是人机吗",
+                True,
+                group_id=1,
+            )
+
+        self.assertEqual(decision.reply_mode, "identity")
+        self.assertEqual(decision.reason, "semantic plan: addressed identity discussion")
+        verify.assert_not_called()
+
+    def test_capability_verifier_fails_closed_on_identity_discussion(self) -> None:
+        response = json.dumps(
+            {"capability": "none", "confidence": 0.98},
+            ensure_ascii=False,
+        )
+        with patch.object(llm, "_chat_completion", return_value=response) as completion:
+            capability = llm.verify_bot_capability(
+                base_url="https://example.invalid",
+                api_key="key",
+                model="model",
+                message="AI不就是人机吗",
+                planned_capability="knowledge_files",
+                topic_summary="关于AI与人机定义的讨论",
+            )
+
+        self.assertEqual(capability, "none")
+        verifier_input = completion.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("AI不就是人机吗", verifier_input)
+        self.assertIn("knowledge_files", verifier_input)
 
     def test_inconsistent_capability_cannot_override_ordinary_knowledge_intent(self) -> None:
         plan = MessagePlan(
@@ -1880,6 +2007,51 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(revision, 9)
         reviewer.assert_called_once()
 
+    def test_late_review_cannot_reintroduce_unsupported_precise_fact(self) -> None:
+        configured = routing_settings(final_reply_review_mode="always")
+        decision = server.ProcessingDecision(
+            True,
+            "fallback",
+            reply_mode="fallback",
+            chat_context=("原上下文",),
+            semantic_intent="knowledge",
+            semantic_topic="兵站压制范围",
+            semantic_confidence=0.9,
+            knowledge_result=ContextResult(
+                "2人时20米，最多9人90米。",
+                ("兵站",),
+                0.9,
+                1.0,
+            ),
+        )
+        review = FinalReplyReview(
+            "revise",
+            "调整表达",
+            0.95,
+            revised_reply="2人时20米，最多9人100米。",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", side_effect=(9, 9)),
+            patch.object(server, "recent_group_chat_context", return_value=("最新上下文",)),
+            patch.object(server, "review_candidate_reply", return_value=review),
+            patch.object(server, "unsafe_or_repeated_reply", return_value=""),
+        ):
+            answer, reason, revision = server.refresh_answer_for_late_context(
+                question="兵站压制范围是多少",
+                answer="2人时20米，最多9人90米。",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                reviewed_revision=8,
+            )
+
+        self.assertEqual(answer, "")
+        self.assertIn("unsupported precise fact", reason)
+        self.assertEqual(revision, 9)
+
     def test_late_same_sender_supplement_is_bound_to_regenerated_turn(self) -> None:
         configured = routing_settings(
             final_reply_review_mode="adaptive",
@@ -1990,6 +2162,8 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertIn("speaker.role 为 bot", PERSONA_CORE)
         self.assertIn("虚构上班、吃饭、出行", FINAL_REPLY_REVIEW_PROMPT)
         self.assertIn("send|drop|regenerate|revise", FINAL_REPLY_REVIEW_PROMPT)
+        self.assertIn("不得把候选回复改成“我是 AI”“我是机器人”", FINAL_REPLY_REVIEW_PROMPT)
+        self.assertIn("不要声称自己是真人", PERSONA_CORE)
         self.assertNotIn("你这禁言权限哪领的", FINAL_REPLY_REVIEW_PROMPT)
 
 

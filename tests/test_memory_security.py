@@ -632,6 +632,41 @@ class MemorySecurityTests(unittest.TestCase):
         self.assertEqual(refreshed.plan_context_revision, 2)
         self.assertEqual(refreshed.semantic_replan_count, 1)
 
+    def test_addressed_late_replan_keeps_addressed_timeout(self):
+        decision = server.ProcessingDecision(
+            True,
+            "fallback",
+            reply_mode="fallback",
+            plan_context_revision=1,
+        )
+        configured = SimpleNamespace(
+            semantic_replan_enabled=True,
+            semantic_planner_timeout_seconds=3,
+            semantic_planner_addressed_timeout_seconds=5,
+            bot_qq="999",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "context_revision", return_value=2),
+            patch.object(
+                server,
+                "context_message_ids_after_revision",
+                return_value=("m2",),
+            ),
+            patch.object(server, "remaining_reply_timeout", return_value=5) as remaining,
+            patch.object(server, "semantic_plan_for_message", return_value=None),
+        ):
+            refreshed, _ = server.refresh_semantic_decision_for_late_context(
+                decision,
+                {"question": "补充", "mentioned": True},
+                ("上下文",),
+                scene_context="",
+                deadline=time.monotonic() + 10,
+            )
+
+        self.assertIs(refreshed, decision)
+        self.assertEqual(remaining.call_args.kwargs["cap"], 5)
+
     def test_clear_requires_same_admin_confirmation_within_window(self):
         store = SimpleNamespace(clear_group=Mock())
         manager = SimpleNamespace(store=store)

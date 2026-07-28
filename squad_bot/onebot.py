@@ -218,13 +218,25 @@ def send_group_msg(
         raw_response = response.read()
     try:
         result = json.loads(raw_response.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError, TypeError):
-        return ""
-    response_data = result.get("data") if isinstance(result, dict) else None
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise RuntimeError("OneBot send_group_msg returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("OneBot send_group_msg returned an invalid response")
+    status = str(result.get("status") or "").strip().lower()
+    retcode = result.get("retcode")
+    if status != "ok" or (retcode is not None and retcode != 0):
+        raise RuntimeError(
+            "OneBot send_group_msg failed: "
+            f"status={status or 'missing'}, retcode={retcode!r}"
+        )
+    response_data = result.get("data")
     if not isinstance(response_data, dict):
-        return ""
+        raise RuntimeError("OneBot send_group_msg response is missing data")
     message_id = response_data.get("message_id", "")
-    return str(message_id).strip() if message_id is not None else ""
+    normalized_message_id = str(message_id).strip() if message_id is not None else ""
+    if not normalized_message_id:
+        raise RuntimeError("OneBot send_group_msg response is missing message_id")
+    return normalized_message_id
 
 
 def get_message_sender_id(

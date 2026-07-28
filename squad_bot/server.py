@@ -33,6 +33,7 @@ from .llm import (
     plan_group_message,
     review_candidate_reply,
     rewrite_contextual_question,
+    verify_bot_capability,
 )
 from .onebot import (
     extract_content_segments,
@@ -2019,6 +2020,9 @@ def refresh_answer_for_late_context(
         unsafe_reason = unsafe_or_repeated_reply(group_id, refreshed_answer)
         if unsafe_reason:
             return "", unsafe_reason, revision
+        grounding_issue = fallback_grounding_issue(decision, refreshed_answer)
+        if grounding_issue:
+            return "", grounding_issue, revision
     return refreshed_answer, reason, revision
 
 
@@ -3040,7 +3044,11 @@ def refresh_semantic_decision_for_late_context(
 
     timeout = remaining_reply_timeout(
         deadline,
-        cap=getattr(settings, "semantic_planner_timeout_seconds", 5),
+        cap=semantic_planner_timeout_cap(
+            mentioned=bool(item.get("mentioned")),
+            reply_target_user_id=str(item.get("reply_target_user_id") or ""),
+            explicit_knowledge_command=bool(item.get("explicit_knowledge_command")),
+        ),
         reserve=2,
     )
     if not timeout:
@@ -3508,8 +3516,11 @@ def answer_question(
                 memory_context=tuple(memory_context),
                 self_history_context=tuple(self_history_context),
                 semantic_context=semantic_context,
+                candidate_knowledge_context=result.context,
                 timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
             )
+            if unsupported_fallback_precise_facts(answer, result.context):
+                return "这个具体数值我没有可靠依据，不能给你拍一个。"
             return finalize_model_answer(answer)
         return "这个我库里暂时没有准确信息。你可以换个更具体的问法，或者问一下小队长和管理员；涉及服务器规则的话，还是以本服公告为准。"
 
@@ -3529,9 +3540,57 @@ def answer_question(
 
 
 PRECISE_FACT_PATTERN = re.compile(
-    r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>公里|千米|分钟|小时|秒|米|km|m|票|人|名|倍|%|％)",
+    r"(?P<value>\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万两点]+)\s*"
+    r"(?P<unit>公里|千米|分钟|小时|秒|米|km|m|票|人|名|倍|%|％)",
     flags=re.I,
 )
+CHINESE_PERCENT_PATTERN = re.compile(
+    r"百分之(?P<value>[零〇一二两三四五六七八九十百千万两点]+)"
+)
+IPV4_PATTERN = re.compile(
+    r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"
+)
+VERSION_PATTERN = re.compile(
+    r"(?<![\d.])(?:v|版本\s*)?(?P<value>\d+(?:\.\d+){1,2})(?![\d.])",
+    flags=re.I,
+)
+PORT_PATTERN = re.compile(
+    r"(?:端口|port)\s*[:：为是]?\s*(?P<named>\d{2,5})"
+    r"|(?<![\d:])(?:[a-z0-9.-]+|\])[:：](?P<address>\d{2,5})(?!\d)",
+    flags=re.I,
+)
+
+
+def normalize_chinese_number(value: str) -> str:
+    value = str(value or "").replace("两", "二").replace("〇", "零")
+    if not value or all(character.isdigit() for character in value):
+        return value
+    if "点" in value:
+        integer, decimal = value.split("点", 1)
+        decimal_digits = "".join(
+            str("零一二三四五六七八九".find(character))
+            for character in decimal
+            if character in "零一二三四五六七八九"
+        )
+        return f"{normalize_chinese_number(integer or '零')}.{decimal_digits}"
+    digits = {character: index for index, character in enumerate("零一二三四五六七八九")}
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+    total = section = number = 0
+    for character in value:
+        if character in digits:
+            number = digits[character]
+            continue
+        unit = units.get(character)
+        if unit is None:
+            return value
+        if unit == 10000:
+            section = (section + number) * unit
+            total += section
+            section = number = 0
+        else:
+            section += (number or 1) * unit
+            number = 0
+    return str(total + section + number)
 
 
 def precise_fact_tokens(text: str) -> set[tuple[str, str]]:
@@ -3542,13 +3601,38 @@ def precise_fact_tokens(text: str) -> set[tuple[str, str]]:
         "名": "人",
         "％": "%",
     }
-    return {
+    source = str(text or "")
+    tokens = {
         (
-            match.group("value"),
+            normalize_chinese_number(match.group("value")),
             unit_aliases.get(match.group("unit").lower(), match.group("unit").lower()),
         )
-        for match in PRECISE_FACT_PATTERN.finditer(str(text or ""))
+        for match in PRECISE_FACT_PATTERN.finditer(source)
     }
+    tokens.update(
+        (normalize_chinese_number(match.group("value")), "%")
+        for match in CHINESE_PERCENT_PATTERN.finditer(source)
+    )
+    ip_addresses = {match.group(0) for match in IPV4_PATTERN.finditer(source)}
+    tokens.update((address, "ip") for address in ip_addresses)
+    tokens.update(
+        (match.group("value"), "version")
+        for match in VERSION_PATTERN.finditer(source)
+        if match.group("value") not in ip_addresses
+    )
+    tokens.update(
+        (match.group("named") or match.group("address"), "port")
+        for match in PORT_PATTERN.finditer(source)
+    )
+    return tokens
+
+
+def candidate_knowledge_segments(context: str) -> tuple[str, ...]:
+    return tuple(
+        segment.strip()
+        for segment in re.split(r"\n\s*---+\s*\n", str(context or ""))
+        if segment.strip()
+    )
 
 
 def unsupported_fallback_precise_facts(
@@ -3558,7 +3642,33 @@ def unsupported_fallback_precise_facts(
     answer_facts = precise_fact_tokens(answer)
     if not answer_facts:
         return set()
-    return answer_facts - precise_fact_tokens(candidate_knowledge_context)
+    segment_facts = [
+        precise_fact_tokens(segment)
+        for segment in candidate_knowledge_segments(candidate_knowledge_context)
+    ]
+    if any(answer_facts <= facts for facts in segment_facts):
+        return set()
+    best_supported = max(
+        segment_facts,
+        key=lambda facts: len(answer_facts & facts),
+        default=set(),
+    )
+    return answer_facts - best_supported
+
+
+def fallback_grounding_issue(decision: ProcessingDecision, answer: str) -> str:
+    if decision.reply_mode != "fallback":
+        return ""
+    candidate_context = (
+        decision.knowledge_result.context
+        if decision.knowledge_result is not None
+        else ""
+    )
+    unsupported = unsupported_fallback_precise_facts(answer, candidate_context)
+    if not unsupported:
+        return ""
+    rendered = ", ".join(f"{value}{unit}" for value, unit in sorted(unsupported))
+    return f"unsupported precise fact in fallback reply: {rendered}"
 
 
 def answer_for_decision(
@@ -3596,7 +3706,7 @@ def answer_for_decision(
             candidate_knowledge_context=candidate_knowledge_context,
             timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
         )
-        if unsupported_fallback_precise_facts(answer, candidate_knowledge_context):
+        if fallback_grounding_issue(decision, answer):
             return "这个具体数值我没有可靠依据，不能给你拍一个。"
         return finalize_model_answer(answer)
     if decision.reply_mode == "chat":
@@ -4767,11 +4877,46 @@ def should_process_message(
             chat_context,
             explicitly_addressed=explicitly_addressed,
         )
-        validated_capability = (
-            usable_plan.capability
-            if usable_plan.intent == "bot_meta"
-            else "none"
+        requested_capability = (
+            usable_plan.capability if usable_plan.intent == "bot_meta" else "none"
         )
+        if (
+            explicitly_addressed
+            and usable_plan.intent == "bot_meta"
+            and "self_identity" in usable_plan.risk_flags
+        ):
+            return ProcessingDecision(
+                True,
+                "semantic plan: addressed identity discussion",
+                effective_question=query_text,
+                reply_mode="identity",
+                chat_context=tuple(chat_context),
+                semantic_intent=usable_plan.intent,
+                semantic_topic=usable_plan.topic_summary,
+                implicit_meaning=usable_plan.implicit_meaning,
+                semantic_confidence=usable_plan.confidence,
+                risk_flags=usable_plan.risk_flags,
+            )
+        validated_capability = "none"
+        if (
+            usable_plan.intent == "bot_meta"
+            and requested_capability != "none"
+            and explicitly_addressed
+            and usable_plan.audience == "bot"
+        ):
+            verified_capability = verify_bot_capability(
+                base_url=settings.llm_base_url,
+                api_key=settings.llm_api_key,
+                model=getattr(settings, "semantic_planner_model", settings.llm_model),
+                message=question,
+                planned_capability=requested_capability,
+                topic_summary=usable_plan.topic_summary,
+                implicit_meaning=usable_plan.implicit_meaning,
+                context=tuple(chat_context),
+                timeout=max(1, min(3, planner_timeout or 3)),
+            )
+            if verified_capability == requested_capability:
+                validated_capability = verified_capability
         if usable_plan.audience == "member" and not mentioned:
             return ProcessingDecision(
                 False,
@@ -4783,8 +4928,21 @@ def should_process_message(
                 capability=validated_capability,
                 semantic_confidence=usable_plan.confidence,
             )
-        if usable_plan.intent == "bot_meta" and validated_capability != "none":
+        if usable_plan.intent == "bot_meta" and requested_capability != "none":
             if explicitly_addressed and usable_plan.audience == "bot":
+                if validated_capability == "none":
+                    return ProcessingDecision(
+                        True,
+                        "semantic plan: unverified bot capability fallback",
+                        effective_question=query_text,
+                        reply_mode="fallback",
+                        chat_context=tuple(chat_context),
+                        semantic_intent=usable_plan.intent,
+                        semantic_topic=usable_plan.topic_summary,
+                        implicit_meaning=usable_plan.implicit_meaning,
+                        semantic_confidence=usable_plan.confidence,
+                        risk_flags=usable_plan.risk_flags,
+                    )
                 return ProcessingDecision(
                     True,
                     "semantic plan: explicit bot capability query",
@@ -4805,15 +4963,15 @@ def should_process_message(
             if explicitly_addressed and usable_plan.audience == "bot":
                 return ProcessingDecision(
                     True,
-                    "semantic plan: bot capability query",
+                    "semantic plan: bot meta fallback",
                     effective_question=query_text,
-                    reply_mode="bot_meta",
+                    reply_mode="fallback",
                     chat_context=tuple(chat_context),
                     semantic_intent=usable_plan.intent,
                     semantic_topic=usable_plan.topic_summary,
                     implicit_meaning=usable_plan.implicit_meaning,
-                    capability=validated_capability,
                     semantic_confidence=usable_plan.confidence,
+                    risk_flags=usable_plan.risk_flags,
                 )
             return ProcessingDecision(False, "semantic plan: bot meta requires explicit bot address")
         if usable_plan.intent == "admin":
@@ -5615,20 +5773,10 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     baseline_revision=baseline_revision,
                     target_item=item,
                 )
-                candidate_knowledge_context = (
-                    decision.knowledge_result.context
-                    if decision.knowledge_result is not None
-                    else ""
-                )
-                if (
-                    decision.reply_mode == "fallback"
-                    and unsupported_fallback_precise_facts(
-                        answer,
-                        candidate_knowledge_context,
-                    )
-                ):
+                grounding_issue = fallback_grounding_issue(decision, answer)
+                if grounding_issue:
                     answer = ""
-                    review_reason = "unsupported precise fact in fallback reply"
+                    review_reason = grounding_issue
                 if not answer:
                     write_message_audit(
                         decision="skipped",

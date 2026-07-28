@@ -125,6 +125,33 @@ class ReplyDetectionTests(unittest.TestCase):
             ],
         )
 
+    @patch("squad_bot.onebot.urllib.request.urlopen")
+    def test_send_group_message_rejects_onebot_business_failure(self, urlopen):
+        urlopen.return_value = FakeResponse(
+            {"status": "failed", "retcode": 100, "data": None}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "status=failed, retcode=100"):
+            send_group_msg("http://127.0.0.1:3000", 123, "回答内容")
+
+    @patch("squad_bot.onebot.urllib.request.urlopen")
+    def test_send_group_message_requires_confirmed_message_id(self, urlopen):
+        urlopen.return_value = FakeResponse(
+            {"status": "ok", "retcode": 0, "data": {}}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "missing message_id"):
+            send_group_msg("http://127.0.0.1:3000", 123, "回答内容")
+
+    @patch("squad_bot.onebot.urllib.request.urlopen")
+    def test_send_group_message_rejects_malformed_response(self, urlopen):
+        response = FakeResponse(None)
+        response.body = io.BytesIO(b"not-json")
+        urlopen.return_value = response
+
+        with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
+            send_group_msg("http://127.0.0.1:3000", 123, "回答内容")
+
     def test_extracts_reply_id_from_segments(self):
         message = [
             {"type": "reply", "data": {"id": 123456}},
