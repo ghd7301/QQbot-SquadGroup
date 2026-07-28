@@ -95,6 +95,9 @@ class Settings:
     semantic_planner_timeout_seconds: int = int(
         os.getenv("SEMANTIC_PLANNER_TIMEOUT_SECONDS", "3")
     )
+    semantic_planner_addressed_timeout_seconds: int = int(
+        os.getenv("SEMANTIC_PLANNER_ADDRESSED_TIMEOUT_SECONDS", "5")
+    )
     semantic_planner_min_confidence: float = float(
         os.getenv("SEMANTIC_PLANNER_MIN_CONFIDENCE", "0.68")
     )

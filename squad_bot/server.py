@@ -1905,6 +1905,11 @@ def review_and_refresh_answer(
             semantic_context=semantic_context_for_decision(decision),
             original_message_ids=_message_ids(target_item or {}),
             knowledge_sources=decision.sources,
+            candidate_knowledge_context=(
+                decision.knowledge_result.context
+                if decision.knowledge_result is not None
+                else ""
+            ),
             retrieval_score=decision.retrieval_score,
             retrieval_coverage=decision.retrieval_coverage,
             allow_regenerate=not regenerated,
@@ -2584,6 +2589,26 @@ def semantic_plan_for_message(
         reply_target=reply_target,
         timeout=timeout or getattr(settings, "semantic_planner_timeout_seconds", 4),
     )
+
+
+def semantic_planner_timeout_cap(
+    *,
+    mentioned: bool,
+    reply_target_user_id: str = "",
+    explicit_knowledge_command: bool = False,
+) -> int:
+    explicitly_addressed = bool(
+        mentioned
+        or explicit_knowledge_command
+        or reply_target_user_id == settings.bot_qq
+    )
+    if explicitly_addressed:
+        return getattr(
+            settings,
+            "semantic_planner_addressed_timeout_seconds",
+            getattr(settings, "semantic_planner_timeout_seconds", 3),
+        )
+    return getattr(settings, "semantic_planner_timeout_seconds", 3)
 
 
 def semantic_planner_circuit_is_open(*, now: float | None = None) -> bool:
@@ -3503,6 +3528,39 @@ def answer_question(
     return finalize_model_answer(answer)
 
 
+PRECISE_FACT_PATTERN = re.compile(
+    r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>公里|千米|分钟|小时|秒|米|km|m|票|人|名|倍|%|％)",
+    flags=re.I,
+)
+
+
+def precise_fact_tokens(text: str) -> set[tuple[str, str]]:
+    unit_aliases = {
+        "千米": "公里",
+        "km": "公里",
+        "m": "米",
+        "名": "人",
+        "％": "%",
+    }
+    return {
+        (
+            match.group("value"),
+            unit_aliases.get(match.group("unit").lower(), match.group("unit").lower()),
+        )
+        for match in PRECISE_FACT_PATTERN.finditer(str(text or ""))
+    }
+
+
+def unsupported_fallback_precise_facts(
+    answer: str,
+    candidate_knowledge_context: str,
+) -> set[tuple[str, str]]:
+    answer_facts = precise_fact_tokens(answer)
+    if not answer_facts:
+        return set()
+    return answer_facts - precise_fact_tokens(candidate_knowledge_context)
+
+
 def answer_for_decision(
     question: str,
     decision: ProcessingDecision,
@@ -3521,6 +3579,11 @@ def answer_for_decision(
             unsolicited=decision.reply_mode == "chat",
         )
     if decision.reply_mode == "fallback":
+        candidate_knowledge_context = (
+            decision.knowledge_result.context
+            if decision.knowledge_result is not None
+            else ""
+        )
         answer = ask_fallback_llm(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
@@ -3530,8 +3593,11 @@ def answer_for_decision(
             memory_context=decision.memory_context,
             self_history_context=decision.self_history_context,
             semantic_context=semantic_context,
+            candidate_knowledge_context=candidate_knowledge_context,
             timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
         )
+        if unsupported_fallback_precise_facts(answer, candidate_knowledge_context):
+            return "这个具体数值我没有可靠依据，不能给你拍一个。"
         return finalize_model_answer(answer)
     if decision.reply_mode == "chat":
         answer = answer_chat(
@@ -4885,7 +4951,7 @@ def should_process_message(
             explicitly_addressed or not settings.fallback_only_when_mentioned
         )
         if fallback_allowed:
-            return ProcessingDecision(
+            decision = ProcessingDecision(
                 should_reply=True,
                 reason="explicit address with unverified semantic fallback",
                 has_context=bool(initial_result.context),
@@ -4903,6 +4969,9 @@ def should_process_message(
                 risk_flags=("intent_unverified",),
                 planner_status=("low_confidence" if plan else "unavailable"),
             )
+            if initial_strong_match:
+                decision = attach_knowledge_result(decision, query_text, initial_result)
+            return decision
     if planner_enabled and not usable_plan and not explicitly_addressed:
         return ProcessingDecision(
             False,
@@ -5346,7 +5415,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             model_started = time.monotonic()
             planner_timeout = remaining_reply_timeout(
                 deadline,
-                cap=getattr(settings, "semantic_planner_timeout_seconds", 4),
+                cap=semantic_planner_timeout_cap(
+                    mentioned=mentioned,
+                    reply_target_user_id=str(item.get("reply_target_user_id") or ""),
+                    explicit_knowledge_command=bool(item.get("explicit_knowledge_command")),
+                ),
             )
             if not planner_timeout:
                 write_message_audit(
@@ -5542,6 +5615,20 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     baseline_revision=baseline_revision,
                     target_item=item,
                 )
+                candidate_knowledge_context = (
+                    decision.knowledge_result.context
+                    if decision.knowledge_result is not None
+                    else ""
+                )
+                if (
+                    decision.reply_mode == "fallback"
+                    and unsupported_fallback_precise_facts(
+                        answer,
+                        candidate_knowledge_context,
+                    )
+                ):
+                    answer = ""
+                    review_reason = "unsupported precise fact in fallback reply"
                 if not answer:
                     write_message_audit(
                         decision="skipped",

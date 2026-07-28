@@ -147,7 +147,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.semantic_intent, "third_party_attack")
         self.assertIsNone(decision.knowledge_result)
 
-    def test_mentioned_planner_failure_uses_unverified_fallback_not_knowledge(self) -> None:
+    def test_mentioned_planner_failure_uses_guarded_fallback_with_candidate_knowledge(self) -> None:
         strong = ContextResult("考核官资料", ["考核官名单.md"], 0.3, 0.8)
         with (
             patch.object(server, "settings", routing_settings(semantic_planner_enabled=True)),
@@ -160,7 +160,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "fallback")
         self.assertEqual(decision.semantic_intent, "unclear")
         self.assertIn("intent_unverified", decision.risk_flags)
-        self.assertIsNone(decision.knowledge_result)
+        self.assertIs(decision.knowledge_result, strong)
 
     def test_reply_to_bot_planner_failure_uses_unverified_fallback(self) -> None:
         strong = ContextResult("考核官资料", ["考核官名单.md"], 0.3, 0.8)
@@ -179,7 +179,75 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertTrue(decision.should_reply)
         self.assertEqual(decision.reply_mode, "fallback")
         self.assertIn("intent_unverified", decision.risk_flags)
-        self.assertIsNone(decision.knowledge_result)
+        self.assertIs(decision.knowledge_result, strong)
+
+    def test_mentioned_fact_question_survives_planner_failure_without_knowledge_bypass(self) -> None:
+        strong = ContextResult(
+            "目前版本是2人20m，随人数增加而增加，最远可达到9人90m。",
+            ["knowledge/02-出生点与工事.md"],
+            6.4663,
+            0.8,
+        )
+        configured = routing_settings(semantic_planner_enabled=True)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=None),
+            patch.object(server, "retrieve_knowledge", return_value=strong),
+        ):
+            decision = server.should_process_message(
+                "兵站压制范围是多少",
+                True,
+                group_id=983063031,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "fallback")
+        self.assertEqual(decision.planner_status, "unavailable")
+        self.assertIs(decision.knowledge_result, strong)
+
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(
+                server,
+                "ask_fallback_llm",
+                return_value="2人时是20米，人数越多范围越大，9人时最远90米。",
+            ) as generate,
+        ):
+            answer = server.answer_for_decision(
+                "兵站压制范围是多少",
+                decision,
+                "兵站压制范围是多少",
+            )
+
+        self.assertIn("2人时是20米", answer)
+        self.assertNotIn("100米", answer)
+        self.assertEqual(
+            generate.call_args.kwargs["candidate_knowledge_context"],
+            strong.context,
+        )
+
+    def test_addressed_messages_get_separate_semantic_planner_timeout(self) -> None:
+        configured = routing_settings(
+            semantic_planner_timeout_seconds=3,
+            semantic_planner_addressed_timeout_seconds=5,
+        )
+        with patch.object(server, "settings", configured):
+            self.assertEqual(server.semantic_planner_timeout_cap(mentioned=False), 3)
+            self.assertEqual(server.semantic_planner_timeout_cap(mentioned=True), 5)
+            self.assertEqual(
+                server.semantic_planner_timeout_cap(
+                    mentioned=False,
+                    reply_target_user_id="999",
+                ),
+                5,
+            )
+            self.assertEqual(
+                server.semantic_planner_timeout_cap(
+                    mentioned=False,
+                    explicit_knowledge_command=True,
+                ),
+                5,
+            )
 
     def test_reply_to_bot_chat_plan_uses_addressed_lane(self) -> None:
         plan = MessagePlan(
@@ -882,11 +950,68 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 model="test-model",
                 question="怎么成为枪男",
                 context=("群友A：这把别当伏地魔了", "群友B：练练对枪"),
+                candidate_knowledge_context="2人20m，最远9人90m",
             )
 
         user_prompt = call.call_args.kwargs["messages"][1]["content"]
         self.assertIn("群友A：这把别当伏地魔了", user_prompt)
+        self.assertIn("2人20m，最远9人90m", user_prompt)
         self.assertIn("当前问题：怎么成为枪男", user_prompt)
+        self.assertIn("仅因人名重合时必须完全忽略", FALLBACK_PROMPT)
+        self.assertIn("不要编造具体数值", FALLBACK_PROMPT)
+
+    def test_fallback_rejects_precise_fact_not_supported_by_candidate_knowledge(self) -> None:
+        configured = routing_settings(knowledge_generation_timeout_seconds=10)
+        decision = server.ProcessingDecision(
+            True,
+            "guarded fallback",
+            reply_mode="fallback",
+            knowledge_result=ContextResult(
+                "2人20m，随人数增加而增加，最远9人90m",
+                ["knowledge/02-出生点与工事.md"],
+                6.4,
+                0.8,
+            ),
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(
+                server,
+                "ask_fallback_llm",
+                return_value="兵站的压制范围通常是半径约100米。",
+            ),
+        ):
+            answer = server.answer_for_decision(
+                "兵站压制范围是多少",
+                decision,
+                "兵站压制范围是多少",
+            )
+
+        self.assertEqual(answer, "这个具体数值我没有可靠依据，不能给你拍一个。")
+        self.assertNotIn("100米", answer)
+
+    def test_fallback_without_candidate_knowledge_rejects_precise_fact(self) -> None:
+        configured = routing_settings(knowledge_generation_timeout_seconds=10)
+        decision = server.ProcessingDecision(
+            True,
+            "fallback without candidate",
+            reply_mode="fallback",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(
+                server,
+                "ask_fallback_llm",
+                return_value="这个距离大约是100米。",
+            ),
+        ):
+            answer = server.answer_for_decision(
+                "这个距离是多少",
+                decision,
+                "这个距离是多少",
+            )
+
+        self.assertEqual(answer, "这个具体数值我没有可靠依据，不能给你拍一个。")
 
     def test_knowledge_generation_receives_group_context_as_untrusted_data(self) -> None:
         with patch.object(llm, "_answer_or_error", return_value="对，就是 TeamSpeak 3。") as call:
@@ -1472,6 +1597,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 semantic_context=(
                     "机器人参与关系：subject\n要求回复视角：first_person"
                 ),
+                candidate_knowledge_context="2人20m，最远9人90m",
             )
 
         self.assertIsNotNone(review)
@@ -1479,6 +1605,8 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertIn("新限制条件", review.updated_question)
         review_input = completion.call_args.kwargs["messages"][1]["content"]
         self.assertIn("要求回复视角：first_person", review_input)
+        self.assertIn("2人20m，最远9人90m", review_input)
+        self.assertIn("不能由审查器自行编一个数值", FINAL_REPLY_REVIEW_PROMPT)
 
     def test_review_regenerates_at_most_once(self) -> None:
         configured = routing_settings(
