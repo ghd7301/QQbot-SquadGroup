@@ -3447,6 +3447,8 @@ def enrich_decision_with_chat_memory(
 
 
 def answer_bot_meta(capability: str, *, admin: bool) -> str:
+    if not admin:
+        return "这类内部状态只对管理员开放。"
     knowledge_path = Path(settings.knowledge_dir)
     files = sorted(path.name for path in knowledge_path.glob("*.md"))
     if capability == "knowledge_files":
@@ -4940,6 +4942,20 @@ def should_process_message(
                         semantic_intent=usable_plan.intent,
                         semantic_topic=usable_plan.topic_summary,
                         implicit_meaning=usable_plan.implicit_meaning,
+                        semantic_confidence=usable_plan.confidence,
+                        risk_flags=usable_plan.risk_flags,
+                    )
+                if not is_admin_user(user_id, sender_role):
+                    return ProcessingDecision(
+                        True,
+                        "semantic plan: bot capability access denied",
+                        effective_question=query_text,
+                        reply_mode="bot_meta",
+                        chat_context=tuple(chat_context),
+                        semantic_intent=usable_plan.intent,
+                        semantic_topic=usable_plan.topic_summary,
+                        implicit_meaning=usable_plan.implicit_meaning,
+                        capability=validated_capability,
                         semantic_confidence=usable_plan.confidence,
                         risk_flags=usable_plan.risk_flags,
                     )

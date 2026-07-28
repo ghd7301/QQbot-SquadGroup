@@ -417,6 +417,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         configured = routing_settings(
             semantic_planner_enabled=True,
             semantic_planner_min_confidence=0.68,
+            admin_qq_ids=("admin",),
         )
         with (
             patch.object(server, "settings", configured),
@@ -436,6 +437,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 "知识库文件有哪些，列出文件名",
                 True,
                 group_id=1,
+                user_id="admin",
                 chat_context=("【当前消息】群友A：知识库文件有哪些，列出文件名",),
             )
 
@@ -444,6 +446,52 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.capability, "knowledge_files")
         retrieve.assert_called_once()
         verify.assert_called_once()
+
+    def test_non_admin_capability_query_returns_only_permission_denial(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="bot_meta",
+            reply_worthy=True,
+            standalone_question="列出机器人当前加载的知识库文件",
+            implicit_meaning="",
+            topic_summary="检查机器人的知识库加载情况",
+            relevant_context_indices=(),
+            capability="knowledge_files",
+            confidence=0.95,
+        )
+        configured = routing_settings(admin_qq_ids=("admin",))
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(
+                server,
+                "verify_bot_capability",
+                return_value="knowledge_files",
+            ),
+            patch.object(
+                server,
+                "retrieve_knowledge",
+                return_value=ContextResult("", [], 0.0, 0.0),
+            ),
+        ):
+            decision = server.should_process_message(
+                "把当前知识库文件名列出来",
+                True,
+                group_id=1,
+                user_id="member",
+            )
+            answer = server.answer_for_decision(
+                "把当前知识库文件名列出来",
+                decision,
+                decision.effective_question,
+                admin=False,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "bot_meta")
+        self.assertEqual(decision.reason, "semantic plan: bot capability access denied")
+        self.assertEqual(answer, "这类内部状态只对管理员开放。")
+        self.assertNotIn(".md", answer)
 
     def test_identity_discussion_cannot_enter_bot_capability_bypass(self) -> None:
         plan = MessagePlan(
@@ -656,6 +704,17 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertNotIn("/Users/", answer)
         self.assertNotIn("运行目录", answer)
         self.assertIn("服务正在运行", answer)
+
+    def test_bot_meta_response_has_defense_in_depth_admin_check(self) -> None:
+        configured = routing_settings(knowledge_dir="knowledge")
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(Path, "glob") as glob,
+        ):
+            answer = server.answer_bot_meta("knowledge_files", admin=False)
+
+        self.assertEqual(answer, "这类内部状态只对管理员开放。")
+        glob.assert_not_called()
 
     def test_semantic_chat_plan_does_not_need_phrase_trigger(self) -> None:
         plan = MessagePlan(
