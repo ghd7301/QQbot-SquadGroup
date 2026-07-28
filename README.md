@@ -50,8 +50,11 @@
 
 ## 目录结构
 
+消息判断、知识路由和当前软抢占队列见 [消息判断与队列链路](docs/message-routing-and-queue.md)。
+
 ```text
 squad-qqbot-mvp/
+  docs/             设计与运行链路说明
   squad_bot/
     config.py       配置
     knowledge.py    Markdown 知识库检索
