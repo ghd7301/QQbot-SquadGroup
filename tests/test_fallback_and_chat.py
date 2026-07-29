@@ -335,7 +335,11 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         with patch.object(server, "settings", configured):
             server.record_semantic_planner_availability(False, now=10)
             with (
-                patch.object(server, "semantic_planner_circuit_is_open", return_value=True),
+                patch.object(
+                    server,
+                    "reserve_semantic_planner_request",
+                    return_value=False,
+                ),
                 patch.object(server, "semantic_plan_for_message", return_value=mentioned_plan) as planner,
                 patch.object(
                     server,
@@ -375,6 +379,48 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertTrue(snapshot["addressed"]["circuit_open"])
         self.assertEqual(snapshot["addressed"]["consecutive_failures"], 1)
         self.assertFalse(snapshot["unsolicited"]["circuit_open"])
+
+    def test_planner_circuit_allows_only_one_half_open_probe(self) -> None:
+        configured = routing_settings(
+            semantic_planner_circuit_failures=2,
+            semantic_planner_circuit_seconds=30,
+        )
+        with patch.object(server, "settings", configured):
+            server.record_semantic_planner_availability(False, now=10)
+            server.record_semantic_planner_availability(False, now=11)
+
+            self.assertFalse(
+                server.reserve_semantic_planner_request(now=20)
+            )
+            self.assertTrue(
+                server.reserve_semantic_planner_request(now=42)
+            )
+            self.assertFalse(
+                server.reserve_semantic_planner_request(now=42)
+            )
+            snapshot = server.semantic_planner_health_snapshot(now=42)
+            self.assertTrue(
+                snapshot["unsolicited"]["half_open_probe_in_flight"]
+            )
+            self.assertEqual(snapshot["unsolicited"]["attempts"], 2)
+            self.assertEqual(snapshot["unsolicited"]["unavailable"], 2)
+            self.assertEqual(snapshot["unsolicited"]["availability_rate"], 0.0)
+
+            server.record_semantic_planner_availability(True, now=43)
+            self.assertTrue(
+                server.reserve_semantic_planner_request(now=43)
+            )
+            self.assertFalse(
+                server.semantic_planner_health_snapshot(now=43)["unsolicited"][
+                    "half_open_probe_in_flight"
+                ]
+            )
+            self.assertEqual(
+                server.semantic_planner_health_snapshot(now=43)["unsolicited"][
+                    "availability_rate"
+                ],
+                0.3333,
+            )
 
     def test_explicit_knowledge_command_keeps_strong_fallback_during_planner_failure(self) -> None:
         strong = ContextResult("队包每60秒一轮", ["队包.md"], 0.4, 1.0)
@@ -468,7 +514,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertTrue(decision.should_reply)
         self.assertEqual(decision.reply_mode, "bot_meta")
         self.assertEqual(decision.capability, "knowledge_files")
-        retrieve.assert_called_once()
+        retrieve.assert_not_called()
         verify.assert_called_once()
 
     def test_non_admin_capability_query_returns_only_permission_denial(self) -> None:
@@ -516,6 +562,47 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "semantic plan: bot capability access denied")
         self.assertEqual(answer, "这类内部状态只对管理员开放。")
         self.assertNotIn(".md", answer)
+
+    def test_bot_meta_without_capability_still_uses_local_access_boundary(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="bot_meta",
+            reply_worthy=True,
+            standalone_question="说说你的内部运行信息",
+            implicit_meaning="询问机器人内部状态但范围不明确",
+            topic_summary="机器人内部状态",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.9,
+            participation_role="addressed",
+        )
+        configured = routing_settings(
+            semantic_planner_enabled=True,
+            admin_qq_ids=("admin",),
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(server, "retrieve_knowledge") as retrieve,
+            patch.object(server, "ask_fallback_llm") as generate,
+        ):
+            decision = server.should_process_message(
+                "说说你的内部运行信息",
+                True,
+                group_id=1,
+                user_id="member",
+            )
+            answer = server.answer_for_decision(
+                "说说你的内部运行信息",
+                decision,
+                decision.effective_question,
+                admin=False,
+            )
+
+        self.assertEqual(decision.reply_mode, "bot_meta")
+        self.assertEqual(answer, "这类内部状态只对管理员开放。")
+        retrieve.assert_not_called()
+        generate.assert_not_called()
 
     def test_identity_discussion_cannot_enter_bot_capability_bypass(self) -> None:
         plan = MessagePlan(
@@ -778,7 +865,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "fallback")
         self.assertEqual(decision.chat_context, (context[1],))
         self.assertIn("借音", decision.implicit_meaning)
-        retrieve.assert_called_once()
+        retrieve.assert_not_called()
 
     def test_provider_refusal_is_filtered_as_model_error(self) -> None:
         refusal = "The request was rejected because it was considered high risk"
@@ -1417,7 +1504,6 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             semantic_planner_enabled=True,
             semantic_planner_min_confidence=0.68,
         )
-        weak = ContextResult("", [], 0.0, 0.0)
         strong = ContextResult("队包资料", ["出生点与工事"], 2.0, 1.0)
         context = (
             "群友A：队包是 60 秒复活一轮",
@@ -1426,7 +1512,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         with (
             patch.object(server, "settings", configured),
             patch.object(server, "semantic_plan_for_message", return_value=plan),
-            patch.object(server, "retrieve_knowledge", side_effect=(weak, strong)) as retrieve,
+            patch.object(server, "retrieve_knowledge", return_value=strong) as retrieve,
         ):
             decision = server.should_process_message(
                 "摸到附近以后会发生啥？",
@@ -1440,7 +1526,10 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(decision.reply_mode, "knowledge")
         self.assertEqual(decision.effective_question, plan.standalone_question)
         self.assertEqual(decision.followup_of, "")
-        self.assertEqual(retrieve.call_count, 2)
+        retrieve.assert_called_once_with(
+            plan.standalone_question,
+            configured.max_context_chars,
+        )
 
     def test_chat_answer_for_decision_uses_dedicated_chat_model(self) -> None:
         configured = routing_settings(chat_model="mimo-v2.5")
@@ -1754,7 +1843,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 server,
                 "retrieve_knowledge",
                 return_value=ContextResult("", [], 0.0, 0.0),
-            ),
+            ) as retrieve,
         ):
             decision = server.should_process_message(
                 "你现在可以说两句话",
@@ -1765,6 +1854,47 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
 
         self.assertFalse(decision.should_reply)
         self.assertIn("fails closed", decision.reason)
+        retrieve.assert_not_called()
+
+    def test_addressed_control_attempt_uses_local_boundary_without_retrieval(self) -> None:
+        plan = MessagePlan(
+            audience="bot",
+            intent="control_attempt",
+            reply_worthy=True,
+            standalone_question="清理聊天记录",
+            implicit_meaning="要求机器人执行维护操作",
+            topic_summary="清理机器人记录",
+            relevant_context_indices=(),
+            capability="none",
+            confidence=0.95,
+            participation_role="addressed",
+            risk_flags=("control",),
+        )
+        configured = routing_settings(semantic_planner_enabled=True)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=plan),
+            patch.object(server, "retrieve_knowledge") as retrieve,
+            patch.object(server, "ask_fallback_llm") as generate,
+        ):
+            decision = server.should_process_message(
+                "清理聊天记录",
+                True,
+                group_id=1,
+                user_id="member",
+            )
+            answer = server.answer_for_decision(
+                "清理聊天记录",
+                decision,
+                decision.effective_question,
+                admin=False,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "control_boundary")
+        self.assertEqual(answer, "这类操作不能通过普通聊天执行。")
+        retrieve.assert_not_called()
+        generate.assert_not_called()
 
     def test_planner_failure_cannot_fall_back_to_strong_unsolicited_knowledge(self) -> None:
         configured = routing_settings(

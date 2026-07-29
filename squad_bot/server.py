@@ -91,6 +91,18 @@ semantic_planner_circuit_open_until: dict[str, float] = {
     "unsolicited": 0.0,
     "addressed": 0.0,
 }
+semantic_planner_probe_in_flight: dict[str, bool] = {
+    "unsolicited": False,
+    "addressed": False,
+}
+semantic_planner_attempts: dict[str, int] = {
+    "unsolicited": 0,
+    "addressed": 0,
+}
+semantic_planner_unavailable: dict[str, int] = {
+    "unsolicited": 0,
+    "addressed": 0,
+}
 
 
 @dataclass
@@ -2116,6 +2128,9 @@ def clear_chat_state() -> None:
         for lane in tuple(semantic_planner_consecutive_failures):
             semantic_planner_consecutive_failures[lane] = 0
             semantic_planner_circuit_open_until[lane] = 0.0
+            semantic_planner_probe_in_flight[lane] = False
+            semantic_planner_attempts[lane] = 0
+            semantic_planner_unavailable[lane] = 0
     clear_fragment_state()
 
 
@@ -2128,11 +2143,11 @@ SEMANTIC_CHAT_INTENTS = {
     "chat",
     "normal_chat",
     "banter_at_bot",
-    "control_attempt",
     "third_party_attack",
     "genuine_criticism",
     "hostile_abuse",
 }
+LOCAL_REPLY_MODES = {"bot_meta", "identity", "control_boundary"}
 
 
 def allow_hostile_reply(group_id: int, user_id: str, *, now: float | None = None) -> bool:
@@ -2699,6 +2714,28 @@ def semantic_planner_circuit_is_open(
         return semantic_planner_circuit_open_until.get(lane, 0.0) > current_time
 
 
+def reserve_semantic_planner_request(
+    *,
+    lane: str = "unsolicited",
+    now: float | None = None,
+) -> bool:
+    """Reserve one half-open probe after a planner circuit cools down."""
+    current_time = time.monotonic() if now is None else now
+    with semantic_planner_health_lock:
+        if semantic_planner_circuit_open_until.get(lane, 0.0) > current_time:
+            return False
+        threshold = max(
+            1,
+            int(getattr(settings, "semantic_planner_circuit_failures", 5)),
+        )
+        if semantic_planner_consecutive_failures.get(lane, 0) < threshold:
+            return True
+        if semantic_planner_probe_in_flight.get(lane, False):
+            return False
+        semantic_planner_probe_in_flight[lane] = True
+        return True
+
+
 def semantic_planner_health_snapshot(*, now: float | None = None) -> dict[str, dict]:
     current_time = time.monotonic() if now is None else now
     with semantic_planner_health_lock:
@@ -2707,12 +2744,29 @@ def semantic_planner_health_snapshot(*, now: float | None = None) -> dict[str, d
         )
         return {
             lane: {
+                "attempts": semantic_planner_attempts.get(lane, 0),
+                "unavailable": semantic_planner_unavailable.get(lane, 0),
+                "availability_rate": (
+                    round(
+                        1.0
+                        - (
+                            semantic_planner_unavailable.get(lane, 0)
+                            / semantic_planner_attempts.get(lane, 0)
+                        ),
+                        4,
+                    )
+                    if semantic_planner_attempts.get(lane, 0)
+                    else None
+                ),
                 "consecutive_failures": semantic_planner_consecutive_failures.get(lane, 0),
                 "circuit_open": semantic_planner_circuit_open_until.get(lane, 0.0)
                 > current_time,
                 "retry_after_seconds": max(
                     0,
                     int(semantic_planner_circuit_open_until.get(lane, 0.0) - current_time),
+                ),
+                "half_open_probe_in_flight": semantic_planner_probe_in_flight.get(
+                    lane, False
                 ),
             }
             for lane in sorted(lanes)
@@ -2727,21 +2781,27 @@ def record_semantic_planner_availability(
 ) -> None:
     current_time = time.monotonic() if now is None else now
     with semantic_planner_health_lock:
+        semantic_planner_attempts[lane] = semantic_planner_attempts.get(lane, 0) + 1
         if available:
             semantic_planner_consecutive_failures[lane] = 0
             semantic_planner_circuit_open_until[lane] = 0.0
+            semantic_planner_probe_in_flight[lane] = False
             return
+        semantic_planner_unavailable[lane] = (
+            semantic_planner_unavailable.get(lane, 0) + 1
+        )
+        semantic_planner_probe_in_flight[lane] = False
         semantic_planner_consecutive_failures[lane] = (
             semantic_planner_consecutive_failures.get(lane, 0) + 1
         )
         threshold = max(
             1,
-            int(getattr(settings, "semantic_planner_circuit_failures", 3)),
+            int(getattr(settings, "semantic_planner_circuit_failures", 5)),
         )
         if semantic_planner_consecutive_failures[lane] >= threshold:
             semantic_planner_circuit_open_until[lane] = current_time + max(
                 1,
-                int(getattr(settings, "semantic_planner_circuit_seconds", 60)),
+                int(getattr(settings, "semantic_planner_circuit_seconds", 30)),
             )
 
 
@@ -3823,6 +3883,8 @@ def answer_for_decision(
 ) -> str:
     llm_question = generation_question or decision.effective_question or question
     semantic_context = semantic_context_for_decision(decision)
+    if decision.reply_mode == "control_boundary":
+        return "这类操作不能通过普通聊天执行。"
     if decision.reply_mode == "bot_meta":
         return answer_bot_meta(decision.capability, admin=admin)
     if decision.draft_reply and decision.reply_mode in {"fallback", "chat"}:
@@ -4978,24 +5040,30 @@ def should_process_message(
 
     normalized = question.strip()
     query_text = effective_question or normalized
-    initial_result = retrieve_knowledge(query_text, settings.max_context_chars)
-    initial_strong_match = is_strong_knowledge_match(
-        initial_result.top_score,
-        initial_result.query_coverage,
-    )
+    knowledge_results: dict[str, ContextResult] = {}
+
+    def knowledge_result_for(query: str) -> ContextResult:
+        if query not in knowledge_results:
+            knowledge_results[query] = retrieve_knowledge(
+                query,
+                settings.max_context_chars,
+            )
+        return knowledge_results[query]
+
     planner_enabled = bool(getattr(settings, "semantic_planner_enabled", False))
     explicitly_addressed = bool(
         mentioned
         or explicit_knowledge_command
         or reply_target_user_id == settings.bot_qq
     )
-    circuit_open = bool(
-        planner_enabled
-        and not explicitly_addressed
-        and semantic_planner_circuit_is_open(lane="unsolicited")
+    planner_request_allowed = bool(
+        not planner_enabled
+        or explicitly_addressed
+        or reserve_semantic_planner_request(lane="unsolicited")
     )
+    circuit_open = planner_enabled and not planner_request_allowed
     plan = None
-    if not circuit_open:
+    if planner_request_allowed:
         plan = semantic_plan_for_message(
             normalized,
             chat_context,
@@ -5122,13 +5190,14 @@ def should_process_message(
             if explicitly_addressed and usable_plan.audience == "bot":
                 return ProcessingDecision(
                     True,
-                    "semantic plan: bot meta fallback",
+                    "semantic plan: bot meta access boundary",
                     effective_question=query_text,
-                    reply_mode="fallback",
+                    reply_mode="bot_meta",
                     chat_context=tuple(chat_context),
                     semantic_intent=usable_plan.intent,
                     semantic_topic=usable_plan.topic_summary,
                     implicit_meaning=usable_plan.implicit_meaning,
+                    capability="none",
                     semantic_confidence=usable_plan.confidence,
                     risk_flags=usable_plan.risk_flags,
                 )
@@ -5138,6 +5207,28 @@ def should_process_message(
                 False,
                 "semantic plan: maintenance action requires explicit admin command",
                 semantic_intent=usable_plan.intent,
+                semantic_confidence=usable_plan.confidence,
+            )
+        if usable_plan.intent == "control_attempt":
+            if explicitly_addressed:
+                return ProcessingDecision(
+                    True,
+                    "semantic plan: addressed control boundary",
+                    effective_question=query_text,
+                    reply_mode="control_boundary",
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    semantic_confidence=usable_plan.confidence,
+                    semantic_audience="bot",
+                    participation_role="addressed",
+                    risk_flags=tuple(dict.fromkeys((*usable_plan.risk_flags, "control"))),
+                )
+            return ProcessingDecision(
+                False,
+                "semantic plan: unsolicited control attempt ignored",
+                semantic_intent=usable_plan.intent,
+                semantic_topic=usable_plan.topic_summary,
                 semantic_confidence=usable_plan.confidence,
             )
         if usable_plan.intent in SEMANTIC_CHAT_INTENTS:
@@ -5241,6 +5332,11 @@ def should_process_message(
                 semantic_confidence=usable_plan.confidence,
             )
     if planner_enabled and not usable_plan and explicitly_addressed:
+        initial_result = knowledge_result_for(query_text)
+        initial_strong_match = is_strong_knowledge_match(
+            initial_result.top_score,
+            initial_result.query_coverage,
+        )
         if explicit_knowledge_command and initial_strong_match:
             decision = attach_knowledge_result(
                 ProcessingDecision(
@@ -5297,22 +5393,14 @@ def should_process_message(
                 if circuit_open
                 else "semantic planner unavailable; unsolicited reply fails closed"
             ),
-            has_context=bool(initial_result.context),
-            sources=tuple(initial_result.sources),
             effective_question=query_text,
-            retrieval_score=initial_result.top_score,
-            retrieval_coverage=initial_result.query_coverage,
             planner_status=(
                 "circuit_open"
                 if circuit_open
                 else ("low_confidence" if plan else "unavailable")
             ),
         )
-    result = (
-        initial_result
-        if query_text == (effective_question or normalized)
-        else retrieve_knowledge(query_text, settings.max_context_chars)
-    )
+    result = knowledge_result_for(query_text)
     context = result.context
     sources = result.sources
     strong_match = is_strong_knowledge_match(
@@ -5875,7 +5963,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             baseline_revision = int(
                 item.get("chat_sequence") or latest_group_user_sequence(group_id)
             )
-            if decision.reply_mode in {"bot_meta", "identity"}:
+            if decision.reply_mode in LOCAL_REPLY_MODES:
                 generation_timeout = 1 if time.monotonic() < deadline else 0
             else:
                 review_reserve = getattr(settings, "final_reply_review_timeout_seconds", 4)
@@ -5920,7 +6008,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     )
             review_reason = ""
             reviewed_revision = latest_group_user_sequence(group_id)
-            if decision.reply_mode not in {"bot_meta", "identity"}:
+            if decision.reply_mode not in LOCAL_REPLY_MODES:
                 answer, review_reason, reviewed_revision = review_and_refresh_answer(
                     question=question,
                     answer=answer,
@@ -6040,7 +6128,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     event_time=event_time,
                 )
                 continue
-            if decision.reply_mode not in {"bot_meta", "identity"}:
+            if decision.reply_mode not in LOCAL_REPLY_MODES:
                 answer, late_review_reason, reviewed_revision = refresh_answer_for_late_context(
                     question=question,
                     answer=answer,
@@ -6080,7 +6168,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     group_id,
                     item,
                     reviewed_revision,
-                    check_context=decision.reply_mode not in {"bot_meta", "identity"},
+                    check_context=decision.reply_mode not in LOCAL_REPLY_MODES,
                 )
                 if not can_send:
                     write_message_audit(

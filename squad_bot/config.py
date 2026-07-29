@@ -93,10 +93,10 @@ class Settings:
         "CHAT_MODEL"
     ) or os.getenv("LLM_MODEL", "deepseek-chat")
     semantic_planner_timeout_seconds: int = int(
-        os.getenv("SEMANTIC_PLANNER_TIMEOUT_SECONDS", "3")
+        os.getenv("SEMANTIC_PLANNER_TIMEOUT_SECONDS", "5")
     )
     semantic_planner_addressed_timeout_seconds: int = int(
-        os.getenv("SEMANTIC_PLANNER_ADDRESSED_TIMEOUT_SECONDS", "5")
+        os.getenv("SEMANTIC_PLANNER_ADDRESSED_TIMEOUT_SECONDS", "6")
     )
     semantic_planner_min_confidence: float = float(
         os.getenv("SEMANTIC_PLANNER_MIN_CONFIDENCE", "0.68")
@@ -114,10 +114,10 @@ class Settings:
         "SEMANTIC_REPLAN_ENABLED", "true"
     ).lower() in {"1", "true", "yes", "on"}
     semantic_planner_circuit_failures: int = int(
-        os.getenv("SEMANTIC_PLANNER_CIRCUIT_FAILURES", "3")
+        os.getenv("SEMANTIC_PLANNER_CIRCUIT_FAILURES", "5")
     )
     semantic_planner_circuit_seconds: int = int(
-        os.getenv("SEMANTIC_PLANNER_CIRCUIT_SECONDS", "60")
+        os.getenv("SEMANTIC_PLANNER_CIRCUIT_SECONDS", "30")
     )
     chat_relevance_check_enabled: bool = os.getenv(
         "CHAT_RELEVANCE_CHECK_ENABLED", "true"
