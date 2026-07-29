@@ -15,6 +15,7 @@ from urllib.parse import parse_qs
 
 from . import pending_store
 from .chat_history import ChatHistoryState
+from .chat_scene import ChatSceneState
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
@@ -86,11 +87,12 @@ chat_message_sequence = 0
 chat_reply_lock = threading.Lock()
 group_send_locks_lock = threading.Lock()
 group_send_locks: dict[int, threading.Lock] = {}
-chat_scene_lock = threading.Lock()
-group_chat_scenes: dict[int, "GroupChatScene"] = {}
-chat_scene_requested_sequence: dict[int, int] = {}
-chat_scene_pending_messages: dict[int, int] = {}
-chat_scene_running: set[int] = set()
+chat_scene_state = ChatSceneState()
+chat_scene_lock = chat_scene_state.lock
+group_chat_scenes = chat_scene_state.scenes
+chat_scene_requested_sequence = chat_scene_state.requested_sequences
+chat_scene_pending_messages = chat_scene_state.pending_messages
+chat_scene_running = chat_scene_state.running
 hostile_reply_lock = threading.Lock()
 hostile_reply_history: dict[tuple[int, str], list[float]] = {}
 memory_clear_confirmations: dict[tuple[int, str], float] = {}
@@ -903,8 +905,7 @@ def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") 
         auto_status = "开" if auto_reply_enabled else "关"
         chat_status = "开" if settings.chat_reply_enabled and auto_reply_enabled else "关"
         queued = message_queue.qsize() + normal_message_queue.qsize() + chat_queue.qsize()
-        with chat_scene_lock:
-            scene_count = len(group_chat_scenes)
+        scene_count, _ = chat_scene_state.counts()
         return (
             f"服务正常。知识片段 {len(kb.chunks)} 个，队列 {queued} 条，"
             f"自动回复{auto_status}，闲聊{chat_status}，场景快照 {scene_count} 个，"
@@ -1337,15 +1338,12 @@ def current_group_chat_scene(
         if stale_seconds is None
         else stale_seconds
     )
-    with chat_scene_lock:
-        scene = group_chat_scenes.get(group_id)
-        if not scene:
-            return ""
-        if max_age > 0 and current_time - scene.updated_at > max_age:
-            return ""
-        if focus_sequence and scene.sequence > focus_sequence:
-            return ""
-        return scene.summary
+    return chat_scene_state.current_summary(
+        group_id,
+        focus_sequence=focus_sequence,
+        now=current_time,
+        stale_seconds=max_age,
+    )
 
 
 def chat_scene_enabled_for_group(group_id: int) -> bool:
@@ -1357,10 +1355,7 @@ def chat_scene_enabled_for_group(group_id: int) -> bool:
 
 
 def _finish_chat_scene_update(group_id: int) -> None:
-    with chat_scene_lock:
-        chat_scene_running.discard(group_id)
-        chat_scene_requested_sequence.pop(group_id, None)
-        chat_scene_pending_messages.pop(group_id, None)
+    chat_scene_state.finish(group_id)
 
 
 def _chat_scene_update_loop(group_id: int) -> None:
@@ -1369,9 +1364,8 @@ def _chat_scene_update_loop(group_id: int) -> None:
         if debounce:
             time.sleep(debounce)
 
-        with chat_scene_lock:
-            existing = group_chat_scenes.get(group_id)
-            last_updated = existing.updated_at if existing else 0.0
+        existing = chat_scene_state.scene(group_id)
+        last_updated = existing.updated_at if existing else 0.0
         min_interval = max(
             0.0,
             getattr(settings, "chat_scene_update_interval_seconds", 30.0),
@@ -1380,10 +1374,7 @@ def _chat_scene_update_loop(group_id: int) -> None:
         if wait_seconds > 0:
             time.sleep(wait_seconds)
 
-        with chat_scene_lock:
-            target_sequence = chat_scene_requested_sequence.get(group_id, 0)
-            chat_scene_pending_messages[group_id] = 0
-            previous = group_chat_scenes.get(group_id)
+        target_sequence, previous = chat_scene_state.begin_update(group_id)
         context = recent_group_chat_context(
             group_id,
             now=time.time(),
@@ -1404,36 +1395,33 @@ def _chat_scene_update_loop(group_id: int) -> None:
             timeout=max(1, getattr(settings, "chat_scene_timeout_seconds", 30)),
         )
         if summary:
-            with chat_scene_lock:
-                group_chat_scenes[group_id] = GroupChatScene(
-                    summary=summary,
-                    updated_at=time.time(),
-                    sequence=target_sequence,
-                )
+            chat_scene_state.set_scene(
+                group_id,
+                summary=summary,
+                updated_at=time.time(),
+                sequence=target_sequence,
+            )
             print("Updated chat scene", group_id, target_sequence)
         else:
             print("Chat scene update failed", group_id, target_sequence)
 
-        with chat_scene_lock:
-            pending = chat_scene_pending_messages.get(group_id, 0)
-            if pending < min_messages:
-                chat_scene_running.discard(group_id)
-                chat_scene_requested_sequence.pop(group_id, None)
-                chat_scene_pending_messages.pop(group_id, None)
-                return
+        if not chat_scene_state.should_continue(
+            group_id,
+            min_messages=min_messages,
+        ):
+            return
 
 
 def schedule_chat_scene_update(group_id: int, sequence: int) -> bool:
     if not sequence or not chat_scene_enabled_for_group(group_id):
         return False
     min_messages = max(1, getattr(settings, "chat_scene_min_messages", 3))
-    with chat_scene_lock:
-        chat_scene_requested_sequence[group_id] = sequence
-        pending = chat_scene_pending_messages.get(group_id, 0) + 1
-        chat_scene_pending_messages[group_id] = pending
-        if group_id in chat_scene_running or pending < min_messages:
-            return False
-        chat_scene_running.add(group_id)
+    if not chat_scene_state.request_update(
+        group_id,
+        sequence,
+        min_messages=min_messages,
+    ):
+        return False
     threading.Thread(
         target=_chat_scene_update_loop,
         args=(group_id,),
@@ -1910,11 +1898,7 @@ def clear_chat_state() -> None:
     with chat_history_lock:
         chat_history_state.clear()
         chat_message_sequence = 0
-    with chat_scene_lock:
-        group_chat_scenes.clear()
-        chat_scene_requested_sequence.clear()
-        chat_scene_pending_messages.clear()
-        chat_scene_running.clear()
+    chat_scene_state.clear()
     with hostile_reply_lock:
         hostile_reply_history.clear()
     semantic_planner_health.reset()
@@ -6103,9 +6087,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            with chat_scene_lock:
-                scene_groups = len(group_chat_scenes)
-                scene_updating = len(chat_scene_running)
+            scene_groups, scene_updating = chat_scene_state.counts()
             memory_status = chat_memory_manager.status() if chat_memory_manager else {}
             pending_counts = pending_status_counts()
             planner_health = semantic_planner_health_snapshot()
