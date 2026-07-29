@@ -4373,18 +4373,13 @@ def should_process_message(
             result,
         )
 
-def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
-    while True:
-        priority, seq, item = work_queue.get()
-        if normal_lane_should_yield(
-            lane,
-            priority_pending=not message_queue.empty(),
-        ):
-            work_queue.put((priority, seq, item))
-            work_queue.task_done()
-            time.sleep(0.05)
-            continue
-        lifecycle = PendingItemLifecycle(item)
+def process_worker_item(
+    item: dict,
+    lane: str,
+    lifecycle: PendingItemLifecycle | None = None,
+) -> PendingItemLifecycle:
+    lifecycle = lifecycle or PendingItemLifecycle(item)
+    for _ in (None,):
         try:
             question = str(item["question"])
             mentioned = bool(item["mentioned"])
@@ -5012,6 +5007,25 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 event_time=item.get("time"),
             )
         finally:
+            pass
+    return lifecycle
+
+
+def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
+    while True:
+        priority, seq, item = work_queue.get()
+        if normal_lane_should_yield(
+            lane,
+            priority_pending=not message_queue.empty(),
+        ):
+            work_queue.put((priority, seq, item))
+            work_queue.task_done()
+            time.sleep(0.05)
+            continue
+        lifecycle = PendingItemLifecycle(item)
+        try:
+            process_worker_item(item, lane, lifecycle)
+        finally:
             lifecycle.acknowledge(
                 delete_pending_message,
                 lambda exc: print("Pending queue acknowledge failed:", repr(exc)),
@@ -5019,10 +5033,13 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             work_queue.task_done()
 
 
-def chat_worker() -> None:
-    while True:
-        item, decision = chat_queue.get()
-        lifecycle = PendingItemLifecycle(item)
+def process_chat_item(
+    item: dict,
+    decision: ProcessingDecision,
+    lifecycle: PendingItemLifecycle | None = None,
+) -> PendingItemLifecycle:
+    lifecycle = lifecycle or PendingItemLifecycle(item)
+    for _ in (None,):
         model_started = time.monotonic()
         routing_latency_ms = int(item.get("_routing_latency_ms") or 0)
         try:
@@ -5541,6 +5558,17 @@ def chat_worker() -> None:
                 chat_context=decision.chat_context,
                 event_time=item.get("time"),
             )
+        finally:
+            pass
+    return lifecycle
+
+
+def chat_worker() -> None:
+    while True:
+        item, decision = chat_queue.get()
+        lifecycle = PendingItemLifecycle(item)
+        try:
+            process_chat_item(item, decision, lifecycle)
         finally:
             lifecycle.acknowledge(
                 delete_pending_message,
