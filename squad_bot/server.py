@@ -20,6 +20,7 @@ from .message_fragments import (
 )
 from . import message_router, semantic_routing, worker_handlers
 from .ingress import events as ingress_events
+from .observability import audit as audit_observability
 from .transport import http as http_transport
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
@@ -613,27 +614,11 @@ COMMAND_ALIASES = {
 }
 
 
-def _rotate_log_if_needed(log_path: Path, max_bytes: int = 5 * 1024 * 1024, keep: int = 5) -> None:
-    """Rotate log file if it exceeds max_bytes. Keeps the last `keep` rotated files."""
-    try:
-        if not log_path.exists() or log_path.stat().st_size < max_bytes:
-            return
-        # Shift existing rotated files: .5 -> delete, .4 -> .5, ..., .1 -> .2
-        for i in range(keep, 0, -1):
-            src = log_path.with_suffix(f"{log_path.suffix}.{i}")
-            if i >= keep:
-                if src.exists():
-                    src.unlink()
-            else:
-                dst = log_path.with_suffix(f"{log_path.suffix}.{i + 1}")
-                if src.exists():
-                    src.rename(dst)
-        # Rotate current file to .1
-        rotated = log_path.with_suffix(f"{log_path.suffix}.1")
-        log_path.rename(rotated)
-        print(f"Rotated audit log: {log_path} -> {rotated}")
-    except Exception as exc:
-        print("Audit log rotation failed:", repr(exc))
+def _rotate_log_if_needed(
+    log_path: Path, max_bytes: int = 5 * 1024 * 1024, keep: int = 5
+) -> None:
+    return audit_observability._rotate_log_if_needed(log_path, max_bytes, keep)
+
 
 
 def write_message_audit(
@@ -700,137 +685,75 @@ def write_message_audit(
     bot_message_id: str = "",
     generated_for_message_ids: Sequence[str] = (),
     turn_id: str = "",
-    event_time=None,
+    event_time=None
 ) -> None:
-    try:
-        total_latency_ms = max(0, int((time.time() - float(event_time)) * 1000))
-    except (TypeError, ValueError):
-        total_latency_ms = 0
-    try:
-        scene_payload = json.loads(scene_context) if scene_context else {}
-    except (json.JSONDecodeError, TypeError):
-        scene_payload = {}
-    record = {
-        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "event_time": event_time,
-        "group_id": str(group_id) if group_id is not None else "",
-        "user_id": str(user_id) if user_id is not None else "",
-        "question": question,
-        "mentioned": bool(mentioned),
-        "decision": decision,
-        "reason": reason,
-        "has_context": bool(has_context),
-        "sources": list(sources),
-        "followup_of": followup_of,
-        "followup_scope": followup_scope,
-        "reply_mode": reply_mode,
-        "retrieval_score": round(float(retrieval_score), 4),
-        "retrieval_coverage": round(float(retrieval_coverage), 4),
-        "knowledge_strength": (
-            "strong"
-            if (
-                float(retrieval_score)
-                >= float(getattr(settings, "knowledge_strong_min_score", 0.18))
-                and float(retrieval_coverage)
-                >= float(getattr(settings, "knowledge_strong_min_coverage", 0.6))
-            )
-            else ("weak" if sources or retrieval_score or retrieval_coverage else "none")
-        ),
-        "model_latency_ms": int(model_latency_ms),
-        "total_latency_ms": total_latency_ms,
-        "model": model_name,
-        "reply_message_id": str(reply_message_id),
-        "reply_target_user_id": str(reply_target_user_id),
-        "chat_context": list(chat_context),
-        "scene_context": scene_context,
-        "answer": answer,
-        "mention_user_id": str(mention_user_id or ""),
-        "semantic_intent": semantic_intent,
-        "semantic_topic": semantic_topic,
-        "implicit_meaning": implicit_meaning,
-        "capability": capability,
-        "semantic_confidence": round(float(semantic_confidence), 4),
-        "topic_candidates": [
-            {
-                "key": candidate.key,
-                "label": candidate.label,
-                "confidence": round(candidate.confidence, 4),
-                "basis": candidate.basis,
-                "anchor_message_ids": list(candidate.anchor_message_ids),
-            }
-            for candidate in topic_candidates
-        ],
-        "subject_candidates": [
-            {
-                "entity_type": candidate.entity_type,
-                "entity_id": candidate.entity_id,
-                "label": candidate.label,
-                "confidence": round(candidate.confidence, 4),
-                "evidence_message_ids": list(candidate.evidence_message_ids),
-            }
-            for candidate in subject_candidates
-        ],
-        "subject_ambiguity": subject_ambiguity,
-        "bot_involvement": bot_involvement,
-        "reply_perspective": reply_perspective,
-        "semantic_audience": semantic_audience,
-        "participation_role": participation_role,
-        "plan_context_revision": int(plan_context_revision),
-        "plan_scene_version": int(plan_scene_version),
-        "related_message_ids": list(related_message_ids),
-        "semantic_replan_count": int(semantic_replan_count),
-        "semantic_replan_reason": semantic_replan_reason,
-        "planner_status": planner_status,
-        "planner_lane": (
-            "addressed"
-            if mentioned
-            or (
-                bool(str(getattr(settings, "bot_qq", "") or ""))
-                and str(reply_target_user_id or "")
-                == str(getattr(settings, "bot_qq", "") or "")
-            )
-            else "unsolicited"
-        ),
-        "planner_circuit_open": planner_status == "circuit_open",
-        "planner_latency_ms": int(planner_latency_ms),
-        "scene_version": int(scene_payload.get("version") or 0) if isinstance(scene_payload, dict) else 0,
-        "scene_updated_through_sequence": (
-            int(scene_payload.get("updated_through_sequence") or 0)
-            if isinstance(scene_payload, dict)
-            else 0
-        ),
-        "memory_query": memory_query,
-        "memory_hit_count": int(memory_hit_count),
-        "memory_retrieval_attempted": bool(memory_retrieval_attempted),
-        "memory_retrieval_mode": memory_retrieval_mode,
-        "memory_candidate_count": int(memory_candidate_count),
-        "memory_rejection_reason": memory_rejection_reason,
-        "recent_context_candidate_count": int(recent_context_candidate_count),
-        "recent_context_selected_count": int(recent_context_selected_count),
-        "recent_context_chars": int(recent_context_chars),
-        "memory_context_chars": int(memory_context_chars),
-        "context_deduplicated_count": int(context_deduplicated_count),
-        "recent_context_selected_ids": list(recent_context_selected_ids),
-        "memory_selected_chunk_ids": [int(value) for value in memory_selected_chunk_ids],
-        "memory_selected_by_planner": bool(memory_selected_by_planner),
-        "self_history_candidate_count": int(self_history_candidate_count),
-        "self_history_selected_count": int(self_history_selected_count),
-        "self_history_chars": int(self_history_chars),
-        "self_history_selected_message_ids": list(self_history_selected_message_ids),
-        "self_history_reasons": list(self_history_reasons),
-        "bot_message_id": str(bot_message_id or ""),
-        "generated_for_message_ids": list(generated_for_message_ids),
-        "turn_id": str(turn_id or ""),
-    }
-    log_path = Path(settings.message_audit_log)
-    try:
-        with audit_lock:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            _rotate_log_if_needed(log_path, max_bytes=5 * 1024 * 1024, keep=5)
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as exc:
-        print("Audit log write failed:", repr(exc))
+    return audit_observability.write_message_audit(
+        runtime_dependencies,
+        decision=decision,
+        reason=reason,
+        group_id=group_id,
+        user_id=user_id,
+        question=question,
+        mentioned=mentioned,
+        has_context=has_context,
+        sources=sources,
+        followup_of=followup_of,
+        followup_scope=followup_scope,
+        reply_mode=reply_mode,
+        retrieval_score=retrieval_score,
+        retrieval_coverage=retrieval_coverage,
+        model_latency_ms=model_latency_ms,
+        model_name=model_name,
+        reply_message_id=reply_message_id,
+        reply_target_user_id=reply_target_user_id,
+        chat_context=chat_context,
+        scene_context=scene_context,
+        answer=answer,
+        mention_user_id=mention_user_id,
+        semantic_intent=semantic_intent,
+        semantic_topic=semantic_topic,
+        implicit_meaning=implicit_meaning,
+        capability=capability,
+        semantic_confidence=semantic_confidence,
+        topic_candidates=topic_candidates,
+        subject_candidates=subject_candidates,
+        subject_ambiguity=subject_ambiguity,
+        bot_involvement=bot_involvement,
+        reply_perspective=reply_perspective,
+        semantic_audience=semantic_audience,
+        participation_role=participation_role,
+        plan_context_revision=plan_context_revision,
+        plan_scene_version=plan_scene_version,
+        related_message_ids=related_message_ids,
+        semantic_replan_count=semantic_replan_count,
+        semantic_replan_reason=semantic_replan_reason,
+        planner_status=planner_status,
+        planner_latency_ms=planner_latency_ms,
+        memory_query=memory_query,
+        memory_hit_count=memory_hit_count,
+        memory_retrieval_attempted=memory_retrieval_attempted,
+        memory_retrieval_mode=memory_retrieval_mode,
+        memory_candidate_count=memory_candidate_count,
+        memory_rejection_reason=memory_rejection_reason,
+        recent_context_candidate_count=recent_context_candidate_count,
+        recent_context_selected_count=recent_context_selected_count,
+        recent_context_chars=recent_context_chars,
+        memory_context_chars=memory_context_chars,
+        context_deduplicated_count=context_deduplicated_count,
+        recent_context_selected_ids=recent_context_selected_ids,
+        memory_selected_chunk_ids=memory_selected_chunk_ids,
+        memory_selected_by_planner=memory_selected_by_planner,
+        self_history_candidate_count=self_history_candidate_count,
+        self_history_selected_count=self_history_selected_count,
+        self_history_chars=self_history_chars,
+        self_history_selected_message_ids=self_history_selected_message_ids,
+        self_history_reasons=self_history_reasons,
+        bot_message_id=bot_message_id,
+        generated_for_message_ids=generated_for_message_ids,
+        turn_id=turn_id,
+        event_time=event_time,
+    )
+
 
 
 def extract_event_question(event: dict) -> tuple[str, bool]:
@@ -881,25 +804,8 @@ def is_admin_user(user_id, sender_role: str = "") -> bool:
 
 
 def recent_audit_entries(limit: int = 5) -> list[dict]:
-    log_path = Path(settings.message_audit_log)
-    if not log_path.exists():
-        return []
-    entries: list[dict] = []
-    try:
-        lines = log_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("decision") not in {"skipped", "ignored"}:
-            continue
-        entries.append(entry)
-        if len(entries) >= limit:
-            break
-    return entries
+    return audit_observability.recent_audit_entries(runtime_dependencies, limit)
+
 
 
 def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") -> str:
@@ -2225,60 +2131,13 @@ def is_identity_question(question: str) -> bool:
 
 
 def record_knowledge_gap(query: str, result) -> bool:
-    normalized = " ".join(str(query or "").strip().split())
-    if len(normalized) < 2:
-        return False
-    safe_query = redact_for_model(normalized)[:300]
-    now = time.time()
-    dedupe_seconds = max(0, getattr(settings, "knowledge_gap_dedupe_seconds", 3600))
-    with knowledge_gap_lock:
-        previous = recent_knowledge_gap_queries.get(safe_query, 0)
-        if now - previous < dedupe_seconds:
-            return False
-        recent_knowledge_gap_queries[safe_query] = now
-        cutoff = now - max(dedupe_seconds, 86400)
-        for key, timestamp in tuple(recent_knowledge_gap_queries.items()):
-            if timestamp < cutoff:
-                recent_knowledge_gap_queries.pop(key, None)
-        record = {
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "query": safe_query,
-            "top_score": round(float(result.top_score), 4),
-            "coverage": round(float(result.query_coverage), 4),
-            "sources": list(result.sources),
-            "matched_tokens": list(result.matched_query_tokens),
-            "missing_tokens": list(result.missing_query_tokens),
-        }
-        path = Path(getattr(settings, "knowledge_gap_log", "work/knowledge_gaps.jsonl"))
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            return True
-        except OSError as exc:
-            print("Knowledge gap log write failed:", repr(exc))
-            return False
+    return audit_observability.record_knowledge_gap(runtime_dependencies, query, result)
+
 
 
 def recent_knowledge_gap_entries(limit: int = 5) -> list[dict]:
-    path = Path(getattr(settings, "knowledge_gap_log", "work/knowledge_gaps.jsonl"))
-    if not path.exists():
-        return []
-    entries: list[dict] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(entry, dict):
-            entries.append(entry)
-        if len(entries) >= limit:
-            break
-    return entries
+    return audit_observability.recent_knowledge_gap_entries(runtime_dependencies, limit)
+
 
 
 def retrieve_knowledge(query: str, max_chars: int):

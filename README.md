@@ -59,6 +59,7 @@ squad-qqbot-mvp/
     ingress/
       events.py     OneBot 撤回、群过滤、上下文记录和入队编排
     observability/
+      audit.py      消息审计、知识缺口日志和日志轮转
       health.py     服务、队列、规划器和记忆健康快照
     transport/
       http.py       HTTP 请求解析、健康接口和 OneBot 入口适配
