@@ -33,6 +33,7 @@ from .fact_guard import (
     unsupported_fallback_precise_facts,
 )
 from .knowledge import ContextResult, KnowledgeBase
+from .knowledge_routing import KnowledgeRoutingService, attach_result
 from .models import (
     ConversationState,
     FollowupMatch,
@@ -2288,9 +2289,7 @@ def attach_knowledge_result(
     query: str,
     result: ContextResult,
 ) -> ProcessingDecision:
-    decision.knowledge_query = query
-    decision.knowledge_result = result
-    return decision
+    return attach_result(decision, query, result)
 
 
 def is_strong_knowledge_match(top_score: float, query_coverage: float) -> bool:
@@ -3822,15 +3821,10 @@ def should_process_message(
 
     normalized = question.strip()
     query_text = effective_question or normalized
-    knowledge_results: dict[str, ContextResult] = {}
-
-    def knowledge_result_for(query: str) -> ContextResult:
-        if query not in knowledge_results:
-            knowledge_results[query] = retrieve_knowledge(
-                query,
-                settings.max_context_chars,
-            )
-        return knowledge_results[query]
+    knowledge_router = KnowledgeRoutingService(
+        lambda query: retrieve_knowledge(query, settings.max_context_chars),
+        is_strong_knowledge_match,
+    )
 
     planner_enabled = bool(getattr(settings, "semantic_planner_enabled", False))
     explicitly_addressed = bool(
@@ -4114,11 +4108,9 @@ def should_process_message(
                 semantic_confidence=usable_plan.confidence,
             )
     if planner_enabled and not usable_plan and explicitly_addressed:
-        initial_result = knowledge_result_for(query_text)
-        initial_strong_match = is_strong_knowledge_match(
-            initial_result.top_score,
-            initial_result.query_coverage,
-        )
+        initial_selection = knowledge_router.lookup(query_text)
+        initial_result = initial_selection.result
+        initial_strong_match = initial_selection.strong_match
         decision = semantic_routing.addressed_planner_fallback(
             result=initial_result,
             query_text=query_text,
@@ -4141,13 +4133,11 @@ def should_process_message(
             circuit_open=circuit_open,
             low_confidence=plan is not None,
         )
-    result = knowledge_result_for(query_text)
+    selection = knowledge_router.lookup(query_text)
+    result = selection.result
     context = result.context
     sources = result.sources
-    strong_match = is_strong_knowledge_match(
-        result.top_score,
-        result.query_coverage,
-    )
+    strong_match = selection.strong_match
     if (
         not usable_plan
         and not strong_match
@@ -4155,28 +4145,20 @@ def should_process_message(
         and (mentioned or looks_like_direct_question(normalized))
     ):
         rewritten = contextual_retrieval_question(normalized, chat_context)
-        if rewritten:
-            standalone_question, confidence = rewritten
-            minimum_confidence = getattr(settings, "contextual_query_min_confidence", 0.75)
-            if confidence >= minimum_confidence and standalone_question != query_text:
-                candidate = retrieve_knowledge(
-                    standalone_question,
-                    settings.max_context_chars,
-                )
-                candidate_is_strong = is_strong_knowledge_match(
-                    candidate.top_score,
-                    candidate.query_coverage,
-                )
-                candidate_is_better = (
-                    candidate.query_coverage,
-                    candidate.top_score,
-                ) > (result.query_coverage, result.top_score)
-                if candidate.context and (candidate_is_strong or candidate_is_better):
-                    query_text = standalone_question
-                    result = candidate
-                    context = result.context
-                    sources = result.sources
-                    strong_match = candidate_is_strong
+        selection = knowledge_router.contextual_candidate(
+            selection,
+            rewritten,
+            min_confidence=getattr(
+                settings,
+                "contextual_query_min_confidence",
+                0.75,
+            ),
+        )
+        query_text = selection.query
+        result = selection.result
+        context = result.context
+        sources = result.sources
+        strong_match = selection.strong_match
     if (
         not strong_match
         and usable_plan is not None

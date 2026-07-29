@@ -65,6 +65,7 @@ squad-qqbot-mvp/
     chat_scene.py   群聊场景快照和更新调度状态
     message_fragments.py 分段消息聚合、受话人边界和超时状态
     semantic_routing.py 语义路由上下文、关系推导和决策归一化
+    knowledge_routing.py 知识检索缓存、强度判断和改写候选选择
     knowledge.py    Markdown 知识库检索
     llm.py          大模型调用和回复判断
     onebot.py       OneBot 消息处理
