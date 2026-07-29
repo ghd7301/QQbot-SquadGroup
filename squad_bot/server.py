@@ -2294,9 +2294,11 @@ def attach_knowledge_result(
 
 
 def is_strong_knowledge_match(top_score: float, query_coverage: float) -> bool:
-    return (
-        top_score >= settings.knowledge_strong_min_score
-        and query_coverage >= settings.knowledge_strong_min_coverage
+    return semantic_routing.is_strong_knowledge_match(
+        top_score,
+        query_coverage,
+        min_score=settings.knowledge_strong_min_score,
+        min_coverage=settings.knowledge_strong_min_coverage,
     )
 
 
@@ -2330,44 +2332,29 @@ def semantic_plan_for_message(
 ) -> MessagePlan | None:
     if not getattr(settings, "semantic_planner_enabled", False):
         return None
-    if reply_target_user_id == settings.bot_qq:
-        reply_target = "bot"
-    elif reply_target_user_id:
-        reply_target = "member"
-    else:
-        reply_target = "none"
-    planner_context = budget_recent_context(
+    return semantic_routing.plan_message(
+        question,
         chat_context,
-        max_messages=max(
-            1,
-            getattr(settings, "semantic_planner_context_messages", 10),
-        ),
-        max_chars=max(
-            800,
-            getattr(settings, "semantic_planner_context_max_chars", 3200),
-        ),
-    )
-    planner_memory = budget_memory_context(
-        memory_candidates,
-        max_hits=3,
-        max_chars=max(
-            200,
-            getattr(settings, "semantic_planner_memory_max_chars", 800),
-        ),
-    )
-    return plan_group_message(
+        planner=plan_group_message,
+        memory_budget=budget_memory_context,
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=getattr(settings, "semantic_planner_model", settings.llm_model),
-        message=question,
-        context=planner_context,
-        scene_context=compact_scene_context(scene_context),
-        memory_candidates=planner_memory,
-        newer_message_ids=tuple(newer_message_ids),
+        scene_context=scene_context,
+        memory_candidates=memory_candidates,
         mentioned=mentioned,
         mentions_other=mentions_other,
-        reply_target=reply_target,
+        reply_target_user_id=reply_target_user_id,
+        bot_user_id=settings.bot_qq,
+        newer_message_ids=newer_message_ids,
         timeout=timeout or getattr(settings, "semantic_planner_timeout_seconds", 4),
+        context_messages=getattr(settings, "semantic_planner_context_messages", 10),
+        context_max_chars=getattr(
+            settings,
+            "semantic_planner_context_max_chars",
+            3200,
+        ),
+        memory_max_chars=getattr(settings, "semantic_planner_memory_max_chars", 800),
     )
 
 
@@ -2382,13 +2369,16 @@ def semantic_planner_timeout_cap(
         or explicit_knowledge_command
         or reply_target_user_id == settings.bot_qq
     )
-    if explicitly_addressed:
-        return getattr(
+    default_timeout = getattr(settings, "semantic_planner_timeout_seconds", 3)
+    return semantic_routing.planner_timeout_cap(
+        explicitly_addressed=explicitly_addressed,
+        default_timeout=default_timeout,
+        addressed_timeout=getattr(
             settings,
             "semantic_planner_addressed_timeout_seconds",
-            getattr(settings, "semantic_planner_timeout_seconds", 3),
-        )
-    return getattr(settings, "semantic_planner_timeout_seconds", 3)
+            default_timeout,
+        ),
+    )
 
 
 def semantic_planner_circuit_is_open(
@@ -2431,10 +2421,9 @@ def record_semantic_planner_availability(
 
 
 def semantic_plan_is_usable(plan: MessagePlan | None) -> bool:
-    return bool(
-        plan
-        and plan.confidence
-        >= getattr(settings, "semantic_planner_min_confidence", 0.68)
+    return semantic_routing.semantic_plan_is_usable(
+        plan,
+        min_confidence=getattr(settings, "semantic_planner_min_confidence", 0.68),
     )
 
 
@@ -4130,68 +4119,27 @@ def should_process_message(
             initial_result.top_score,
             initial_result.query_coverage,
         )
-        if explicit_knowledge_command and initial_strong_match:
-            decision = attach_knowledge_result(
-                ProcessingDecision(
-                    True,
-                    "explicit knowledge command with strong context",
-                    True,
-                    tuple(initial_result.sources),
-                    query_text,
-                    followup_of,
-                    followup_scope,
-                    "knowledge",
-                    tuple(chat_context),
-                    initial_result.top_score,
-                    initial_result.query_coverage,
-                    semantic_intent="knowledge",
-                    semantic_audience="bot",
-                    participation_role="addressed",
-                    planner_status=("low_confidence" if plan else "unavailable"),
-                ),
-                query_text,
-                initial_result,
-            )
-            return decision
-        fallback_allowed = settings.llm_fallback_enabled and (
-            explicitly_addressed or not settings.fallback_only_when_mentioned
+        decision = semantic_routing.addressed_planner_fallback(
+            result=initial_result,
+            query_text=query_text,
+            followup_of=followup_of,
+            followup_scope=followup_scope,
+            chat_context=chat_context,
+            explicit_knowledge_command=explicit_knowledge_command,
+            strong_match=initial_strong_match,
+            fallback_allowed=(
+                settings.llm_fallback_enabled
+                and (explicitly_addressed or not settings.fallback_only_when_mentioned)
+            ),
+            low_confidence=plan is not None,
         )
-        if fallback_allowed:
-            decision = ProcessingDecision(
-                should_reply=True,
-                reason="explicit address with unverified semantic fallback",
-                has_context=bool(initial_result.context),
-                sources=tuple(initial_result.sources),
-                effective_question=query_text,
-                followup_of=followup_of,
-                followup_scope=followup_scope,
-                reply_mode="fallback",
-                chat_context=(),
-                retrieval_score=initial_result.top_score,
-                retrieval_coverage=initial_result.query_coverage,
-                semantic_intent="unclear",
-                semantic_audience="bot",
-                participation_role="addressed",
-                risk_flags=("intent_unverified",),
-                planner_status=("low_confidence" if plan else "unavailable"),
-            )
-            if initial_strong_match:
-                decision = attach_knowledge_result(decision, query_text, initial_result)
+        if decision is not None:
             return decision
     if planner_enabled and not usable_plan and not explicitly_addressed:
-        return ProcessingDecision(
-            False,
-            (
-                "semantic planner circuit open; unsolicited reply fails closed"
-                if circuit_open
-                else "semantic planner unavailable; unsolicited reply fails closed"
-            ),
-            effective_question=query_text,
-            planner_status=(
-                "circuit_open"
-                if circuit_open
-                else ("low_confidence" if plan else "unavailable")
-            ),
+        return semantic_routing.unavailable_unsolicited_decision(
+            query_text,
+            circuit_open=circuit_open,
+            low_confidence=plan is not None,
         )
     result = knowledge_result_for(query_text)
     context = result.context

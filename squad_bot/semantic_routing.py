@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
+from .knowledge import ContextResult
 from .llm import MessagePlan
 from .models import ProcessingDecision
 
@@ -36,6 +37,168 @@ def compact_scene_context(scene_context: str) -> str:
         "topics": topics,
     }
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+
+
+def plan_message(
+    question: str,
+    chat_context: Sequence[str],
+    *,
+    planner: Callable[..., MessagePlan | None],
+    memory_budget: Callable[..., tuple[str, ...]],
+    base_url: str,
+    api_key: str,
+    model: str,
+    scene_context: str,
+    memory_candidates: Sequence[str],
+    mentioned: bool,
+    mentions_other: bool,
+    reply_target_user_id: str,
+    bot_user_id: str,
+    newer_message_ids: Sequence[str],
+    timeout: int,
+    context_messages: int,
+    context_max_chars: int,
+    memory_max_chars: int,
+) -> MessagePlan | None:
+    if reply_target_user_id == bot_user_id:
+        reply_target = "bot"
+    elif reply_target_user_id:
+        reply_target = "member"
+    else:
+        reply_target = "none"
+    planner_context = budget_recent_context(
+        chat_context,
+        max_messages=max(1, context_messages),
+        max_chars=max(800, context_max_chars),
+    )
+    planner_memory = memory_budget(
+        memory_candidates,
+        max_hits=3,
+        max_chars=max(200, memory_max_chars),
+    )
+    return planner(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        message=question,
+        context=planner_context,
+        scene_context=compact_scene_context(scene_context),
+        memory_candidates=planner_memory,
+        newer_message_ids=tuple(newer_message_ids),
+        mentioned=mentioned,
+        mentions_other=mentions_other,
+        reply_target=reply_target,
+        timeout=timeout,
+    )
+
+
+def is_strong_knowledge_match(
+    top_score: float,
+    query_coverage: float,
+    *,
+    min_score: float,
+    min_coverage: float,
+) -> bool:
+    return top_score >= min_score and query_coverage >= min_coverage
+
+
+def semantic_plan_is_usable(
+    plan: MessagePlan | None,
+    *,
+    min_confidence: float,
+) -> bool:
+    return bool(plan and plan.confidence >= min_confidence)
+
+
+def planner_timeout_cap(
+    *,
+    explicitly_addressed: bool,
+    default_timeout: int,
+    addressed_timeout: int,
+) -> int:
+    return addressed_timeout if explicitly_addressed else default_timeout
+
+
+def addressed_planner_fallback(
+    *,
+    result: ContextResult,
+    query_text: str,
+    followup_of: str,
+    followup_scope: str,
+    chat_context: Sequence[str],
+    explicit_knowledge_command: bool,
+    strong_match: bool,
+    fallback_allowed: bool,
+    low_confidence: bool,
+) -> ProcessingDecision | None:
+    planner_status = "low_confidence" if low_confidence else "unavailable"
+    if explicit_knowledge_command and strong_match:
+        decision = ProcessingDecision(
+            True,
+            "explicit knowledge command with strong context",
+            True,
+            tuple(result.sources),
+            query_text,
+            followup_of,
+            followup_scope,
+            "knowledge",
+            tuple(chat_context),
+            result.top_score,
+            result.query_coverage,
+            semantic_intent="knowledge",
+            semantic_audience="bot",
+            participation_role="addressed",
+            planner_status=planner_status,
+        )
+        decision.knowledge_query = query_text
+        decision.knowledge_result = result
+        return decision
+    if not fallback_allowed:
+        return None
+    decision = ProcessingDecision(
+        should_reply=True,
+        reason="explicit address with unverified semantic fallback",
+        has_context=bool(result.context),
+        sources=tuple(result.sources),
+        effective_question=query_text,
+        followup_of=followup_of,
+        followup_scope=followup_scope,
+        reply_mode="fallback",
+        chat_context=(),
+        retrieval_score=result.top_score,
+        retrieval_coverage=result.query_coverage,
+        semantic_intent="unclear",
+        semantic_audience="bot",
+        participation_role="addressed",
+        risk_flags=("intent_unverified",),
+        planner_status=planner_status,
+    )
+    if strong_match:
+        decision.knowledge_query = query_text
+        decision.knowledge_result = result
+    return decision
+
+
+def unavailable_unsolicited_decision(
+    query_text: str,
+    *,
+    circuit_open: bool,
+    low_confidence: bool,
+) -> ProcessingDecision:
+    return ProcessingDecision(
+        False,
+        (
+            "semantic planner circuit open; unsolicited reply fails closed"
+            if circuit_open
+            else "semantic planner unavailable; unsolicited reply fails closed"
+        ),
+        effective_question=query_text,
+        planner_status=(
+            "circuit_open"
+            if circuit_open
+            else ("low_confidence" if low_confidence else "unavailable")
+        ),
+    )
 
 
 def context_line_payload(line: str) -> dict:
