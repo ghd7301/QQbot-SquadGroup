@@ -83,8 +83,14 @@ chat_history_save_event = threading.Event()
 knowledge_gap_lock = threading.Lock()
 recent_knowledge_gap_queries: dict[str, float] = {}
 semantic_planner_health_lock = threading.Lock()
-semantic_planner_consecutive_failures = 0
-semantic_planner_circuit_open_until = 0.0
+semantic_planner_consecutive_failures: dict[str, int] = {
+    "unsolicited": 0,
+    "addressed": 0,
+}
+semantic_planner_circuit_open_until: dict[str, float] = {
+    "unsolicited": 0.0,
+    "addressed": 0.0,
+}
 
 
 @dataclass
@@ -96,7 +102,7 @@ class ProcessingDecision:
     effective_question: str = ""
     followup_of: str = ""
     followup_scope: str = ""
-    reply_mode: str = "knowledge"
+    reply_mode: str = ""
     chat_context: tuple[str, ...] = ()
     retrieval_score: float = 0.0
     retrieval_coverage: float = 0.0
@@ -837,6 +843,16 @@ def write_message_audit(
         "reply_mode": reply_mode,
         "retrieval_score": round(float(retrieval_score), 4),
         "retrieval_coverage": round(float(retrieval_coverage), 4),
+        "knowledge_strength": (
+            "strong"
+            if (
+                float(retrieval_score)
+                >= float(getattr(settings, "knowledge_strong_min_score", 0.18))
+                and float(retrieval_coverage)
+                >= float(getattr(settings, "knowledge_strong_min_coverage", 0.6))
+            )
+            else ("weak" if sources or retrieval_score or retrieval_coverage else "none")
+        ),
         "model_latency_ms": int(model_latency_ms),
         "total_latency_ms": total_latency_ms,
         "model": model_name,
@@ -882,6 +898,17 @@ def write_message_audit(
         "semantic_replan_count": int(semantic_replan_count),
         "semantic_replan_reason": semantic_replan_reason,
         "planner_status": planner_status,
+        "planner_lane": (
+            "addressed"
+            if mentioned
+            or (
+                bool(str(getattr(settings, "bot_qq", "") or ""))
+                and str(reply_target_user_id or "")
+                == str(getattr(settings, "bot_qq", "") or "")
+            )
+            else "unsolicited"
+        ),
+        "planner_circuit_open": planner_status == "circuit_open",
         "planner_latency_ms": int(planner_latency_ms),
         "scene_version": int(scene_payload.get("version") or 0) if isinstance(scene_payload, dict) else 0,
         "scene_updated_through_sequence": (
@@ -1845,6 +1872,25 @@ def review_and_refresh_answer(
             "unclear",
         }
         context_changed = baseline_revision is None or latest_revision > baseline_revision
+        context_change_note = ""
+        if (
+            context_changed
+            and baseline_revision is not None
+            and target_item
+            and target_item.get("user_id")
+            and target_item.get("chat_sequence")
+        ):
+            context_changed, delta_ids, relation = locked_send_context_change(
+                group_id,
+                baseline_revision,
+                target_item,
+            )
+            if not context_changed:
+                rendered_ids = ",".join(delta_ids)
+                context_change_note = (
+                    f"adaptive final review skipped: {relation}"
+                    + (f"; delta={rendered_ids}" if rendered_ids else "")
+                )
         requires_model_review = (
             review_mode == "always"
             or context_changed
@@ -1861,6 +1907,13 @@ def review_and_refresh_answer(
                     decision.semantic_audience == "unclear"
                     or decision.participation_role == "uncertain"
                     or decision.semantic_confidence < 0.8
+                    or (
+                        decision.semantic_intent == "knowledge"
+                        and not is_strong_knowledge_match(
+                            decision.retrieval_score,
+                            decision.retrieval_coverage,
+                        )
+                    )
                 )
             )
             or (
@@ -1879,7 +1932,11 @@ def review_and_refresh_answer(
             unsafe_reason = unsafe_or_repeated_reply(group_id, candidate)
             if unsafe_reason:
                 return "", unsafe_reason, latest_revision
-            return candidate, "adaptive final review skipped", latest_revision
+            return (
+                candidate,
+                context_change_note or "adaptive final review skipped",
+                latest_revision,
+            )
         latest_context = recent_group_chat_context(
             group_id,
             now=time.time(),
@@ -1917,7 +1974,24 @@ def review_and_refresh_answer(
             timeout=review_timeout,
         )
         if not review or review.confidence < 0.6:
-            return "", "final review unavailable or low confidence", latest_revision
+            failure_reason = (
+                "final review unavailable"
+                if review is None
+                else "final review low confidence"
+            )
+            degraded = deterministic_review_failure_answer(
+                decision,
+                candidate,
+                mentioned=mentioned,
+                context_changed=context_changed,
+            )
+            if degraded:
+                return (
+                    degraded,
+                    f"{failure_reason}; deterministic addressed degradation",
+                    latest_revision,
+                )
+            return "", failure_reason, latest_revision
         merge_review_message_ids(target_item, review, latest_context)
         if review.action == "drop":
             return "", f"final review dropped [{review.context_relation}]: {review.reason}", latest_revision
@@ -2028,7 +2102,6 @@ def refresh_answer_for_late_context(
 
 def clear_chat_state() -> None:
     global chat_message_sequence
-    global semantic_planner_consecutive_failures, semantic_planner_circuit_open_until
     with chat_history_lock:
         group_chat_history.clear()
         chat_message_sequence = 0
@@ -2040,8 +2113,9 @@ def clear_chat_state() -> None:
     with hostile_reply_lock:
         hostile_reply_history.clear()
     with semantic_planner_health_lock:
-        semantic_planner_consecutive_failures = 0
-        semantic_planner_circuit_open_until = 0.0
+        for lane in tuple(semantic_planner_consecutive_failures):
+            semantic_planner_consecutive_failures[lane] = 0
+            semantic_planner_circuit_open_until[lane] = 0.0
     clear_fragment_state()
 
 
@@ -2615,31 +2689,57 @@ def semantic_planner_timeout_cap(
     return getattr(settings, "semantic_planner_timeout_seconds", 3)
 
 
-def semantic_planner_circuit_is_open(*, now: float | None = None) -> bool:
+def semantic_planner_circuit_is_open(
+    *,
+    lane: str = "unsolicited",
+    now: float | None = None,
+) -> bool:
     current_time = time.monotonic() if now is None else now
     with semantic_planner_health_lock:
-        return semantic_planner_circuit_open_until > current_time
+        return semantic_planner_circuit_open_until.get(lane, 0.0) > current_time
+
+
+def semantic_planner_health_snapshot(*, now: float | None = None) -> dict[str, dict]:
+    current_time = time.monotonic() if now is None else now
+    with semantic_planner_health_lock:
+        lanes = set(semantic_planner_consecutive_failures) | set(
+            semantic_planner_circuit_open_until
+        )
+        return {
+            lane: {
+                "consecutive_failures": semantic_planner_consecutive_failures.get(lane, 0),
+                "circuit_open": semantic_planner_circuit_open_until.get(lane, 0.0)
+                > current_time,
+                "retry_after_seconds": max(
+                    0,
+                    int(semantic_planner_circuit_open_until.get(lane, 0.0) - current_time),
+                ),
+            }
+            for lane in sorted(lanes)
+        }
 
 
 def record_semantic_planner_availability(
     available: bool,
     *,
+    lane: str = "unsolicited",
     now: float | None = None,
 ) -> None:
-    global semantic_planner_consecutive_failures, semantic_planner_circuit_open_until
     current_time = time.monotonic() if now is None else now
     with semantic_planner_health_lock:
         if available:
-            semantic_planner_consecutive_failures = 0
-            semantic_planner_circuit_open_until = 0.0
+            semantic_planner_consecutive_failures[lane] = 0
+            semantic_planner_circuit_open_until[lane] = 0.0
             return
-        semantic_planner_consecutive_failures += 1
+        semantic_planner_consecutive_failures[lane] = (
+            semantic_planner_consecutive_failures.get(lane, 0) + 1
+        )
         threshold = max(
             1,
             int(getattr(settings, "semantic_planner_circuit_failures", 3)),
         )
-        if semantic_planner_consecutive_failures >= threshold:
-            semantic_planner_circuit_open_until = current_time + max(
+        if semantic_planner_consecutive_failures[lane] >= threshold:
+            semantic_planner_circuit_open_until[lane] = current_time + max(
                 1,
                 int(getattr(settings, "semantic_planner_circuit_seconds", 60)),
             )
@@ -3671,6 +3771,46 @@ def fallback_grounding_issue(decision: ProcessingDecision, answer: str) -> str:
         return ""
     rendered = ", ".join(f"{value}{unit}" for value, unit in sorted(unsupported))
     return f"unsupported precise fact in fallback reply: {rendered}"
+
+
+def deterministic_review_failure_answer(
+    decision: ProcessingDecision,
+    candidate: str,
+    *,
+    mentioned: bool,
+    context_changed: bool = False,
+) -> str:
+    explicitly_addressed = bool(
+        mentioned
+        or decision.participation_role == "addressed"
+        or decision.semantic_audience == "bot"
+    )
+    if not explicitly_addressed:
+        return ""
+    if decision.semantic_intent == "control_attempt":
+        return "这类操作不能通过普通聊天执行。"
+    if (
+        decision.reply_mode == "knowledge"
+        and candidate
+        and not context_changed
+        and not decision.risk_flags
+        and is_strong_knowledge_match(
+            decision.retrieval_score,
+            decision.retrieval_coverage,
+        )
+    ):
+        knowledge_context = (
+            decision.knowledge_result.context
+            if decision.knowledge_result is not None
+            else ""
+        )
+        if not unsupported_fallback_precise_facts(candidate, knowledge_context):
+            return candidate
+    if decision.semantic_intent == "knowledge":
+        return "这个具体问题我暂时没有可靠信息，不能确定。"
+    if decision.planner_status in {"unavailable", "circuit_open", "low_confidence"}:
+        return "这次我没判断清楚你在问什么，换个说法再问我一次。"
+    return ""
 
 
 def answer_for_decision(
@@ -4852,7 +4992,7 @@ def should_process_message(
     circuit_open = bool(
         planner_enabled
         and not explicitly_addressed
-        and semantic_planner_circuit_is_open()
+        and semantic_planner_circuit_is_open(lane="unsolicited")
     )
     plan = None
     if not circuit_open:
@@ -4867,7 +5007,10 @@ def should_process_message(
             timeout=planner_timeout,
         )
         if planner_enabled:
-            record_semantic_planner_availability(plan is not None)
+            record_semantic_planner_availability(
+                plan is not None,
+                lane=("addressed" if explicitly_addressed else "unsolicited"),
+            )
     usable_plan = plan if semantic_plan_is_usable(plan) else None
     if usable_plan is not None and plan_out is not None:
         plan_out.append(usable_plan)
@@ -5804,6 +5947,9 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         has_context=decision.has_context,
                         sources=decision.sources,
                         reply_mode=decision.reply_mode,
+                        retrieval_score=decision.retrieval_score,
+                        retrieval_coverage=decision.retrieval_coverage,
+                        model_latency_ms=int((time.monotonic() - model_started) * 1000),
                         semantic_intent=decision.semantic_intent,
                         semantic_topic=decision.semantic_topic,
                         semantic_confidence=decision.semantic_confidence,
@@ -5821,7 +5967,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     user_id=user_id,
                     question=question,
                     mentioned=mentioned,
+                    has_context=decision.has_context,
+                    sources=decision.sources,
                     reply_mode=decision.reply_mode,
+                    retrieval_score=decision.retrieval_score,
+                    retrieval_coverage=decision.retrieval_coverage,
                     answer=answer,
                     **semantic_relation_audit_fields(decision),
                     event_time=event_time,
@@ -5880,7 +6030,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     user_id=user_id,
                     question=question,
                     mentioned=mentioned,
+                    has_context=decision.has_context,
+                    sources=decision.sources,
                     reply_mode=decision.reply_mode,
+                    retrieval_score=decision.retrieval_score,
+                    retrieval_coverage=decision.retrieval_coverage,
                     model_latency_ms=model_latency_ms,
                     **semantic_relation_audit_fields(decision),
                     event_time=event_time,
@@ -5906,7 +6060,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         user_id=user_id,
                         question=question,
                         mentioned=mentioned,
+                        has_context=decision.has_context,
+                        sources=decision.sources,
                         reply_mode=decision.reply_mode,
+                        retrieval_score=decision.retrieval_score,
+                        retrieval_coverage=decision.retrieval_coverage,
                         model_latency_ms=int((time.monotonic() - model_started) * 1000),
                         **semantic_relation_audit_fields(decision),
                         event_time=event_time,
@@ -5932,7 +6090,11 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                         user_id=user_id,
                         question=question,
                         mentioned=mentioned,
+                        has_context=decision.has_context,
+                        sources=decision.sources,
                         reply_mode=decision.reply_mode,
+                        retrieval_score=decision.retrieval_score,
+                        retrieval_coverage=decision.retrieval_coverage,
                         model_latency_ms=model_latency_ms,
                         answer=answer,
                         **semantic_relation_audit_fields(decision),
@@ -6627,6 +6789,7 @@ class Handler(BaseHTTPRequestHandler):
                 scene_updating = len(chat_scene_running)
             memory_status = chat_memory_manager.status() if chat_memory_manager else {}
             pending_counts = pending_status_counts()
+            planner_health = semantic_planner_health_snapshot()
             self._json(
                 200,
                 {
@@ -6648,6 +6811,7 @@ class Handler(BaseHTTPRequestHandler):
                     "pending_sent_unknown": pending_counts.get("sent_unknown", 0),
                     "scene_groups": scene_groups,
                     "scene_updating": scene_updating,
+                    "semantic_planner": planner_health,
                     "memory_messages": memory_status.get("messages", 0),
                     "memory_chunks": memory_status.get("chunks", 0),
                     "memory_topic_relations": memory_status.get("topic_relations", 0),

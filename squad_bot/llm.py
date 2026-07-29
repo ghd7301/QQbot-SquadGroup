@@ -102,7 +102,7 @@ MESSAGE_PLAN_PROMPT = """你是 QQ 群消息语义规划器，只理解消息并
 5. topic_candidates 最多 2 个；subject_candidates 最多 3 个。只引用输入中真实 message_id。当前机器人用 entity_type=bot，其他机器人/软件/项目用 external_project；对象不明时 subject_ambiguity=ambiguous/unknown，不要猜。
 6. relevant_context_message_ids 只选真正相关消息。若提供“规划后新增消息 ID”，只有会补充、纠正、否定、回答或改变当前消息的新增 ID 才能选择；无关并行消息不选。QQ 引用话题 basis=qq_reply，其他 basis 用 continuation/semantic/bridge。
 7. 历史候选仅在确实相关时选择 chunk_id。需要候选外旧记录时 memory_needed=true，并给 memory_query；participant_scope 只能 current/reply_chain/group，time_scope 只能 day/week/month/all/空。
-8. capability 只有当前消息直接要求查看对应的可观测信息，并且 intent=bot_meta 时，才可为 knowledge_files、knowledge_status、runtime_status、model_status、health；其他情况必须为 none。提到机器人、AI、知识库或模型不等于要求查看状态，身份讨论、普通事实问题、游戏问题、生活问题和闲聊一律返回 capability=none。
+8. capability 只有当前消息直接要求查看对应的可观测信息，并且 intent=bot_meta 时，才可为 knowledge_files、knowledge_status、runtime_status、model_status、health；其他情况必须为 none。直接询问“你当前用的是什么模型、模型名称或模型配置”必须返回 intent=bot_meta、capability=model_status，不能按人格身份问题归为 normal_chat。提到机器人、AI、知识库或模型但没有索取对应状态，不等于状态查询；身份讨论、普通事实问题、游戏问题、生活问题和闲聊一律返回 capability=none。
 9. risk_flags 仅按语义选 group_recruitment、self_identity、real_world_claim、third_party_target、control、hostility。向全群找真人组队标 group_recruitment；机器人不能假装能上线。后续若回复只能建议去 TS 里对应游戏的语音频道，不得回答“有”“我来”“算我一个”。
 10. 先按字面和硬关系理解，再考虑谐音、缩写或梗。信息不足就降低 confidence。不要生成 draft_reply。
 
@@ -609,6 +609,10 @@ def plan_group_message(
         if intent not in allowed_intents:
             intent = "unclear"
         if capability not in allowed_capabilities:
+            capability = "none"
+        if capability != "none":
+            intent = "bot_meta"
+        elif intent != "bot_meta":
             capability = "none"
         indices: list[int] = []
         for raw_index in payload.get("relevant_context_indices") or ():

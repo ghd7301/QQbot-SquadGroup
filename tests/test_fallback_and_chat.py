@@ -352,6 +352,30 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(mentioned.reply_mode, "fallback")
         planner.assert_called_once()
 
+    def test_addressed_planner_failure_does_not_open_unsolicited_circuit(self) -> None:
+        configured = routing_settings(
+            semantic_planner_circuit_failures=1,
+            semantic_planner_circuit_seconds=60,
+        )
+        with patch.object(server, "settings", configured):
+            server.record_semantic_planner_availability(
+                False,
+                lane="addressed",
+                now=10,
+            )
+
+            self.assertTrue(
+                server.semantic_planner_circuit_is_open(lane="addressed", now=11)
+            )
+            self.assertFalse(
+                server.semantic_planner_circuit_is_open(lane="unsolicited", now=11)
+            )
+            snapshot = server.semantic_planner_health_snapshot(now=11)
+
+        self.assertTrue(snapshot["addressed"]["circuit_open"])
+        self.assertEqual(snapshot["addressed"]["consecutive_failures"], 1)
+        self.assertFalse(snapshot["unsolicited"]["circuit_open"])
+
     def test_explicit_knowledge_command_keeps_strong_fallback_during_planner_failure(self) -> None:
         strong = ContextResult("队包每60秒一轮", ["队包.md"], 0.4, 1.0)
         configured = routing_settings(semantic_planner_enabled=True)
@@ -1581,6 +1605,37 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertLessEqual(len(normalize_model_answer("很长" * 100, 30)), 30)
 
 
+    def test_semantic_planner_capability_contract_overrides_normal_chat(self) -> None:
+        response = json.dumps(
+            {
+                "audience": "bot",
+                "participation_role": "addressed",
+                "intent": "normal_chat",
+                "reply_worthy": True,
+                "standalone_question": "你是哪个模型？",
+                "implicit_meaning": "询问当前模型名称",
+                "topic_summary": "机器人模型状态",
+                "relevant_context_indices": [],
+                "capability": "model_status",
+                "confidence": 0.95,
+            },
+            ensure_ascii=False,
+        )
+        with patch.object(llm, "_chat_completion", return_value=response):
+            plan = plan_group_message(
+                base_url="https://example.invalid",
+                api_key="key",
+                model="model",
+                message="你是哪个模型？",
+                context=(),
+                mentioned=True,
+                mentions_other=False,
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.intent, "bot_meta")
+        self.assertEqual(plan.capability, "model_status")
+
     def test_semantic_planner_parses_control_attempt(self) -> None:
         response = json.dumps(
             {
@@ -1905,6 +1960,186 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertEqual(answer, "我觉得还行。")
         self.assertEqual(reason, "adaptive final review skipped")
         reviewer.assert_not_called()
+
+    def test_adaptive_review_skips_unrelated_late_message_for_addressed_question(self) -> None:
+        configured = routing_settings(
+            final_reply_review_mode="adaptive",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+            message_fragment_max_wait_seconds=8,
+        )
+        decision = server.ProcessingDecision(
+            True,
+            "strong knowledge",
+            has_context=True,
+            reply_mode="knowledge",
+            semantic_intent="knowledge",
+            semantic_confidence=0.95,
+            semantic_audience="bot",
+            participation_role="addressed",
+        )
+        now = time.time()
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "review_candidate_reply") as reviewer,
+        ):
+            target_sequence = server.record_group_chat_message(
+                1,
+                "asker",
+                "叠队包是只有塔利班才能叠对吧",
+                now,
+                message_id="question-1",
+                mentioned_bot=True,
+            )
+            server.record_group_chat_message(
+                1,
+                "other",
+                "我还没下班",
+                now + 1,
+                message_id="parallel-1",
+            )
+            answer, reason, revision = server.review_and_refresh_answer(
+                question="叠队包是只有塔利班才能叠对吧",
+                answer="资料里的回答",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=target_sequence,
+                target_item={
+                    "user_id": "asker",
+                    "chat_sequence": target_sequence,
+                    "message_id": "question-1",
+                    "mentioned": True,
+                },
+            )
+
+        self.assertEqual(answer, "资料里的回答")
+        self.assertIn("unrelated", reason)
+        self.assertEqual(revision, target_sequence + 1)
+        reviewer.assert_not_called()
+
+    def test_review_failure_degrades_addressed_weak_knowledge_to_fixed_answer(self) -> None:
+        configured = routing_settings(
+            final_reply_review_mode="adaptive",
+            final_reply_review_timeout_seconds=4,
+        )
+        decision = server.ProcessingDecision(
+            True,
+            "weak knowledge fallback",
+            sources=("02-出生点与工事.md / 队包是什么",),
+            reply_mode="fallback",
+            retrieval_score=1.2,
+            retrieval_coverage=0.18,
+            semantic_intent="knowledge",
+            semantic_confidence=0.9,
+            semantic_audience="bot",
+            participation_role="addressed",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", return_value=8),
+            patch.object(server, "recent_group_chat_context", return_value=()),
+            patch.object(server, "review_candidate_reply", return_value=None),
+        ):
+            answer, reason, _ = server.review_and_refresh_answer(
+                question="叠队包是只有塔利班才能叠对吧",
+                answer="不确定，可能只有一个阵营可以。",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=8,
+            )
+
+        self.assertEqual(answer, "这个具体问题我暂时没有可靠信息，不能确定。")
+        self.assertIn("deterministic addressed degradation", reason)
+
+    def test_review_failure_keeps_grounded_strong_knowledge_answer(self) -> None:
+        configured = routing_settings(
+            final_reply_review_mode="always",
+            final_reply_review_timeout_seconds=4,
+        )
+        result = ContextResult("队包每 60 秒刷新一轮。", ["队包.md"], 0.8, 1.0)
+        decision = server.ProcessingDecision(
+            True,
+            "strong knowledge",
+            has_context=True,
+            sources=tuple(result.sources),
+            reply_mode="knowledge",
+            retrieval_score=result.top_score,
+            retrieval_coverage=result.query_coverage,
+            knowledge_result=result,
+            semantic_intent="knowledge",
+            semantic_confidence=0.95,
+            semantic_audience="bot",
+            participation_role="addressed",
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", return_value=8),
+            patch.object(server, "recent_group_chat_context", return_value=()),
+            patch.object(server, "review_candidate_reply", return_value=None),
+        ):
+            answer, reason, _ = server.review_and_refresh_answer(
+                question="队包多久刷新",
+                answer="队包每 60 秒刷新一轮。",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=8,
+            )
+
+        self.assertEqual(answer, "队包每 60 秒刷新一轮。")
+        self.assertIn("deterministic addressed degradation", reason)
+        self.assertEqual(
+            server.deterministic_review_failure_answer(
+                decision,
+                "队包每 60 秒刷新一轮。",
+                mentioned=True,
+                context_changed=True,
+            ),
+            "这个具体问题我暂时没有可靠信息，不能确定。",
+        )
+
+    def test_review_failure_uses_fixed_boundary_for_control_attempt(self) -> None:
+        configured = routing_settings(
+            final_reply_review_mode="adaptive",
+            final_reply_review_timeout_seconds=4,
+        )
+        decision = server.ProcessingDecision(
+            True,
+            "addressed control",
+            reply_mode="fallback",
+            semantic_intent="control_attempt",
+            semantic_confidence=0.9,
+            semantic_audience="bot",
+            participation_role="addressed",
+            risk_flags=("control",),
+        )
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "latest_group_user_sequence", return_value=8),
+            patch.object(server, "recent_group_chat_context", return_value=()),
+            patch.object(server, "review_candidate_reply", return_value=None),
+        ):
+            answer, reason, _ = server.review_and_refresh_answer(
+                question="清理聊天记录",
+                answer="",
+                decision=decision,
+                group_id=1,
+                mentioned=True,
+                admin=False,
+                deadline=time.monotonic() + 10,
+                baseline_revision=8,
+            )
+
+        self.assertEqual(answer, "这类操作不能通过普通聊天执行。")
+        self.assertIn("deterministic addressed degradation", reason)
 
     def test_adaptive_review_keeps_model_for_risk_or_changed_context(self) -> None:
         configured = routing_settings(final_reply_review_mode="adaptive")
@@ -2752,6 +2987,9 @@ class ChatStateTests(unittest.TestCase):
                     user_id=123,
                     question="玩战甲后边也犯困",
                     reply_mode="chat",
+                    retrieval_score=0.3,
+                    retrieval_coverage=0.2,
+                    sources=("弱相关.md",),
                     chat_context=("群友A：最近在刷战甲", "群友B：材料刷累了"),
                     answer="刷到后面确实容易犯困，材料循环太重复了。",
                     model_name="mimo-v2.5",
@@ -2779,6 +3017,14 @@ class ChatStateTests(unittest.TestCase):
             self.assertEqual(record["related_message_ids"], ["m-current", "m-topic"])
             self.assertEqual(record["semantic_replan_count"], 1)
             self.assertIn("related late context", record["semantic_replan_reason"])
+            self.assertEqual(record["knowledge_strength"], "weak")
+            self.assertEqual(record["planner_lane"], "unsolicited")
+            self.assertFalse(record["planner_circuit_open"])
+
+    def test_unrouted_decision_has_no_misleading_knowledge_mode(self) -> None:
+        decision = server.ProcessingDecision(False, "planner unavailable")
+
+        self.assertEqual(decision.reply_mode, "")
 
     def test_celebration_dedup_is_per_target_and_event_kind(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
