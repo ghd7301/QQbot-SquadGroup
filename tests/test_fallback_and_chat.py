@@ -2598,6 +2598,52 @@ class ChatStateTests(unittest.TestCase):
     def tearDown(self) -> None:
         server.clear_chat_state()
 
+    def test_clear_resets_next_chat_message_sequence(self) -> None:
+        with patch.object(
+            server,
+            "settings",
+            SimpleNamespace(
+                bot_qq="999",
+                chat_context_seconds=300,
+                chat_context_messages=12,
+            ),
+        ):
+            server.record_group_chat_message(1, "1", "第一条", 100)
+            server.record_group_chat_message(1, "1", "第二条", 101)
+            server.clear_chat_state()
+            sequence = server.record_group_chat_message(1, "1", "重新开始", 102)
+
+        self.assertEqual(sequence, 1)
+        self.assertEqual(server.chat_message_sequence, 1)
+        self.assertEqual(server.chat_history_state.sequence, 1)
+
+    def test_load_resumes_after_highest_chat_message_sequence(self) -> None:
+        configured = SimpleNamespace(
+            bot_qq="999",
+            chat_context_seconds=300,
+            chat_context_messages=12,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "chat_history.json"
+            with patch.object(server, "settings", configured):
+                for index in range(1, 4):
+                    server.record_group_chat_message(
+                        1,
+                        "1",
+                        f"第{index}条",
+                        100 + index,
+                    )
+                server.save_chat_history(history_path)
+                server.clear_chat_state()
+
+                self.assertEqual(server.load_chat_history(history_path), 3)
+                self.assertEqual(server.chat_message_sequence, 3)
+                sequence = server.record_group_chat_message(1, "1", "下一条", 104)
+
+        self.assertEqual(sequence, 4)
+        self.assertEqual(server.chat_message_sequence, 4)
+        self.assertEqual(server.chat_history_state.sequence, 4)
+
     def test_context_is_trimmed_by_time_and_message_count(self) -> None:
         with patch.object(
             server,

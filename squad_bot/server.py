@@ -14,6 +14,7 @@ from typing import Sequence
 from urllib.parse import parse_qs
 
 from . import pending_store
+from .chat_history import ChatHistoryState
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
@@ -78,8 +79,9 @@ audit_lock = threading.Lock()
 auto_reply_enabled = settings.auto_reply_enabled
 topic_cooldown_lock = threading.Lock()
 recent_reply_topics: dict[tuple[int, str], float] = {}
-chat_history_lock = threading.Lock()
-group_chat_history: dict[int, list["GroupChatMessage"]] = {}
+chat_history_state = ChatHistoryState()
+chat_history_lock = chat_history_state.lock
+group_chat_history = chat_history_state.messages
 chat_message_sequence = 0
 chat_reply_lock = threading.Lock()
 group_send_locks_lock = threading.Lock()
@@ -1128,71 +1130,38 @@ def record_group_chat_message(
     message_status: str = "active",
 ) -> int:
     global chat_message_sequence
-    normalized = text.strip()
-    if not normalized:
-        return 0
-    try:
-        timestamp = float(event_time)
-    except (TypeError, ValueError):
-        timestamp = time.time()
-    try:
-        received_timestamp = float(received_time)
-    except (TypeError, ValueError):
-        received_timestamp = time.time()
-    normalized_status = str(message_status or "active").strip().lower()
-    if normalized_status not in {"active", "recalled", "edited", "invalid"}:
-        normalized_status = "active"
-    safe_segments = tuple(
-        {
-            str(key): str(value)[:1000]
-            for key, value in segment.items()
-            if str(key) in {"type", "text"}
-        }
-        for segment in content_segments
-        if isinstance(segment, dict) and str(segment.get("type") or "").strip()
-    )[:24]
-    window = max(0, settings.chat_context_seconds)
-    max_messages = max(1, settings.chat_context_messages)
     with chat_history_lock:
-        chat_message_sequence += 1
-        entry = GroupChatMessage(
-            text=normalized,
-            user_id=str(user_id or ""),
-            timestamp=timestamp,
-            sequence=chat_message_sequence,
-            message_id=str(message_id or ""),
-            reply_message_id=str(reply_message_id or ""),
-            reply_target_user_id=str(reply_target_user_id or ""),
-            reply_text=str(reply_text or "").strip(),
-            mentioned_bot=bool(mentioned_bot),
-            mentioned_user_ids=tuple(
-                str(value) for value in mentioned_user_ids if str(value).strip()
-            ),
-            display_name=str(display_name or "").strip(),
-            generated_for_message_ids=tuple(dict.fromkeys(
-                str(value).strip()
-                for value in generated_for_message_ids
-                if str(value).strip()
-            )),
-            turn_id=str(turn_id or "").strip(),
-            reply_mode=str(reply_mode or "").strip(),
-            semantic_topic=str(semantic_topic or "").strip(),
-            received_time=received_timestamp,
-            content_segments=safe_segments,
-            message_status=normalized_status,
+        entry = chat_history_state.record(
+            group_id,
+            user_id,
+            text,
+            event_time,
+            context_seconds=settings.chat_context_seconds,
+            context_messages=settings.chat_context_messages,
+            message_id=message_id,
+            reply_message_id=reply_message_id,
+            reply_target_user_id=reply_target_user_id,
+            reply_text=reply_text,
+            mentioned_bot=mentioned_bot,
+            mentioned_user_ids=mentioned_user_ids,
+            display_name=display_name,
+            generated_for_message_ids=generated_for_message_ids,
+            turn_id=turn_id,
+            reply_mode=reply_mode,
+            semantic_topic=semantic_topic,
+            received_time=received_time,
+            content_segments=content_segments,
+            message_status=message_status,
         )
-        history = group_chat_history.setdefault(group_id, [])
-        history.append(entry)
-        if window > 0:
-            history[:] = [item for item in history if timestamp - item.timestamp <= window]
-        history[:] = history[-max(max_messages * 4, 24):]
-        sequence = entry.sequence
+        if entry is None:
+            return 0
+        chat_message_sequence = chat_history_state.sequence
     if chat_memory_manager:
         speaker_id = stable_member_id(group_id, entry.user_id)
         chat_memory_manager.enqueue(
             MemoryMessage(
                 group_id=group_id,
-                message_id=entry.message_id or f"local:{group_id}:{sequence}",
+                message_id=entry.message_id or f"local:{group_id}:{entry.sequence}",
                 speaker_id=speaker_id,
                 display_name=entry.display_name if speaker_id != "bot" else "机器人",
                 speaker_role="bot" if speaker_id == "bot" else "member",
@@ -1201,7 +1170,10 @@ def record_group_chat_message(
                 reply_message_id=entry.reply_message_id,
                 reply_speaker_id=stable_member_id(group_id, entry.reply_target_user_id),
                 quoted_text=entry.reply_text,
-                mentions=tuple(stable_member_id(group_id, value) for value in entry.mentioned_user_ids),
+                mentions=tuple(
+                    stable_member_id(group_id, value)
+                    for value in entry.mentioned_user_ids
+                ),
                 generated_for_message_ids=entry.generated_for_message_ids,
                 turn_id=entry.turn_id,
                 reply_mode=entry.reply_mode,
@@ -1212,18 +1184,11 @@ def record_group_chat_message(
                 message_status=entry.message_status,
             )
         )
-    return sequence
+    return entry.sequence
 
 
 def find_group_chat_message(group_id: int, message_id: str) -> GroupChatMessage | None:
-    target = str(message_id or "").strip()
-    if not target:
-        return None
-    with chat_history_lock:
-        for item in reversed(group_chat_history.get(group_id, ())):
-            if item.message_id == target and item.message_status == "active":
-                return item
-    return None
+    return chat_history_state.find(group_id, message_id)
 
 
 def resolve_reply_message_context(
@@ -1337,49 +1302,26 @@ def recent_group_chat_context(
     current_time = time.time() if now is None else now
     window = settings.chat_context_seconds if context_seconds is None else context_seconds
     limit = settings.chat_context_messages if max_messages is None else max_messages
-    if window <= 0 or limit <= 0:
-        return ()
-    with chat_history_lock:
-        history = group_chat_history.get(group_id, [])
-        recent = [item for item in history if current_time - item.timestamp <= window]
-        if recent:
-            group_chat_history[group_id] = recent
-        else:
-            group_chat_history.pop(group_id, None)
-    active = [item for item in recent if item.message_status == "active"]
-    available = (
-        [item for item in active if item.sequence <= through_sequence]
-        if through_sequence
-        else active
+    selected = chat_history_state.recent(
+        group_id,
+        now=current_time,
+        context_seconds=window,
+        max_messages=limit,
+        focus_sequence=focus_sequence,
+        through_sequence=through_sequence,
     )
-    selected = available[-limit:]
-    if focus_sequence:
-        focus = next((item for item in available if item.sequence == focus_sequence), None)
-        if focus and focus.reply_message_id:
-            replied = next(
-                (item for item in available if item.message_id == focus.reply_message_id),
-                None,
-            )
-            if replied and replied not in selected:
-                tail = selected[-(limit - 1):] if limit > 1 else []
-                selected = sorted(
-                    [replied, *tail],
-                    key=lambda item: item.sequence,
-                )
-    lines: list[str] = []
-    for item in selected:
-        lines.append(
-            json.dumps(
-                _context_message_payload(
-                    group_id,
-                    item,
-                    current=item.sequence == focus_sequence,
-                ),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+    return tuple(
+        json.dumps(
+            _context_message_payload(
+                group_id,
+                item,
+                current=item.sequence == focus_sequence,
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
-    return tuple(lines)
+        for item in selected
+    )
 
 
 def current_group_chat_scene(
@@ -1510,23 +1452,18 @@ def has_substantive_chat_context(chat_context: Sequence[str]) -> bool:
 
 
 def group_chat_has_newer_user_message(group_id: int, sequence: int) -> bool:
-    with chat_history_lock:
-        return any(
-            item.sequence > sequence and item.user_id != settings.bot_qq
-            for item in group_chat_history.get(group_id, ())
-        )
+    return chat_history_state.has_newer_user_message(
+        group_id,
+        sequence,
+        bot_user_id=settings.bot_qq,
+    )
 
 
 def latest_group_user_sequence(group_id: int) -> int:
-    with chat_history_lock:
-        return max(
-            (
-                item.sequence
-                for item in group_chat_history.get(group_id, ())
-                if item.user_id != settings.bot_qq
-            ),
-            default=0,
-        )
+    return chat_history_state.latest_user_sequence(
+        group_id,
+        bot_user_id=settings.bot_qq,
+    )
 
 
 def locked_send_context_change(
@@ -1971,7 +1908,7 @@ def refresh_answer_for_late_context(
 def clear_chat_state() -> None:
     global chat_message_sequence
     with chat_history_lock:
-        group_chat_history.clear()
+        chat_history_state.clear()
         chat_message_sequence = 0
     with chat_scene_lock:
         group_chat_scenes.clear()
@@ -2019,34 +1956,7 @@ def save_chat_history(path: str | Path | None = None) -> None:
     """Persist chat history to disk for restart recovery."""
     save_path = Path(path or "work/chat_history.json")
     try:
-        with chat_history_lock:
-            data = {}
-            for group_id, messages in group_chat_history.items():
-                data[str(group_id)] = [
-                    {
-                        "text": m.text,
-                        "user_id": m.user_id,
-                        "timestamp": m.timestamp,
-                        "sequence": m.sequence,
-                        "message_id": m.message_id,
-                        "reply_message_id": m.reply_message_id,
-                        "reply_target_user_id": m.reply_target_user_id,
-                        "reply_text": m.reply_text,
-                        "mentioned_bot": m.mentioned_bot,
-                        "mentioned_user_ids": list(m.mentioned_user_ids),
-                        "display_name": m.display_name,
-                        "generated_for_message_ids": list(m.generated_for_message_ids),
-                        "turn_id": m.turn_id,
-                        "reply_mode": m.reply_mode,
-                        "semantic_topic": m.semantic_topic,
-                        "received_time": m.received_time,
-                        "content_segments": list(m.content_segments),
-                        "message_status": m.message_status,
-                    }
-                    for m in messages
-                ]
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        save_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        chat_history_state.save(save_path)
     except Exception as exc:
         print("Save chat history failed:", repr(exc))
 
@@ -2088,11 +1998,7 @@ def recall_group_chat_message(group_id: int, message_id: str) -> None:
     target = str(message_id or "").strip()
     if not target:
         return
-    with chat_history_lock:
-        history = group_chat_history.get(group_id, [])
-        for item in history:
-            if item.message_id == target:
-                item.message_status = "recalled"
+    chat_history_state.recall(group_id, target)
     if chat_memory_manager:
         chat_memory_manager.enqueue_recall(group_id, target)
 
@@ -2104,38 +2010,9 @@ def load_chat_history(path: str | Path | None = None) -> int:
     if not load_path.exists():
         return 0
     try:
-        data = json.loads(load_path.read_text(encoding="utf-8"))
-        count = 0
+        count = chat_history_state.load(load_path)
         with chat_history_lock:
-            for group_id_str, messages in data.items():
-                group_id = int(group_id_str)
-                history = group_chat_history.setdefault(group_id, [])
-                for m in messages:
-                    entry = GroupChatMessage(
-                        text=m["text"],
-                        user_id=m["user_id"],
-                        timestamp=m["timestamp"],
-                        sequence=m["sequence"],
-                        message_id=m.get("message_id", ""),
-                        reply_message_id=m.get("reply_message_id", ""),
-                        reply_target_user_id=m.get("reply_target_user_id", ""),
-                        reply_text=m.get("reply_text", ""),
-                        mentioned_bot=bool(m.get("mentioned_bot")),
-                        mentioned_user_ids=tuple(m.get("mentioned_user_ids") or ()),
-                        display_name=m.get("display_name", ""),
-                        generated_for_message_ids=tuple(
-                            m.get("generated_for_message_ids") or ()
-                        ),
-                        turn_id=m.get("turn_id", ""),
-                        reply_mode=m.get("reply_mode", ""),
-                        semantic_topic=m.get("semantic_topic", ""),
-                        received_time=float(m.get("received_time") or m["timestamp"]),
-                        content_segments=tuple(m.get("content_segments") or ()),
-                        message_status=str(m.get("message_status") or "active"),
-                    )
-                    history.append(entry)
-                    chat_message_sequence = max(chat_message_sequence, entry.sequence)
-                    count += 1
+            chat_message_sequence = chat_history_state.sequence
         print(f"Loaded {count} chat history entries from {load_path}")
         return count
     except Exception as exc:
@@ -2146,12 +2023,7 @@ def load_chat_history(path: str | Path | None = None) -> int:
 def migrate_loaded_chat_history_to_memory() -> int:
     if not chat_memory_manager:
         return 0
-    with chat_history_lock:
-        snapshot = [
-            (group_id, item)
-            for group_id, messages in group_chat_history.items()
-            for item in messages
-        ]
+    snapshot = chat_history_state.snapshot()
     queued = 0
     for group_id, item in snapshot:
         speaker_id = stable_member_id(group_id, item.user_id)
