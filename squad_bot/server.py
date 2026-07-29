@@ -18,6 +18,7 @@ from .message_fragments import (
     items_compatible,
     message_ids,
 )
+from . import admin as admin_service
 from . import message_router, semantic_routing, worker_handlers
 from .ingress import events as ingress_events
 from .observability import audit as audit_observability
@@ -782,25 +783,23 @@ def classify_reply_target(
 
 
 def normalize_command_text(message: str) -> str:
-    return " ".join(message.strip().lower().split())
+    return admin_service.normalize_command_text(runtime_dependencies, message)
+
 
 
 def get_admin_command(message: str) -> str:
-    normalized = normalize_command_text(message)
-    return COMMAND_ALIASES.get(normalized, "")
+    return admin_service.get_admin_command(runtime_dependencies, message)
+
 
 
 def is_restored_admin_command(item: dict) -> bool:
-    return bool(
-        item.get("_restored")
-        and is_admin_user(item.get("user_id"), item.get("sender_role", ""))
-        and get_admin_command(str(item.get("question", "")))
-    )
+    return admin_service.is_restored_admin_command(runtime_dependencies, item)
+
 
 
 def is_admin_user(user_id, sender_role: str = "") -> bool:
-    admin_ids = tuple(getattr(settings, "admin_qq_ids", ()))
-    return bool(admin_ids) and str(user_id) in admin_ids
+    return admin_service.is_admin_user(runtime_dependencies, user_id, sender_role)
+
 
 
 def recent_audit_entries(limit: int = 5) -> list[dict]:
@@ -809,91 +808,10 @@ def recent_audit_entries(limit: int = 5) -> list[dict]:
 
 
 def answer_admin_command(command: str, *, group_id: int = 0, user_id: str = "") -> str:
-    global auto_reply_enabled
-    if command == "reload":
-        with kb_lock:
-            count = kb.reload()
-            stats = kb.last_reload_stats
-        return (
-            f"知识库已重载，共 {count} 个片段；新增 {stats.added}，修改 {stats.changed}，"
-            f"删除 {stats.removed}，复用 {stats.reused}。"
-        )
-    if command == "health":
-        auto_status = "开" if auto_reply_enabled else "关"
-        chat_status = "开" if settings.chat_reply_enabled and auto_reply_enabled else "关"
-        queued = message_queue.qsize() + normal_message_queue.qsize() + chat_queue.qsize()
-        scene_count, _ = chat_scene_state.counts()
-        return (
-            f"服务正常。知识片段 {len(kb.chunks)} 个，队列 {queued} 条，"
-            f"自动回复{auto_status}，闲聊{chat_status}，场景快照 {scene_count} 个，"
-            f"每分钟最多回复 {settings.max_replies_per_minute} 条。"
-        )
-    if command == "recent_skips":
-        entries = recent_audit_entries()
-        if not entries:
-            return "最近还没有记录到跳过消息。"
-        parts: list[str] = []
-        for entry in entries:
-            question = str(entry.get("question") or "").strip()
-            if len(question) > 28:
-                question = question[:28] + "..."
-            reason = entry.get("reason") or "unknown"
-            parts.append(f"{entry.get('group_id') or '未知群'}：{reason}：{question or '空消息'}")
-        return "最近跳过消息：\n" + "\n".join(parts)
-    if command == "auto_reply_on":
-        auto_reply_enabled = True
-        return "自动回复已开启。"
-    if command == "auto_reply_off":
-        auto_reply_enabled = False
-        return "自动回复已关闭。被 @ 时仍可回答。"
-    if command == "memory_status":
-        if not chat_memory_manager:
-            return "聊天记忆没有启用。"
-        status = chat_memory_manager.status()
-        state = "暂停" if status["paused"] else "运行"
-        return (
-            f"聊天记忆{state}，消息 {status['messages']} 条，片段 {status['chunks']} 个，"
-            f"话题关系 {status.get('topic_relations', 0)} 条，"
-            f"待索引 {status['queued']} 条，向量方式 {status['provider']}。"
-        )
-    if command == "memory_pause":
-        if not chat_memory_manager:
-            return "聊天记忆没有启用。"
-        chat_memory_manager.paused.set()
-        return "聊天记忆索引已暂停，现有短期上下文仍然可用。"
-    if command == "memory_resume":
-        if not chat_memory_manager:
-            return "聊天记忆没有启用。"
-        chat_memory_manager.paused.clear()
-        return "聊天记忆索引已恢复。"
-    if command == "memory_rebuild":
-        if not chat_memory_manager:
-            return "聊天记忆没有启用。"
-        chat_memory_manager.enqueue_rebuild(group_id)
-        return "已安排重建本群聊天记忆索引。"
-    if command == "memory_clear_request":
-        memory_clear_confirmations[(group_id, str(user_id))] = time.time() + 60
-        return "这是不可恢复操作。确认要清空本群聊天记忆，请发送：清空本群聊天记忆 确认"
-    if command == "memory_clear_confirm":
-        if not chat_memory_manager:
-            return "聊天记忆没有启用。"
-        key = (group_id, str(user_id))
-        expires_at = memory_clear_confirmations.pop(key, 0)
-        if time.time() > expires_at:
-            return "确认已失效，请先发送：清空本群聊天记忆"
-        chat_memory_manager.store.clear_group(group_id)
-        return "本群聊天记忆已清空。"
-    if command == "knowledge_gaps":
-        entries = recent_knowledge_gap_entries()
-        if not entries:
-            return "最近没有记录到知识检索缺口。"
-        lines = []
-        for entry in entries:
-            query = str(entry.get("query") or "")[:36]
-            missing = "、".join(entry.get("missing_tokens") or ())[:50]
-            lines.append(f"{query}（缺：{missing or '无明确词'}）")
-        return "最近知识未命中：\n" + "\n".join(lines)
-    return "未知维护命令。"
+    return admin_service.answer_admin_command(
+        runtime_dependencies, command, group_id=group_id, user_id=user_id
+    )
+
 
 
 def topic_key(question: str, decision: ProcessingDecision) -> str:

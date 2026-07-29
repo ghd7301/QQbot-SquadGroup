@@ -4,9 +4,20 @@ from pathlib import Path
 
 from squad_bot import server
 from squad_bot.runtime import BotRuntime
+from squad_bot.runtime_dependencies import RuntimeDependencies
 
 
 class BotRuntimeTests(unittest.TestCase):
+    def test_runtime_dependencies_read_and_write_live_namespace(self) -> None:
+        namespace = {"enabled": False}
+        dependencies = RuntimeDependencies(namespace)
+
+        namespace["enabled"] = True
+        self.assertTrue(dependencies.enabled)
+
+        dependencies.enabled = False
+        self.assertFalse(namespace["enabled"])
+
     def test_runtime_instances_do_not_share_mutable_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             knowledge_dir = Path(temp_dir) / "knowledge"

@@ -56,6 +56,7 @@
 squad-qqbot-mvp/
   docs/             设计与运行链路说明
   squad_bot/
+    admin.py        管理命令识别、权限判断和运行态维护操作
     ingress/
       events.py     OneBot 撤回、群过滤、上下文记录和入队编排
     observability/
