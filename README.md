@@ -57,10 +57,14 @@ squad-qqbot-mvp/
   docs/             设计与运行链路说明
   squad_bot/
     config.py       配置
+    models.py       路由、会话、群聊和队列数据模型
+    fact_guard.py   精确事实提取与知识回答安全校验
+    planner_health.py 语义规划熔断、半开探测和可用率状态
+    pending_store.py SQLite 表结构、会话轮次和待发送消息状态
     knowledge.py    Markdown 知识库检索
     llm.py          大模型调用和回复判断
     onebot.py       OneBot 消息处理
-    server.py       HTTP 服务和群消息队列
+    server.py       HTTP 服务、群消息队列编排和启动装配
   knowledge/        Squad 知识库
   scripts/
     com.squad.qqbot.mvp.plist   launchd 配置

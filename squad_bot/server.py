@@ -8,16 +8,32 @@ import re
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Sequence
 from urllib.parse import parse_qs
 
+from . import pending_store
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
+from .fact_guard import (
+    candidate_knowledge_segments,
+    normalize_chinese_number,
+    precise_fact_tokens,
+    unsupported_fallback_precise_facts,
+)
 from .knowledge import ContextResult, KnowledgeBase
+from .models import (
+    ConversationState,
+    FollowupMatch,
+    GroupChatMessage,
+    GroupChatScene,
+    MemoryProbeResult,
+    MessageFragmentBuffer,
+    PendingFailureResult,
+    ProcessingDecision,
+)
 from .llm import (
     MessagePlan,
     SemanticTopicCandidate,
@@ -46,6 +62,7 @@ from .onebot import (
     send_group_msg,
     should_respond,
 )
+from .planner_health import SemanticPlannerHealth
 
 
 kb = KnowledgeBase(settings.knowledge_dir)
@@ -82,168 +99,7 @@ chat_memory_manager: ChatMemoryManager | None = None
 chat_history_save_event = threading.Event()
 knowledge_gap_lock = threading.Lock()
 recent_knowledge_gap_queries: dict[str, float] = {}
-semantic_planner_health_lock = threading.Lock()
-semantic_planner_consecutive_failures: dict[str, int] = {
-    "unsolicited": 0,
-    "addressed": 0,
-}
-semantic_planner_circuit_open_until: dict[str, float] = {
-    "unsolicited": 0.0,
-    "addressed": 0.0,
-}
-semantic_planner_probe_in_flight: dict[str, bool] = {
-    "unsolicited": False,
-    "addressed": False,
-}
-semantic_planner_attempts: dict[str, int] = {
-    "unsolicited": 0,
-    "addressed": 0,
-}
-semantic_planner_unavailable: dict[str, int] = {
-    "unsolicited": 0,
-    "addressed": 0,
-}
-
-
-@dataclass
-class ProcessingDecision:
-    should_reply: bool
-    reason: str
-    has_context: bool = False
-    sources: tuple[str, ...] = ()
-    effective_question: str = ""
-    followup_of: str = ""
-    followup_scope: str = ""
-    reply_mode: str = ""
-    chat_context: tuple[str, ...] = ()
-    retrieval_score: float = 0.0
-    retrieval_coverage: float = 0.0
-    knowledge_query: str = ""
-    knowledge_result: ContextResult | None = None
-    semantic_intent: str = ""
-    semantic_topic: str = ""
-    implicit_meaning: str = ""
-    capability: str = "none"
-    draft_reply: str = ""
-    semantic_confidence: float = 0.0
-    memory_context: tuple[str, ...] = ()
-    memory_query: str = ""
-    memory_needed: bool = False
-    memory_hit_count: int = 0
-    memory_retrieval_attempted: bool = False
-    memory_retrieval_mode: str = ""
-    memory_candidate_count: int = 0
-    memory_rejection_reason: str = ""
-    recent_context_candidate_count: int = 0
-    risk_flags: tuple[str, ...] = ()
-    topic_candidates: tuple[SemanticTopicCandidate, ...] = ()
-    recent_context_selected_count: int = 0
-    recent_context_chars: int = 0
-    memory_context_chars: int = 0
-    context_deduplicated_count: int = 0
-    recent_context_selected_ids: tuple[str, ...] = ()
-    memory_selected_chunk_ids: tuple[int, ...] = ()
-    memory_selected_by_planner: bool = False
-    self_history_context: tuple[str, ...] = ()
-    self_history_candidate_count: int = 0
-    self_history_selected_count: int = 0
-    self_history_chars: int = 0
-    self_history_selected_message_ids: tuple[str, ...] = ()
-    self_history_reasons: tuple[str, ...] = ()
-    reply_regenerated: bool = False
-    subject_candidates: tuple[SubjectCandidate, ...] = ()
-    subject_ambiguity: str = "unknown"
-    bot_involvement: str = "uncertain"
-    reply_perspective: str = "neutral"
-    semantic_audience: str = "unclear"
-    participation_role: str = "uncertain"
-    plan_context_revision: int = 0
-    plan_scene_version: int = 0
-    related_message_ids: tuple[str, ...] = ()
-    semantic_replan_count: int = 0
-    semantic_replan_reason: str = ""
-    planner_status: str = "not_run"
-    planner_latency_ms: int = 0
-
-
-@dataclass(frozen=True)
-class PendingFailureResult:
-    status: str
-    attempts: int
-    next_attempt_at: float = 0.0
-
-
-@dataclass(frozen=True)
-class MemoryProbeResult:
-    query: str = ""
-    hits: tuple[MemoryHit, ...] = ()
-    context: tuple[str, ...] = ()
-    attempted: bool = False
-    rejection_reason: str = ""
-
-
-@dataclass
-class ConversationState:
-    last_question: str
-    sources: tuple[str, ...]
-    timestamp: float
-    user_id: str = ""
-    last_answer: str = ""
-    reply_mode: str = "knowledge"
-    bot_message_id: str = ""
-    user_message_id: str = ""
-    trigger_message_ids: tuple[str, ...] = ()
-    turn_id: str = ""
-    semantic_intent: str = ""
-    semantic_topic: str = ""
-
-
-@dataclass
-class FollowupMatch:
-    state: ConversationState
-    scope: str
-
-
-@dataclass
-class GroupChatMessage:
-    text: str
-    user_id: str
-    timestamp: float
-    sequence: int = 0
-    message_id: str = ""
-    reply_message_id: str = ""
-    reply_target_user_id: str = ""
-    reply_text: str = ""
-    mentioned_bot: bool = False
-    mentioned_user_ids: tuple[str, ...] = ()
-    display_name: str = ""
-    generated_for_message_ids: tuple[str, ...] = ()
-    turn_id: str = ""
-    reply_mode: str = ""
-    semantic_topic: str = ""
-    received_time: float = 0.0
-    content_segments: tuple[dict[str, str], ...] = ()
-    message_status: str = "active"
-
-
-@dataclass
-class GroupChatScene:
-    summary: str
-    updated_at: float
-    sequence: int
-
-
-@dataclass
-class MessageFragmentBuffer:
-    group_id: int
-    user_id: str
-    audience: str
-    item: dict
-    parts: list[str]
-    fragments: list[dict]
-    started_at: float
-    deadline: float
-
+semantic_planner_health = SemanticPlannerHealth()
 
 IDENTITY_KEYWORDS = (
     "你是谁",
@@ -2124,13 +1980,7 @@ def clear_chat_state() -> None:
         chat_scene_running.clear()
     with hostile_reply_lock:
         hostile_reply_history.clear()
-    with semantic_planner_health_lock:
-        for lane in tuple(semantic_planner_consecutive_failures):
-            semantic_planner_consecutive_failures[lane] = 0
-            semantic_planner_circuit_open_until[lane] = 0.0
-            semantic_planner_probe_in_flight[lane] = False
-            semantic_planner_attempts[lane] = 0
-            semantic_planner_unavailable[lane] = 0
+    semantic_planner_health.reset()
     clear_fragment_state()
 
 
@@ -2349,22 +2199,13 @@ def chat_reply_quota_reason(
         else max_per_hour
     )
     with chat_reply_lock:
-        connection = open_pending_queue_db(db_path)
-        try:
-            row = connection.execute(
-                "SELECT MAX(replied_at), COUNT(*) FROM chat_reply_history "
-                "WHERE group_id = ? AND replied_at > ?",
-                (str(group_id), current_time - 3600),
-            ).fetchone()
-        finally:
-            connection.close()
-    previous = float(row[0]) if row and row[0] is not None else None
-    recent_count = int(row[1]) if row else 0
-    if cooldown > 0 and previous is not None and current_time - previous < cooldown:
-        return "chat cooldown"
-    if hourly_limit > 0 and recent_count >= hourly_limit:
-        return "chat hourly limit"
-    return ""
+        return pending_store.chat_reply_quota_reason(
+            group_id,
+            db_path=_pending_db_path(db_path),
+            now=current_time,
+            cooldown_seconds=cooldown,
+            max_per_hour=hourly_limit,
+        )
 
 
 def mark_chat_replied(
@@ -2375,19 +2216,11 @@ def mark_chat_replied(
 ) -> None:
     timestamp = time.time() if now is None else now
     with chat_reply_lock:
-        connection = open_pending_queue_db(db_path)
-        try:
-            connection.execute(
-                "DELETE FROM chat_reply_history WHERE replied_at <= ?",
-                (timestamp - 3600,),
-            )
-            connection.execute(
-                "INSERT INTO chat_reply_history (group_id, replied_at) VALUES (?, ?)",
-                (str(group_id), timestamp),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        pending_store.mark_chat_replied(
+            group_id,
+            db_path=_pending_db_path(db_path),
+            now=timestamp,
+        )
 
 
 def celebration_was_replied(
@@ -2401,17 +2234,14 @@ def celebration_was_replied(
 ) -> bool:
     current_time = time.time() if now is None else now
     with chat_reply_lock:
-        connection = open_pending_queue_db(db_path)
-        try:
-            row = connection.execute(
-                "SELECT 1 FROM celebration_reply_history "
-                "WHERE group_id = ? AND target_key = ? AND event_kind = ? "
-                "AND replied_at > ? LIMIT 1",
-                (str(group_id), target_key, event_kind, current_time - window_seconds),
-            ).fetchone()
-        finally:
-            connection.close()
-    return row is not None
+        return pending_store.celebration_was_replied(
+            group_id,
+            target_key,
+            event_kind,
+            db_path=_pending_db_path(db_path),
+            now=current_time,
+            window_seconds=window_seconds,
+        )
 
 
 def mark_celebration_replied(
@@ -2424,20 +2254,13 @@ def mark_celebration_replied(
 ) -> None:
     timestamp = time.time() if now is None else now
     with chat_reply_lock:
-        connection = open_pending_queue_db(db_path)
-        try:
-            connection.execute(
-                "DELETE FROM celebration_reply_history WHERE replied_at <= ?",
-                (timestamp - 604800,),
-            )
-            connection.execute(
-                "INSERT INTO celebration_reply_history "
-                "(group_id, target_key, event_kind, replied_at) VALUES (?, ?, ?, ?)",
-                (str(group_id), target_key, event_kind, timestamp),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        pending_store.mark_celebration_replied(
+            group_id,
+            target_key,
+            event_kind,
+            db_path=_pending_db_path(db_path),
+            now=timestamp,
+        )
 
 
 def has_auto_reply_keyword(message: str) -> bool:
@@ -2709,9 +2532,7 @@ def semantic_planner_circuit_is_open(
     lane: str = "unsolicited",
     now: float | None = None,
 ) -> bool:
-    current_time = time.monotonic() if now is None else now
-    with semantic_planner_health_lock:
-        return semantic_planner_circuit_open_until.get(lane, 0.0) > current_time
+    return semantic_planner_health.circuit_is_open(lane, now=now)
 
 
 def reserve_semantic_planner_request(
@@ -2719,58 +2540,15 @@ def reserve_semantic_planner_request(
     lane: str = "unsolicited",
     now: float | None = None,
 ) -> bool:
-    """Reserve one half-open probe after a planner circuit cools down."""
-    current_time = time.monotonic() if now is None else now
-    with semantic_planner_health_lock:
-        if semantic_planner_circuit_open_until.get(lane, 0.0) > current_time:
-            return False
-        threshold = max(
-            1,
-            int(getattr(settings, "semantic_planner_circuit_failures", 5)),
-        )
-        if semantic_planner_consecutive_failures.get(lane, 0) < threshold:
-            return True
-        if semantic_planner_probe_in_flight.get(lane, False):
-            return False
-        semantic_planner_probe_in_flight[lane] = True
-        return True
+    return semantic_planner_health.reserve_request(
+        lane,
+        failure_threshold=getattr(settings, "semantic_planner_circuit_failures", 5),
+        now=now,
+    )
 
 
 def semantic_planner_health_snapshot(*, now: float | None = None) -> dict[str, dict]:
-    current_time = time.monotonic() if now is None else now
-    with semantic_planner_health_lock:
-        lanes = set(semantic_planner_consecutive_failures) | set(
-            semantic_planner_circuit_open_until
-        )
-        return {
-            lane: {
-                "attempts": semantic_planner_attempts.get(lane, 0),
-                "unavailable": semantic_planner_unavailable.get(lane, 0),
-                "availability_rate": (
-                    round(
-                        1.0
-                        - (
-                            semantic_planner_unavailable.get(lane, 0)
-                            / semantic_planner_attempts.get(lane, 0)
-                        ),
-                        4,
-                    )
-                    if semantic_planner_attempts.get(lane, 0)
-                    else None
-                ),
-                "consecutive_failures": semantic_planner_consecutive_failures.get(lane, 0),
-                "circuit_open": semantic_planner_circuit_open_until.get(lane, 0.0)
-                > current_time,
-                "retry_after_seconds": max(
-                    0,
-                    int(semantic_planner_circuit_open_until.get(lane, 0.0) - current_time),
-                ),
-                "half_open_probe_in_flight": semantic_planner_probe_in_flight.get(
-                    lane, False
-                ),
-            }
-            for lane in sorted(lanes)
-        }
+    return semantic_planner_health.snapshot(now=now)
 
 
 def record_semantic_planner_availability(
@@ -2779,30 +2557,13 @@ def record_semantic_planner_availability(
     lane: str = "unsolicited",
     now: float | None = None,
 ) -> None:
-    current_time = time.monotonic() if now is None else now
-    with semantic_planner_health_lock:
-        semantic_planner_attempts[lane] = semantic_planner_attempts.get(lane, 0) + 1
-        if available:
-            semantic_planner_consecutive_failures[lane] = 0
-            semantic_planner_circuit_open_until[lane] = 0.0
-            semantic_planner_probe_in_flight[lane] = False
-            return
-        semantic_planner_unavailable[lane] = (
-            semantic_planner_unavailable.get(lane, 0) + 1
-        )
-        semantic_planner_probe_in_flight[lane] = False
-        semantic_planner_consecutive_failures[lane] = (
-            semantic_planner_consecutive_failures.get(lane, 0) + 1
-        )
-        threshold = max(
-            1,
-            int(getattr(settings, "semantic_planner_circuit_failures", 5)),
-        )
-        if semantic_planner_consecutive_failures[lane] >= threshold:
-            semantic_planner_circuit_open_until[lane] = current_time + max(
-                1,
-                int(getattr(settings, "semantic_planner_circuit_seconds", 30)),
-            )
+    semantic_planner_health.record(
+        available,
+        lane,
+        failure_threshold=getattr(settings, "semantic_planner_circuit_failures", 5),
+        circuit_seconds=getattr(settings, "semantic_planner_circuit_seconds", 30),
+        now=now,
+    )
 
 
 def semantic_plan_is_usable(plan: MessagePlan | None) -> bool:
@@ -3701,123 +3462,6 @@ def answer_question(
     return finalize_model_answer(answer)
 
 
-PRECISE_FACT_PATTERN = re.compile(
-    r"(?P<value>\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万两点]+)\s*"
-    r"(?P<unit>公里|千米|分钟|小时|秒|米|km|m|票|人|名|倍|%|％)",
-    flags=re.I,
-)
-CHINESE_PERCENT_PATTERN = re.compile(
-    r"百分之(?P<value>[零〇一二两三四五六七八九十百千万两点]+)"
-)
-IPV4_PATTERN = re.compile(
-    r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"
-)
-VERSION_PATTERN = re.compile(
-    r"(?<![\d.])(?:v|版本\s*)?(?P<value>\d+(?:\.\d+){1,2})(?![\d.])",
-    flags=re.I,
-)
-PORT_PATTERN = re.compile(
-    r"(?:端口|port)\s*[:：为是]?\s*(?P<named>\d{2,5})"
-    r"|(?<![\d:])(?:[a-z0-9.-]+|\])[:：](?P<address>\d{2,5})(?!\d)",
-    flags=re.I,
-)
-
-
-def normalize_chinese_number(value: str) -> str:
-    value = str(value or "").replace("两", "二").replace("〇", "零")
-    if not value or all(character.isdigit() for character in value):
-        return value
-    if "点" in value:
-        integer, decimal = value.split("点", 1)
-        decimal_digits = "".join(
-            str("零一二三四五六七八九".find(character))
-            for character in decimal
-            if character in "零一二三四五六七八九"
-        )
-        return f"{normalize_chinese_number(integer or '零')}.{decimal_digits}"
-    digits = {character: index for index, character in enumerate("零一二三四五六七八九")}
-    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
-    total = section = number = 0
-    for character in value:
-        if character in digits:
-            number = digits[character]
-            continue
-        unit = units.get(character)
-        if unit is None:
-            return value
-        if unit == 10000:
-            section = (section + number) * unit
-            total += section
-            section = number = 0
-        else:
-            section += (number or 1) * unit
-            number = 0
-    return str(total + section + number)
-
-
-def precise_fact_tokens(text: str) -> set[tuple[str, str]]:
-    unit_aliases = {
-        "千米": "公里",
-        "km": "公里",
-        "m": "米",
-        "名": "人",
-        "％": "%",
-    }
-    source = str(text or "")
-    tokens = {
-        (
-            normalize_chinese_number(match.group("value")),
-            unit_aliases.get(match.group("unit").lower(), match.group("unit").lower()),
-        )
-        for match in PRECISE_FACT_PATTERN.finditer(source)
-    }
-    tokens.update(
-        (normalize_chinese_number(match.group("value")), "%")
-        for match in CHINESE_PERCENT_PATTERN.finditer(source)
-    )
-    ip_addresses = {match.group(0) for match in IPV4_PATTERN.finditer(source)}
-    tokens.update((address, "ip") for address in ip_addresses)
-    tokens.update(
-        (match.group("value"), "version")
-        for match in VERSION_PATTERN.finditer(source)
-        if match.group("value") not in ip_addresses
-    )
-    tokens.update(
-        (match.group("named") or match.group("address"), "port")
-        for match in PORT_PATTERN.finditer(source)
-    )
-    return tokens
-
-
-def candidate_knowledge_segments(context: str) -> tuple[str, ...]:
-    return tuple(
-        segment.strip()
-        for segment in re.split(r"\n\s*---+\s*\n", str(context or ""))
-        if segment.strip()
-    )
-
-
-def unsupported_fallback_precise_facts(
-    answer: str,
-    candidate_knowledge_context: str,
-) -> set[tuple[str, str]]:
-    answer_facts = precise_fact_tokens(answer)
-    if not answer_facts:
-        return set()
-    segment_facts = [
-        precise_fact_tokens(segment)
-        for segment in candidate_knowledge_segments(candidate_knowledge_context)
-    ]
-    if any(answer_facts <= facts for facts in segment_facts):
-        return set()
-    best_supported = max(
-        segment_facts,
-        key=lambda facts: len(answer_facts & facts),
-        default=set(),
-    )
-    return answer_facts - best_supported
-
-
 def fallback_grounding_issue(decision: ProcessingDecision, answer: str) -> str:
     if decision.reply_mode != "fallback":
         return ""
@@ -3955,112 +3599,12 @@ def next_sequence() -> int:
         return sequence_number
 
 
+def _pending_db_path(db_path: str | Path | None = None) -> str | Path:
+    return db_path or settings.pending_queue_db
+
+
 def open_pending_queue_db(db_path: str | Path | None = None) -> sqlite3.Connection:
-    path = Path(db_path or settings.pending_queue_db)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=5)
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pending_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            priority INTEGER NOT NULL,
-            sequence INTEGER NOT NULL,
-            payload TEXT NOT NULL,
-            created_at REAL NOT NULL
-        )
-        """
-    )
-    existing_pending_columns = {
-        str(row[1]) for row in connection.execute("PRAGMA table_info(pending_messages)")
-    }
-    pending_migrations = {
-        "status": "TEXT NOT NULL DEFAULT 'queued'",
-        "attempts": "INTEGER NOT NULL DEFAULT 0",
-        "next_attempt_at": "REAL NOT NULL DEFAULT 0",
-        "last_error": "TEXT NOT NULL DEFAULT ''",
-        "dispatch_id": "TEXT NOT NULL DEFAULT ''",
-    }
-    for column, definition in pending_migrations.items():
-        if column not in existing_pending_columns:
-            connection.execute(
-                f"ALTER TABLE pending_messages ADD COLUMN {column} {definition}"
-            )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_pending_status_time "
-        "ON pending_messages (status, next_attempt_at, priority, sequence)"
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chat_reply_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT NOT NULL,
-            replied_at REAL NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chat_reply_group_time "
-        "ON chat_reply_history (group_id, replied_at)"
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS celebration_reply_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT NOT NULL,
-            target_key TEXT NOT NULL,
-            event_kind TEXT NOT NULL,
-            replied_at REAL NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_celebration_reply_lookup "
-        "ON celebration_reply_history (group_id, target_key, event_kind, replied_at)"
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS conversation_turns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            user_message_id TEXT NOT NULL,
-            bot_message_id TEXT NOT NULL,
-            question TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            reply_mode TEXT NOT NULL,
-            sources_json TEXT NOT NULL,
-            created_at REAL NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_conversation_bot_message "
-        "ON conversation_turns (group_id, bot_message_id)"
-    )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_conversation_user_time "
-        "ON conversation_turns (group_id, user_id, created_at)"
-    )
-    existing_turn_columns = {
-        str(row[1]) for row in connection.execute("PRAGMA table_info(conversation_turns)")
-    }
-    turn_migrations = {
-        "trigger_message_ids_json": "TEXT NOT NULL DEFAULT '[]'",
-        "turn_id": "TEXT NOT NULL DEFAULT ''",
-        "semantic_intent": "TEXT NOT NULL DEFAULT ''",
-        "semantic_topic": "TEXT NOT NULL DEFAULT ''",
-    }
-    for column, definition in turn_migrations.items():
-        if column not in existing_turn_columns:
-            connection.execute(
-                f"ALTER TABLE conversation_turns ADD COLUMN {column} {definition}"
-            )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_conversation_turn_id "
-        "ON conversation_turns (group_id, turn_id)"
-    )
-    connection.commit()
-    return connection
+    return pending_store.open_pending_queue_db(_pending_db_path(db_path))
 
 
 def persist_conversation_turn(
@@ -4069,59 +3613,15 @@ def persist_conversation_turn(
     *,
     db_path: str | Path | None = None,
 ) -> int:
-    connection = open_pending_queue_db(db_path)
-    try:
-        cutoff = time.time() - 30 * 86400
-        connection.execute("DELETE FROM conversation_turns WHERE created_at < ?", (cutoff,))
-        cursor = connection.execute(
-            """
-            INSERT INTO conversation_turns (
-                group_id, user_id, user_message_id, bot_message_id,
-                question, answer, reply_mode, sources_json, created_at,
-                trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(group_id),
-                state.user_id,
-                state.user_message_id,
-                state.bot_message_id,
-                state.last_question,
-                state.last_answer,
-                state.reply_mode,
-                json.dumps(list(state.sources), ensure_ascii=False),
-                state.timestamp,
-                json.dumps(list(state.trigger_message_ids), ensure_ascii=False),
-                state.turn_id,
-                state.semantic_intent,
-                state.semantic_topic,
-            ),
-        )
-        connection.commit()
-        return int(cursor.lastrowid)
-    finally:
-        connection.close()
+    return pending_store.persist_conversation_turn(
+        group_id,
+        state,
+        db_path=_pending_db_path(db_path),
+    )
 
 
 def _conversation_state_from_row(row) -> ConversationState:
-    try:
-        sources = tuple(json.loads(row[7]))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        sources = ()
-    return ConversationState(
-        last_question=str(row[4] or ""),
-        sources=sources,
-        timestamp=float(row[8]),
-        user_id=str(row[1] or ""),
-        last_answer=str(row[5] or ""),
-        reply_mode=str(row[6] or ""),
-        bot_message_id=str(row[3] or ""),
-        user_message_id=str(row[2] or ""),
-        trigger_message_ids=tuple(json.loads(row[9] or "[]")),
-        turn_id=str(row[10] or ""),
-        semantic_intent=str(row[11] or ""),
-        semantic_topic=str(row[12] or ""),
-    )
+    return pending_store.conversation_state_from_row(row)
 
 
 def load_conversation_turn_by_bot_message_id(
@@ -4130,25 +3630,11 @@ def load_conversation_turn_by_bot_message_id(
     *,
     db_path: str | Path | None = None,
 ) -> ConversationState | None:
-    target = str(bot_message_id or "").strip()
-    if not target:
-        return None
-    connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            """
-            SELECT id, user_id, user_message_id, bot_message_id,
-                   question, answer, reply_mode, sources_json, created_at,
-                   trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
-            FROM conversation_turns
-            WHERE group_id = ? AND bot_message_id = ?
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (str(group_id), target),
-        ).fetchone()
-    finally:
-        connection.close()
-    return _conversation_state_from_row(row) if row else None
+    return pending_store.load_conversation_turn_by_bot_message_id(
+        group_id,
+        bot_message_id,
+        db_path=_pending_db_path(db_path),
+    )
 
 
 def persist_pending_message(
@@ -4157,16 +3643,12 @@ def persist_pending_message(
     item: dict,
     db_path: str | Path | None = None,
 ) -> int:
-    connection = open_pending_queue_db(db_path)
-    try:
-        cursor = connection.execute(
-            "INSERT INTO pending_messages (priority, sequence, payload, created_at) VALUES (?, ?, ?, ?)",
-            (priority, sequence, json.dumps(item, ensure_ascii=False), time.time()),
-        )
-        connection.commit()
-        return int(cursor.lastrowid)
-    finally:
-        connection.close()
+    return pending_store.persist_pending_message(
+        priority,
+        sequence,
+        item,
+        db_path=_pending_db_path(db_path),
+    )
 
 
 def load_pending_messages(
@@ -4174,56 +3656,10 @@ def load_pending_messages(
     *,
     include_future: bool = False,
 ) -> list[tuple[int, int, dict]]:
-    connection = open_pending_queue_db(db_path)
-    try:
-        query = """
-            SELECT id, priority, sequence, payload, created_at,
-                   status, attempts, next_attempt_at, last_error, dispatch_id
-            FROM pending_messages
-            WHERE status IN ('queued', 'retry')
-        """
-        parameters: tuple = ()
-        if not include_future:
-            query += " AND next_attempt_at <= ?"
-            parameters = (time.time(),)
-        query += " ORDER BY priority, sequence"
-        rows = connection.execute(query, parameters).fetchall()
-    finally:
-        connection.close()
-
-    pending: list[tuple[int, int, dict]] = []
-    for (
-        pending_id,
-        priority,
-        sequence,
-        payload,
-        created_at,
-        status,
-        attempts,
-        next_attempt_at,
-        last_error,
-        dispatch_id,
-    ) in rows:
-        try:
-            item = json.loads(payload)
-        except (json.JSONDecodeError, TypeError):
-            delete_pending_message(int(pending_id), db_path)
-            continue
-        if not isinstance(item, dict):
-            delete_pending_message(int(pending_id), db_path)
-            continue
-        item["_pending_id"] = int(pending_id)
-        item["_pending_created_at"] = float(created_at)
-        item["_restored"] = True
-        item["_pending_status"] = str(status or "queued")
-        item["_pending_attempts"] = int(attempts or 0)
-        item["_pending_next_attempt_at"] = float(next_attempt_at or 0)
-        item["_pending_last_error"] = str(last_error or "")
-        item["_pending_dispatch_id"] = str(dispatch_id or "")
-        item["_queue_priority"] = int(priority)
-        item["_queue_sequence"] = int(sequence)
-        pending.append((int(priority), int(sequence), item))
-    return pending
+    return pending_store.load_pending_messages(
+        db_path=_pending_db_path(db_path),
+        include_future=include_future,
+    )
 
 
 def mark_pending_failure(
@@ -4234,44 +3670,18 @@ def mark_pending_failure(
     now: float | None = None,
     max_attempts: int | None = None,
 ) -> PendingFailureResult:
-    current_time = time.time() if now is None else float(now)
-    limit = max(
-        1,
-        int(
-            max_attempts
-            if max_attempts is not None
-            else getattr(settings, "pending_retry_max_attempts", 3)
-        ),
+    retry_limit = (
+        max_attempts
+        if max_attempts is not None
+        else getattr(settings, "pending_retry_max_attempts", 3)
     )
-    connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            "SELECT attempts FROM pending_messages WHERE id = ?",
-            (pending_id,),
-        ).fetchone()
-        if not row:
-            return PendingFailureResult("missing", 0, 0.0)
-        attempts = int(row[0] or 0) + 1
-        if attempts >= limit:
-            status = "dead_letter"
-            next_attempt_at = 0.0
-        else:
-            status = "retry"
-            delays = (1.0, 3.0, 10.0)
-            delay = delays[min(attempts - 1, len(delays) - 1)]
-            next_attempt_at = current_time + delay
-        connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?
-            WHERE id = ?
-            """,
-            (status, attempts, next_attempt_at, str(error or "")[:500], pending_id),
-        )
-        connection.commit()
-        return PendingFailureResult(status, attempts, next_attempt_at)
-    finally:
-        connection.close()
+    return pending_store.mark_pending_failure(
+        pending_id,
+        error,
+        db_path=_pending_db_path(db_path),
+        now=now,
+        max_attempts=retry_limit,
+    )
 
 
 def mark_pending_sent_unknown(
@@ -4280,19 +3690,11 @@ def mark_pending_sent_unknown(
     *,
     db_path: str | Path | None = None,
 ) -> None:
-    connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = 'sent_unknown', last_error = ?, next_attempt_at = 0
-            WHERE id = ?
-            """,
-            (str(error or "")[:500], pending_id),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    pending_store.mark_pending_sent_unknown(
+        pending_id,
+        error,
+        db_path=_pending_db_path(db_path),
+    )
 
 
 def mark_pending_dispatch_started(
@@ -4301,80 +3703,37 @@ def mark_pending_dispatch_started(
     *,
     db_path: str | Path | None = None,
 ) -> None:
-    connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = 'dispatching', dispatch_id = ?, last_error = ''
-            WHERE id = ? AND status IN ('queued', 'retry')
-            """,
-            (str(dispatch_id), pending_id),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    pending_store.mark_pending_dispatch_started(
+        pending_id,
+        dispatch_id,
+        db_path=_pending_db_path(db_path),
+    )
 
 
 def recover_incomplete_pending_dispatches(
     db_path: str | Path | None = None,
 ) -> int:
-    connection = open_pending_queue_db(db_path)
-    try:
-        cursor = connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = 'sent_unknown', next_attempt_at = 0,
-                last_error = 'service stopped during message dispatch'
-            WHERE status = 'dispatching'
-            """
-        )
-        connection.commit()
-        return max(0, int(cursor.rowcount or 0))
-    finally:
-        connection.close()
+    return pending_store.recover_incomplete_pending_dispatches(
+        db_path=_pending_db_path(db_path)
+    )
 
 
 def delete_pending_message(
     pending_id: int,
     db_path: str | Path | None = None,
 ) -> None:
-    connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute("DELETE FROM pending_messages WHERE id = ?", (pending_id,))
-        connection.commit()
-    finally:
-        connection.close()
+    pending_store.delete_pending_message(
+        pending_id,
+        db_path=_pending_db_path(db_path),
+    )
 
 
 def pending_message_count(db_path: str | Path | None = None) -> int:
-    connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM pending_messages WHERE status IN ('queued', 'retry')"
-        ).fetchone()
-        return int(row[0]) if row else 0
-    finally:
-        connection.close()
+    return pending_store.pending_message_count(db_path=_pending_db_path(db_path))
 
 
 def pending_status_counts(db_path: str | Path | None = None) -> dict[str, int]:
-    result = {
-        "queued": 0,
-        "retry": 0,
-        "dispatching": 0,
-        "dead_letter": 0,
-        "sent_unknown": 0,
-    }
-    connection = open_pending_queue_db(db_path)
-    try:
-        for status, count in connection.execute(
-            "SELECT status, COUNT(*) FROM pending_messages GROUP BY status"
-        ):
-            result[str(status or "queued")] = int(count or 0)
-    finally:
-        connection.close()
-    return result
+    return pending_store.pending_status_counts(db_path=_pending_db_path(db_path))
 
 
 def enqueue_persistent_message(priority: int, item: dict) -> int:
