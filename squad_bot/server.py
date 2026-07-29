@@ -34,6 +34,7 @@ from .fact_guard import (
 )
 from .knowledge import ContextResult, KnowledgeBase
 from .knowledge_routing import KnowledgeRoutingService, attach_result
+from .worker_runtime import PendingItemLifecycle, normal_lane_should_yield
 from .models import (
     ConversationState,
     FollowupMatch,
@@ -4375,12 +4376,15 @@ def should_process_message(
 def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
     while True:
         priority, seq, item = work_queue.get()
-        if lane == "normal" and not message_queue.empty():
+        if normal_lane_should_yield(
+            lane,
+            priority_pending=not message_queue.empty(),
+        ):
             work_queue.put((priority, seq, item))
             work_queue.task_done()
             time.sleep(0.05)
             continue
-        terminal = True
+        lifecycle = PendingItemLifecycle(item)
         try:
             question = str(item["question"])
             mentioned = bool(item["mentioned"])
@@ -4654,7 +4658,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                     (time.monotonic() - model_started) * 1000
                 )
                 chat_queue.put((item, decision))
-                terminal = False
+                lifecycle.transfer()
                 continue
 
             current_topic_key = topic_key(question, decision)
@@ -4994,8 +4998,7 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
             if decision.reply_mode == "knowledge":
                 mark_topic_replied(group_id, current_topic_key)
         except Exception as exc:
-            failure_action = handle_pending_worker_failure(item, repr(exc))
-            terminal = failure_action == "delivered"
+            lifecycle.handle_failure(repr(exc), handle_pending_worker_failure)
             print(f"{lane} worker error:", repr(exc))
             write_message_audit(
                 decision="error",
@@ -5009,19 +5012,17 @@ def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
                 event_time=item.get("time"),
             )
         finally:
-            pending_id = item.get("_pending_id")
-            if terminal and pending_id is not None:
-                try:
-                    delete_pending_message(int(pending_id))
-                except Exception as exc:
-                    print("Pending queue acknowledge failed:", repr(exc))
+            lifecycle.acknowledge(
+                delete_pending_message,
+                lambda exc: print("Pending queue acknowledge failed:", repr(exc)),
+            )
             work_queue.task_done()
 
 
 def chat_worker() -> None:
     while True:
         item, decision = chat_queue.get()
-        terminal = True
+        lifecycle = PendingItemLifecycle(item)
         model_started = time.monotonic()
         routing_latency_ms = int(item.get("_routing_latency_ms") or 0)
         try:
@@ -5528,8 +5529,7 @@ def chat_worker() -> None:
                 turn_id=turn_id,
             )
         except Exception as exc:
-            failure_action = handle_pending_worker_failure(item, repr(exc))
-            terminal = failure_action == "delivered"
+            lifecycle.handle_failure(repr(exc), handle_pending_worker_failure)
             print("Chat worker error:", repr(exc))
             write_message_audit(
                 decision="error",
@@ -5542,12 +5542,13 @@ def chat_worker() -> None:
                 event_time=item.get("time"),
             )
         finally:
-            pending_id = item.get("_pending_id")
-            if terminal and pending_id is not None:
-                try:
-                    delete_pending_message(int(pending_id))
-                except Exception as exc:
-                    print("Chat pending queue acknowledge failed:", repr(exc))
+            lifecycle.acknowledge(
+                delete_pending_message,
+                lambda exc: print(
+                    "Chat pending queue acknowledge failed:",
+                    repr(exc),
+                ),
+            )
             chat_queue.task_done()
 
 
