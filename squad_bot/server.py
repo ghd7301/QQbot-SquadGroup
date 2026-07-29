@@ -14,10 +14,7 @@ from typing import Sequence
 from urllib.parse import parse_qs
 
 from . import pending_store
-from .chat_history import ChatHistoryState
-from .chat_scene import ChatSceneState
 from .message_fragments import (
-    FragmentAggregator,
     classify_audience,
     items_compatible,
     message_ids,
@@ -32,8 +29,9 @@ from .fact_guard import (
     precise_fact_tokens,
     unsupported_fallback_precise_facts,
 )
-from .knowledge import ContextResult, KnowledgeBase
+from .knowledge import ContextResult
 from .knowledge_routing import KnowledgeRoutingService, attach_result
+from .runtime import BotRuntime
 from .runtime_dependencies import RuntimeDependencies
 from .worker_runtime import PendingItemLifecycle, normal_lane_should_yield
 from .models import (
@@ -74,47 +72,47 @@ from .onebot import (
     send_group_msg,
     should_respond,
 )
-from .planner_health import SemanticPlannerHealth
 
 
-kb = KnowledgeBase(settings.knowledge_dir)
-message_queue: queue.PriorityQueue = queue.PriorityQueue()
-normal_message_queue: queue.PriorityQueue = queue.PriorityQueue()
-chat_queue: queue.Queue = queue.Queue()
-reply_timestamps: list[float] = []
-rate_limit_lock = threading.Lock()
-kb_lock = threading.RLock()
-sequence_lock = threading.Lock()
+bot_runtime = BotRuntime(settings.knowledge_dir)
+kb = bot_runtime.knowledge.base
+message_queue = bot_runtime.queues.priority
+normal_message_queue = bot_runtime.queues.normal
+chat_queue = bot_runtime.queues.chat
+reply_timestamps = bot_runtime.queues.reply_timestamps
+rate_limit_lock = bot_runtime.queues.rate_limit_lock
+kb_lock = bot_runtime.knowledge.lock
+sequence_lock = bot_runtime.queues.sequence_lock
 sequence_number = 0
-audit_lock = threading.Lock()
+audit_lock = bot_runtime.audit_lock
 auto_reply_enabled = settings.auto_reply_enabled
-topic_cooldown_lock = threading.Lock()
-recent_reply_topics: dict[tuple[int, str], float] = {}
-chat_history_state = ChatHistoryState()
+topic_cooldown_lock = bot_runtime.conversation.topic_cooldown_lock
+recent_reply_topics = bot_runtime.conversation.recent_reply_topics
+chat_history_state = bot_runtime.conversation.history
 chat_history_lock = chat_history_state.lock
 group_chat_history = chat_history_state.messages
 chat_message_sequence = 0
-chat_reply_lock = threading.Lock()
-group_send_locks_lock = threading.Lock()
-group_send_locks: dict[int, threading.Lock] = {}
-chat_scene_state = ChatSceneState()
+chat_reply_lock = bot_runtime.conversation.chat_reply_lock
+group_send_locks_lock = bot_runtime.conversation.group_send_locks_lock
+group_send_locks = bot_runtime.conversation.group_send_locks
+chat_scene_state = bot_runtime.conversation.scene
 chat_scene_lock = chat_scene_state.lock
 group_chat_scenes = chat_scene_state.scenes
 chat_scene_requested_sequence = chat_scene_state.requested_sequences
 chat_scene_pending_messages = chat_scene_state.pending_messages
 chat_scene_running = chat_scene_state.running
-hostile_reply_lock = threading.Lock()
-hostile_reply_history: dict[tuple[int, str], list[float]] = {}
-memory_clear_confirmations: dict[tuple[int, str], float] = {}
-fragment_aggregator = FragmentAggregator()
+hostile_reply_lock = bot_runtime.conversation.hostile_reply_lock
+hostile_reply_history = bot_runtime.conversation.hostile_reply_history
+memory_clear_confirmations = bot_runtime.conversation.memory_clear_confirmations
+fragment_aggregator = bot_runtime.conversation.fragments
 fragment_condition = fragment_aggregator.condition
 group_fragment_buffers = fragment_aggregator.buffers
 ready_fragment_buffers = fragment_aggregator.ready
 chat_memory_manager: ChatMemoryManager | None = None
-chat_history_save_event = threading.Event()
-knowledge_gap_lock = threading.Lock()
-recent_knowledge_gap_queries: dict[str, float] = {}
-semantic_planner_health = SemanticPlannerHealth()
+chat_history_save_event = bot_runtime.conversation.history_save_event
+knowledge_gap_lock = bot_runtime.knowledge.gap_lock
+recent_knowledge_gap_queries = bot_runtime.knowledge.recent_gap_queries
+semantic_planner_health = bot_runtime.planner_health
 runtime_dependencies = RuntimeDependencies(globals())
 
 IDENTITY_KEYWORDS = (
