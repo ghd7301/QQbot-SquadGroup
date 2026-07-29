@@ -56,6 +56,8 @@
 squad-qqbot-mvp/
   docs/             设计与运行链路说明
   squad_bot/
+    transport/
+      http.py       HTTP 请求解析、健康接口和 OneBot 入口适配
     config.py       配置
     models.py       路由、会话、群聊和队列数据模型
     fact_guard.py   精确事实提取与知识回答安全校验
