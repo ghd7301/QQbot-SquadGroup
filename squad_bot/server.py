@@ -16,6 +16,12 @@ from urllib.parse import parse_qs
 from . import pending_store
 from .chat_history import ChatHistoryState
 from .chat_scene import ChatSceneState
+from .message_fragments import (
+    FragmentAggregator,
+    classify_audience,
+    items_compatible,
+    message_ids,
+)
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
@@ -96,9 +102,10 @@ chat_scene_running = chat_scene_state.running
 hostile_reply_lock = threading.Lock()
 hostile_reply_history: dict[tuple[int, str], list[float]] = {}
 memory_clear_confirmations: dict[tuple[int, str], float] = {}
-fragment_condition = threading.Condition()
-group_fragment_buffers: dict[int, "MessageFragmentBuffer"] = {}
-ready_fragment_buffers: list["MessageFragmentBuffer"] = []
+fragment_aggregator = FragmentAggregator()
+fragment_condition = fragment_aggregator.condition
+group_fragment_buffers = fragment_aggregator.buffers
+ready_fragment_buffers = fragment_aggregator.ready
 chat_memory_manager: ChatMemoryManager | None = None
 chat_history_save_event = threading.Event()
 knowledge_gap_lock = threading.Lock()
@@ -3658,52 +3665,19 @@ def begin_pending_dispatch(item: dict) -> None:
 
 def classify_fragment_audience(item: dict) -> str:
     """Classify who a fragment addresses without guessing from general pronouns."""
-    bot_qq = str(settings.bot_qq or "")
-    reply_message_id = str(item.get("reply_message_id") or "")
-    reply_target_user_id = str(item.get("reply_target_user_id") or "")
-    if item.get("mentioned") or item.get("explicit_knowledge_command"):
-        return "bot"
-    if reply_message_id:
-        if bot_qq and reply_target_user_id == bot_qq:
-            return "bot"
-        return "human"
-    if item.get("mentioned_user_ids"):
-        return "human"
-    return "unknown"
+    return classify_audience(item, bot_user_id=str(settings.bot_qq or ""))
 
 
-def fragment_items_compatible(buffer: MessageFragmentBuffer, item: dict, audience: str) -> bool:
-    if str(item.get("user_id") or "") != buffer.user_id:
-        return False
-    if {buffer.audience, audience} == {"bot", "human"}:
-        return False
-    if audience == "human" or buffer.audience == "human":
-        return audience == buffer.audience
-    if audience == "bot" and buffer.audience == "unknown":
-        return False
-    if audience == "bot" and any(
-        fragment.get("fragment_audience") == "unknown"
-        for fragment in buffer.fragments[1:]
-    ):
-        return False
-    old_reply_id = str(buffer.item.get("reply_message_id") or "")
-    new_reply_id = str(item.get("reply_message_id") or "")
-    if old_reply_id and new_reply_id and old_reply_id != new_reply_id:
-        return False
-    old_target = str(buffer.item.get("reply_target_user_id") or "")
-    new_target = str(item.get("reply_target_user_id") or "")
-    if old_target and new_target and old_target != new_target:
-        return False
-    return True
+def fragment_items_compatible(
+    buffer: MessageFragmentBuffer,
+    item: dict,
+    audience: str,
+) -> bool:
+    return items_compatible(buffer, item, audience)
 
 
 def _message_ids(item: dict) -> list[str]:
-    result: list[str] = []
-    for candidate in item.get("message_ids") or (item.get("message_id"),):
-        value = str(candidate or "").strip()
-        if value and value not in result:
-            result.append(value)
-    return result
+    return message_ids(item)
 
 
 def bot_turn_metadata(item: dict, bot_message_id) -> tuple[tuple[str, ...], str]:
@@ -3805,91 +3779,28 @@ def merge_review_message_ids(item: dict | None, review, latest_context: Sequence
 
 
 def _new_fragment_buffer(item: dict, audience: str, now: float) -> MessageFragmentBuffer:
-    buffered_item = dict(item)
-    buffered_item["message_ids"] = _message_ids(item)
-    buffered_item["fragment_audience"] = audience
-    question = str(item.get("question") or "").strip()
-    fragment = dict(item)
-    fragment["fragment_audience"] = audience
-    max_wait = max(0.0, settings.message_fragment_max_wait_seconds)
-    debounce = max(0.0, settings.message_fragment_debounce_seconds)
-    deadline = min(now + debounce, now + max_wait) if max_wait else now + debounce
-    return MessageFragmentBuffer(
-        group_id=int(item["group_id"]),
-        user_id=str(item.get("user_id") or ""),
-        audience=audience,
-        item=buffered_item,
-        parts=[question],
-        fragments=[fragment],
-        started_at=now,
-        deadline=deadline,
+    return fragment_aggregator.new_buffer(
+        item,
+        audience,
+        now,
+        debounce_seconds=settings.message_fragment_debounce_seconds,
+        max_wait_seconds=settings.message_fragment_max_wait_seconds,
     )
 
 
 def _merge_fragment(buffer: MessageFragmentBuffer, item: dict, audience: str, now: float) -> None:
-    question = str(item.get("question") or "").strip()
-    buffer.parts.append(question)
-    fragment = dict(item)
-    fragment["fragment_audience"] = audience
-    buffer.fragments.append(fragment)
-    buffer.item["question"] = "\n".join(part for part in buffer.parts if part)
-    if audience == "bot":
-        buffer.audience = "bot"
-    buffer.item["fragment_audience"] = buffer.audience
-    buffer.item["mentioned"] = bool(buffer.item.get("mentioned") or item.get("mentioned"))
-    mentioned_ids = list(buffer.item.get("mentioned_user_ids") or ())
-    for candidate in item.get("mentioned_user_ids") or ():
-        value = str(candidate or "").strip()
-        if value and value not in mentioned_ids:
-            mentioned_ids.append(value)
-    buffer.item["mentioned_user_ids"] = mentioned_ids
-    buffer.item["mentions_other"] = bool(mentioned_ids)
-    message_ids = _message_ids(buffer.item)
-    for message_id in _message_ids(item):
-        if message_id not in message_ids:
-            message_ids.append(message_id)
-    buffer.item["message_ids"] = message_ids
-    buffer.item["message_id"] = str(item.get("message_id") or buffer.item.get("message_id") or "")
-    for key in ("reply_message_id", "reply_target_user_id", "reply_text"):
-        if not buffer.item.get(key) and item.get(key):
-            buffer.item[key] = item[key]
-    for key in ("time", "sender_role", "chat_context", "chat_sequence"):
-        if key in item:
-            buffer.item[key] = item[key]
-    debounce = max(0.0, settings.message_fragment_debounce_seconds)
-    max_wait = max(0.0, settings.message_fragment_max_wait_seconds)
-    debounce_deadline = now + debounce
-    hard_deadline = buffer.started_at + max_wait if max_wait else debounce_deadline
-    buffer.deadline = min(debounce_deadline, hard_deadline)
+    fragment_aggregator.merge(
+        buffer,
+        item,
+        audience,
+        now,
+        debounce_seconds=settings.message_fragment_debounce_seconds,
+        max_wait_seconds=settings.message_fragment_max_wait_seconds,
+    )
 
 
 def _fragment_prefix_item(buffer: MessageFragmentBuffer, count: int) -> dict:
-    selected = buffer.fragments[:count]
-    item = dict(buffer.item)
-    item["question"] = "\n".join(
-        str(fragment.get("question") or "").strip() for fragment in selected
-    )
-    item["mentioned"] = any(fragment.get("mentioned") for fragment in selected)
-    mentioned_ids: list[str] = []
-    message_ids: list[str] = []
-    for fragment in selected:
-        for candidate in fragment.get("mentioned_user_ids") or ():
-            value = str(candidate or "").strip()
-            if value and value not in mentioned_ids:
-                mentioned_ids.append(value)
-        for message_id in _message_ids(fragment):
-            if message_id not in message_ids:
-                message_ids.append(message_id)
-    item["mentioned_user_ids"] = mentioned_ids
-    item["mentions_other"] = bool(mentioned_ids)
-    item["message_ids"] = message_ids
-    item["message_id"] = str(selected[-1].get("message_id") or "")
-    for key in ("reply_message_id", "reply_target_user_id", "reply_text"):
-        item[key] = next(
-            (fragment.get(key) for fragment in selected if fragment.get(key)),
-            "",
-        )
-    return item
+    return fragment_aggregator.prefix_item(buffer, count)
 
 
 def semantic_bot_fragment_count(buffer: MessageFragmentBuffer) -> int:
@@ -3932,24 +3843,15 @@ def _dispatch_fragment_buffer(buffer: MessageFragmentBuffer) -> int:
 
 
 def _defer_fragment_buffers(buffers: Sequence[MessageFragmentBuffer]) -> None:
-    if not buffers:
-        return
-    with fragment_condition:
-        ready_fragment_buffers.extend(buffers)
-        fragment_condition.notify_all()
+    fragment_aggregator.defer(buffers)
 
 
 def clear_fragment_state() -> None:
-    with fragment_condition:
-        group_fragment_buffers.clear()
-        ready_fragment_buffers.clear()
-        fragment_condition.notify_all()
+    fragment_aggregator.clear()
 
 
 def flush_group_fragment_buffer(group_id: int, *, defer_dispatch: bool = False) -> int | None:
-    with fragment_condition:
-        buffer = group_fragment_buffers.pop(int(group_id), None)
-        fragment_condition.notify_all()
+    buffer = fragment_aggregator.pop_group(group_id)
     if not buffer:
         return None
     if defer_dispatch:
@@ -3964,12 +3866,9 @@ def flush_fragment_buffer_for_new_speaker(
     *,
     defer_dispatch: bool = False,
 ) -> int | None:
-    with fragment_condition:
-        buffer = group_fragment_buffers.get(int(group_id))
-        if not buffer or buffer.user_id == str(user_id or ""):
-            return None
-        buffer = group_fragment_buffers.pop(int(group_id))
-        fragment_condition.notify_all()
+    buffer = fragment_aggregator.pop_for_new_speaker(group_id, user_id)
+    if not buffer:
+        return None
     if defer_dispatch:
         _defer_fragment_buffers((buffer,))
         return None
@@ -3984,49 +3883,22 @@ def submit_message_fragment(
 ) -> list[int]:
     """Buffer a fragment, optionally deferring semantic dispatch to the worker."""
     current_time = time.monotonic() if now is None else float(now)
-    group_id = int(item["group_id"])
     audience = classify_fragment_audience(item)
-    displaced: list[MessageFragmentBuffer] = []
     is_admin_command = bool(
         is_admin_user(item.get("user_id"), item.get("sender_role", ""))
         and get_admin_command(str(item.get("question") or ""))
     )
 
-    with fragment_condition:
-        current = group_fragment_buffers.get(group_id)
-        if current and (
-            is_admin_command
-            or audience == "human"
-            or not fragment_items_compatible(current, item, audience)
-        ):
-            displaced.append(group_fragment_buffers.pop(group_id))
-            current = None
-
-        if audience != "human" and not is_admin_command:
-            max_parts = max(1, settings.message_fragment_max_parts)
-            max_chars = max(1, settings.message_fragment_max_chars)
-            would_exceed = bool(
-                current
-                and (
-                    len(current.parts) >= max_parts
-                    or len("\n".join((*current.parts, str(item.get("question") or "")))) > max_chars
-                )
-            )
-            if would_exceed:
-                displaced.append(group_fragment_buffers.pop(group_id))
-                current = None
-            if current is None:
-                current = _new_fragment_buffer(item, audience, current_time)
-                group_fragment_buffers[group_id] = current
-            else:
-                _merge_fragment(current, item, audience, current_time)
-            if (
-                len(current.parts) >= max_parts
-                or len(str(current.item.get("question") or "")) >= max_chars
-                or current.deadline <= current_time
-            ):
-                displaced.append(group_fragment_buffers.pop(group_id))
-        fragment_condition.notify_all()
+    displaced = fragment_aggregator.submit(
+        item,
+        audience,
+        now=current_time,
+        is_immediate=is_admin_command,
+        max_parts=settings.message_fragment_max_parts,
+        max_chars=settings.message_fragment_max_chars,
+        debounce_seconds=settings.message_fragment_debounce_seconds,
+        max_wait_seconds=settings.message_fragment_max_wait_seconds,
+    )
 
     pending_ids: list[int] = []
     if defer_dispatch:
@@ -4040,27 +3912,7 @@ def submit_message_fragment(
 
 def fragment_aggregation_worker() -> None:
     while True:
-        due: list[MessageFragmentBuffer] = []
-        with fragment_condition:
-            while not due:
-                if ready_fragment_buffers:
-                    due = list(ready_fragment_buffers)
-                    ready_fragment_buffers.clear()
-                    break
-                now = time.monotonic()
-                due_group_ids = [
-                    group_id
-                    for group_id, buffer in group_fragment_buffers.items()
-                    if buffer.deadline <= now
-                ]
-                if due_group_ids:
-                    due = [group_fragment_buffers.pop(group_id) for group_id in due_group_ids]
-                    break
-                if not group_fragment_buffers:
-                    fragment_condition.wait()
-                else:
-                    next_deadline = min(buffer.deadline for buffer in group_fragment_buffers.values())
-                    fragment_condition.wait(timeout=max(0.0, next_deadline - now))
+        due = fragment_aggregator.wait_for_due()
         for buffer in due:
             try:
                 _dispatch_fragment_buffer(buffer)
@@ -6104,7 +5956,7 @@ class Handler(BaseHTTPRequestHandler):
                     "priority_queued": message_queue.qsize(),
                     "normal_queued": normal_message_queue.qsize(),
                     "chat_queued": chat_queue.qsize(),
-                    "fragment_buffered": len(group_fragment_buffers),
+                    "fragment_buffered": fragment_aggregator.buffered_count(),
                     "pending": pending_counts.get("queued", 0) + pending_counts.get("retry", 0),
                     "pending_retry": pending_counts.get("retry", 0),
                     "pending_dispatching": pending_counts.get("dispatching", 0),

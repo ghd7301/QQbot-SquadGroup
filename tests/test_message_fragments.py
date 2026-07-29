@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from squad_bot import llm, server
+from squad_bot.message_fragments import FragmentAggregator
 
 
 def fragment_settings(**overrides):
@@ -65,6 +66,25 @@ class MessageFragmentTests(unittest.TestCase):
 
     def tearDown(self):
         server.clear_fragment_state()
+
+    def test_aggregator_returns_due_buffer_to_worker(self):
+        aggregator = FragmentAggregator()
+        aggregator.submit(
+            item("等到截止时间", message_id="due-1"),
+            "unknown",
+            now=0,
+            is_immediate=False,
+            max_parts=6,
+            max_chars=800,
+            debounce_seconds=3,
+            max_wait_seconds=8,
+        )
+
+        due = aggregator.wait_for_due(monotonic=lambda: 3)
+
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0].item["message_ids"], ["due-1"])
+        self.assertEqual(aggregator.buffered_count(), 0)
 
     def test_bot_mention_and_following_unknown_fragment_merge(self):
         dispatched = []

@@ -63,6 +63,7 @@ squad-qqbot-mvp/
     pending_store.py SQLite 表结构、会话轮次和待发送消息状态
     chat_history.py 短期群聊历史、序号和 JSON 持久化
     chat_scene.py   群聊场景快照和更新调度状态
+    message_fragments.py 分段消息聚合、受话人边界和超时状态
     knowledge.py    Markdown 知识库检索
     llm.py          大模型调用和回复判断
     onebot.py       OneBot 消息处理
