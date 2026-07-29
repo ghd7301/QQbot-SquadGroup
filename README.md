@@ -56,6 +56,8 @@
 squad-qqbot-mvp/
   docs/             设计与运行链路说明
   squad_bot/
+    ingress/
+      events.py     OneBot 撤回、群过滤、上下文记录和入队编排
     transport/
       http.py       HTTP 请求解析、健康接口和 OneBot 入口适配
     config.py       配置

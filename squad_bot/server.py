@@ -19,6 +19,7 @@ from .message_fragments import (
     message_ids,
 )
 from . import message_router, semantic_routing, worker_handlers
+from .ingress import events as ingress_events
 from .transport import http as http_transport
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
@@ -3903,6 +3904,10 @@ def chat_worker() -> None:
                 ),
             )
             chat_queue.task_done()
+
+
+def handle_onebot_event(event: dict) -> tuple[int, dict]:
+    return ingress_events.handle_onebot_event(runtime_dependencies, event)
 
 
 Handler = http_transport.create_handler(runtime_dependencies)

@@ -95,8 +95,12 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"ok": True, "answer": "回答：医疗兵怎么玩"})
 
-    def test_onebot_ignores_non_group_event(self) -> None:
-        deps = SimpleNamespace()
+    def test_onebot_delegates_event_processing(self) -> None:
+        events = []
+        deps = SimpleNamespace(
+            handle_onebot_event=lambda event: events.append(event)
+            or (202, {"ok": True, "accepted": True})
+        )
 
         previous_directory = Path.cwd()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -111,8 +115,9 @@ class HttpTransportTests(unittest.TestCase):
             finally:
                 os.chdir(previous_directory)
 
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["ignored"], "not group message")
+        self.assertEqual(status, 202)
+        self.assertEqual(payload, {"ok": True, "accepted": True})
+        self.assertEqual(events, [{"post_type": "meta_event"}])
 
 
 if __name__ == "__main__":
