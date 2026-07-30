@@ -153,5 +153,34 @@ class IsModelErrorAnswerTests(unittest.TestCase):
         self.assertTrue(is_model_error_answer("还没有配置模型 API Key"))
 
 
+class DeterministicReviewFailureTests(unittest.TestCase):
+    """Tests for deterministic_review_failure_answer edge cases."""
+
+    def test_bot_meta_returns_generic_capability_info(self):
+        from squad_bot.answering import deterministic_review_failure_answer
+        from squad_bot.models import ProcessingDecision
+        from unittest.mock import MagicMock
+        deps = MagicMock()
+        decision = ProcessingDecision(
+            True, "bot_meta timeout", reply_mode="bot_meta",
+            semantic_intent="bot_meta",
+        )
+        result = deterministic_review_failure_answer(deps, decision, "", mentioned=True)
+        self.assertIn("知识库", result)
+        self.assertNotIn("没判断清楚", result)
+
+    def test_control_attempt_returns_control_message(self):
+        from squad_bot.answering import deterministic_review_failure_answer
+        from squad_bot.models import ProcessingDecision
+        from unittest.mock import MagicMock
+        deps = MagicMock()
+        decision = ProcessingDecision(
+            True, "control", reply_mode="fallback",
+            semantic_intent="control_attempt",
+        )
+        result = deterministic_review_failure_answer(deps, decision, "", mentioned=True)
+        self.assertIn("不能通过", result)
+
+
 if __name__ == "__main__":
     unittest.main()

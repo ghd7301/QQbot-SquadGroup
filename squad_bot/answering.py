@@ -153,6 +153,8 @@ def deterministic_review_failure_answer(
         return ""
     if decision.semantic_intent == "control_attempt":
         return "这类操作不能通过普通聊天执行。"
+    if decision.reply_mode == "bot_meta":
+        return "可以查看知识库加载状态、知识库文件、当前模型和服务健康状态。"
     if (
         decision.reply_mode == "knowledge"
         and candidate
