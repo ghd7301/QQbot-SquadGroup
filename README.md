@@ -78,7 +78,7 @@ squad-qqbot-mvp/
     planner_health.py 语义规划熔断、半开探测和可用率状态
     pending_store.py SQLite 表结构、会话轮次和待发送消息状态
     chat_history.py 短期历史、上下文构建、恢复和长期记忆迁移
-    chat_scene.py   群聊场景快照和更新调度状态
+    chat_scene.py   群聊场景快照、模型更新和线程调度
     message_fragments.py 分段消息聚合、受话人边界和超时状态
     semantic_routing.py 语义路由上下文、关系推导和决策归一化
     knowledge_routing.py 知识检索缓存、强度判断和改写候选选择

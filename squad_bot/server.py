@@ -12,6 +12,7 @@ from typing import Sequence
 
 from . import pending_store
 from . import chat_history as chat_history_service
+from . import chat_scene as chat_scene_service
 from .message_fragments import (
     classify_audience,
     items_compatible,
@@ -1059,103 +1060,37 @@ def current_group_chat_scene(
     now: float | None = None,
     stale_seconds: int | None = None,
 ) -> str:
-    current_time = time.time() if now is None else now
-    max_age = (
-        getattr(settings, "chat_scene_stale_seconds", 600)
-        if stale_seconds is None
-        else stale_seconds
-    )
-    return chat_scene_state.current_summary(
+    return chat_scene_service.current_group_chat_scene(
+        runtime_dependencies,
         group_id,
         focus_sequence=focus_sequence,
-        now=current_time,
-        stale_seconds=max_age,
+        now=now,
+        stale_seconds=stale_seconds,
     )
 
 
 def chat_scene_enabled_for_group(group_id: int) -> bool:
-    if not auto_reply_enabled or not settings.chat_reply_enabled:
-        return False
-    if not getattr(settings, "chat_scene_enabled", True):
-        return False
-    return not settings.chat_allowed_group_ids or str(group_id) in settings.chat_allowed_group_ids
+    return chat_scene_service.chat_scene_enabled_for_group(
+        runtime_dependencies, group_id
+    )
 
 
 def _finish_chat_scene_update(group_id: int) -> None:
-    chat_scene_state.finish(group_id)
+    return chat_scene_service.finish_chat_scene_update(
+        runtime_dependencies, group_id
+    )
 
 
 def _chat_scene_update_loop(group_id: int) -> None:
-    while True:
-        debounce = max(0.0, getattr(settings, "chat_scene_debounce_seconds", 3.0))
-        if debounce:
-            time.sleep(debounce)
-
-        existing = chat_scene_state.scene(group_id)
-        last_updated = existing.updated_at if existing else 0.0
-        min_interval = max(
-            0.0,
-            getattr(settings, "chat_scene_update_interval_seconds", 30.0),
-        )
-        wait_seconds = min_interval - (time.time() - last_updated)
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-
-        target_sequence, previous = chat_scene_state.begin_update(group_id)
-        context = recent_group_chat_context(
-            group_id,
-            now=time.time(),
-            focus_sequence=target_sequence,
-            through_sequence=target_sequence,
-        )
-        min_messages = max(1, getattr(settings, "chat_scene_min_messages", 3))
-        if len(context) < min_messages:
-            _finish_chat_scene_update(group_id)
-            return
-
-        summary = analyze_chat_scene(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            model=getattr(settings, "chat_scene_model", settings.llm_model),
-            context=context,
-            previous_scene=previous.summary if previous else "",
-            timeout=max(1, getattr(settings, "chat_scene_timeout_seconds", 30)),
-        )
-        if summary:
-            chat_scene_state.set_scene(
-                group_id,
-                summary=summary,
-                updated_at=time.time(),
-                sequence=target_sequence,
-            )
-            print("Updated chat scene", group_id, target_sequence)
-        else:
-            print("Chat scene update failed", group_id, target_sequence)
-
-        if not chat_scene_state.should_continue(
-            group_id,
-            min_messages=min_messages,
-        ):
-            return
+    return chat_scene_service.chat_scene_update_loop(
+        runtime_dependencies, group_id
+    )
 
 
 def schedule_chat_scene_update(group_id: int, sequence: int) -> bool:
-    if not sequence or not chat_scene_enabled_for_group(group_id):
-        return False
-    min_messages = max(1, getattr(settings, "chat_scene_min_messages", 3))
-    if not chat_scene_state.request_update(
-        group_id,
-        sequence,
-        min_messages=min_messages,
-    ):
-        return False
-    threading.Thread(
-        target=_chat_scene_update_loop,
-        args=(group_id,),
-        daemon=True,
-        name=f"chat-scene-{group_id}",
-    ).start()
-    return True
+    return chat_scene_service.schedule_chat_scene_update(
+        runtime_dependencies, group_id, sequence
+    )
 
 
 def has_substantive_chat_context(chat_context: Sequence[str]) -> bool:

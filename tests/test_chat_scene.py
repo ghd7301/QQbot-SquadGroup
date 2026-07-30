@@ -1,5 +1,7 @@
 import unittest
+from types import SimpleNamespace
 
+from squad_bot import chat_scene
 from squad_bot.chat_scene import ChatSceneState
 
 
@@ -60,6 +62,21 @@ class ChatSceneStateTests(unittest.TestCase):
             "",
         )
         self.assertEqual(state.counts(), (1, 0))
+
+    def test_scene_service_respects_group_policy(self) -> None:
+        deps = SimpleNamespace(
+            auto_reply_enabled=True,
+            settings=SimpleNamespace(
+                chat_reply_enabled=True,
+                chat_scene_enabled=True,
+                chat_allowed_group_ids=("100",),
+            ),
+        )
+
+        self.assertTrue(chat_scene.chat_scene_enabled_for_group(deps, 100))
+        self.assertFalse(chat_scene.chat_scene_enabled_for_group(deps, 200))
+        deps.auto_reply_enabled = False
+        self.assertFalse(chat_scene.chat_scene_enabled_for_group(deps, 100))
 
 
 if __name__ == "__main__":

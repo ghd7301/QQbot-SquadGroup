@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from .models import GroupChatScene
 
@@ -101,3 +102,121 @@ class ChatSceneState:
         self.running.discard(group_id)
         self.requested_sequences.pop(group_id, None)
         self.pending_messages.pop(group_id, None)
+
+
+def current_group_chat_scene(
+    deps,
+    group_id: int,
+    *,
+    focus_sequence: int = 0,
+    now: float | None = None,
+    stale_seconds: int | None = None,
+) -> str:
+    current_time = time.time() if now is None else now
+    max_age = (
+        getattr(deps.settings, "chat_scene_stale_seconds", 600)
+        if stale_seconds is None
+        else stale_seconds
+    )
+    return deps.chat_scene_state.current_summary(
+        group_id,
+        focus_sequence=focus_sequence,
+        now=current_time,
+        stale_seconds=max_age,
+    )
+
+
+def chat_scene_enabled_for_group(deps, group_id: int) -> bool:
+    if not deps.auto_reply_enabled or not deps.settings.chat_reply_enabled:
+        return False
+    if not getattr(deps.settings, "chat_scene_enabled", True):
+        return False
+    return (
+        not deps.settings.chat_allowed_group_ids
+        or str(group_id) in deps.settings.chat_allowed_group_ids
+    )
+
+
+def finish_chat_scene_update(deps, group_id: int) -> None:
+    deps.chat_scene_state.finish(group_id)
+
+
+def chat_scene_update_loop(deps, group_id: int) -> None:
+    while True:
+        debounce = max(
+            0.0, getattr(deps.settings, "chat_scene_debounce_seconds", 3.0)
+        )
+        if debounce:
+            time.sleep(debounce)
+
+        existing = deps.chat_scene_state.scene(group_id)
+        last_updated = existing.updated_at if existing else 0.0
+        min_interval = max(
+            0.0,
+            getattr(deps.settings, "chat_scene_update_interval_seconds", 30.0),
+        )
+        wait_seconds = min_interval - (time.time() - last_updated)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+        target_sequence, previous = deps.chat_scene_state.begin_update(group_id)
+        context = deps.recent_group_chat_context(
+            group_id,
+            now=time.time(),
+            focus_sequence=target_sequence,
+            through_sequence=target_sequence,
+        )
+        min_messages = max(
+            1, getattr(deps.settings, "chat_scene_min_messages", 3)
+        )
+        if len(context) < min_messages:
+            deps._finish_chat_scene_update(group_id)
+            return
+
+        summary = deps.analyze_chat_scene(
+            base_url=deps.settings.llm_base_url,
+            api_key=deps.settings.llm_api_key,
+            model=getattr(
+                deps.settings, "chat_scene_model", deps.settings.llm_model
+            ),
+            context=context,
+            previous_scene=previous.summary if previous else "",
+            timeout=max(
+                1, getattr(deps.settings, "chat_scene_timeout_seconds", 30)
+            ),
+        )
+        if summary:
+            deps.chat_scene_state.set_scene(
+                group_id,
+                summary=summary,
+                updated_at=time.time(),
+                sequence=target_sequence,
+            )
+            print("Updated chat scene", group_id, target_sequence)
+        else:
+            print("Chat scene update failed", group_id, target_sequence)
+
+        if not deps.chat_scene_state.should_continue(
+            group_id,
+            min_messages=min_messages,
+        ):
+            return
+
+
+def schedule_chat_scene_update(deps, group_id: int, sequence: int) -> bool:
+    if not sequence or not deps.chat_scene_enabled_for_group(group_id):
+        return False
+    min_messages = max(1, getattr(deps.settings, "chat_scene_min_messages", 3))
+    if not deps.chat_scene_state.request_update(
+        group_id,
+        sequence,
+        min_messages=min_messages,
+    ):
+        return False
+    threading.Thread(
+        target=deps._chat_scene_update_loop,
+        args=(group_id,),
+        daemon=True,
+        name=f"chat-scene-{group_id}",
+    ).start()
+    return True
