@@ -370,14 +370,14 @@ def mark_pending_superseded(
     *,
     db_path: str | Path,
 ) -> None:
-    """Mark a queued entry as superseded by a higher-priority duplicate."""
+    """Mark a queued or dispatching entry as superseded by a higher-priority duplicate."""
     connection = open_pending_queue_db(db_path)
     try:
         connection.execute(
             """
             UPDATE pending_messages
             SET status = 'superseded', next_attempt_at = 0
-            WHERE id = ? AND status IN ('queued', 'retry')
+            WHERE id = ? AND status IN ('queued', 'retry', 'dispatching')
             """,
             (pending_id,),
         )
@@ -417,7 +417,7 @@ def find_queued_duplicates(
         rows = connection.execute(
             """
             SELECT id, payload FROM pending_messages
-            WHERE status IN ('queued', 'retry')
+            WHERE status IN ('queued', 'retry', 'dispatching')
             """,
         ).fetchall()
     finally:

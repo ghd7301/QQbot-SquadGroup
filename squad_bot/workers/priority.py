@@ -203,6 +203,19 @@ def process_worker_item(
                     event_time=event_time,
                 )
                 continue
+            # Check superseded again before expensive LLM calls
+            if pending_id is not None and not mentioned and deps.is_pending_superseded(int(pending_id)):
+                print("Skip superseded item before routing", pending_id, group_id, question)
+                deps.write_message_audit(
+                    decision="skipped",
+                    reason="superseded by mentioned=true duplicate",
+                    group_id=group_id,
+                    user_id=user_id,
+                    question=question,
+                    mentioned=mentioned,
+                    event_time=event_time,
+                )
+                continue
             selected_plan: list[deps.MessagePlan] = []
             decision = deps.should_process_message(
                 question,
