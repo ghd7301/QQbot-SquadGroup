@@ -54,7 +54,6 @@ def send_and_record_bot_turn(
             reply_mode=reply_mode,
             semantic_topic=semantic_topic,
         )
-        deps.save_chat_history()
     except Exception as record_exc:
         print("Post-send recording failed:", repr(record_exc))
         # Mark as sent_unknown so the pending entry is not retried
@@ -73,6 +72,10 @@ def send_and_record_bot_turn(
             question=str(item.get("question") or ""),
             event_time=item.get("time"),
         )
+    try:
+        deps.save_chat_history()
+    except Exception as save_exc:
+        print("Chat history save failed:", repr(save_exc))
     return bot_message_id, trigger_message_ids, turn_id
 
 

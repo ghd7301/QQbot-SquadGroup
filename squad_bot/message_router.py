@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # Quick-skip signals for unsolicited messages that rarely need a bot reply.
-_SHORT_SKIP_MAX_LENGTH = 4
+_SHORT_SKIP_MAX_LENGTH = 2
 _QUESTION_SIGNALS = ("?", "？", "怎么", "如何", "什么", "啥", "为什么", "为啥",
                      "能不能", "可以吗", "是不是", "怎么办", "求助", "请问")
 
