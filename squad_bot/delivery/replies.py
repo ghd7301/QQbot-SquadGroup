@@ -57,6 +57,14 @@ def send_and_record_bot_turn(
         deps.save_chat_history()
     except Exception as record_exc:
         print("Post-send recording failed:", repr(record_exc))
+        # Mark as sent_unknown so the pending entry is not retried
+        # (message was already delivered, we just failed to record it)
+        pending_id = item.get("_pending_id")
+        if pending_id is not None:
+            try:
+                deps.mark_pending_sent_unknown(int(pending_id), repr(record_exc))
+            except Exception:
+                pass
         deps.write_message_audit(
             decision="error",
             reason=f"post-send recording failed: {record_exc!r}",

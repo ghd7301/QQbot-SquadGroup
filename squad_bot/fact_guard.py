@@ -112,12 +112,6 @@ def unsupported_fallback_precise_facts(
     ]
     if any(answer_facts <= facts for facts in segment_facts):
         return set()
-    # Cross-segment check: facts from multiple segments may jointly support the answer
-    combined = set()
-    for facts in segment_facts:
-        combined |= facts
-    if answer_facts <= combined:
-        return set()
     best_supported = max(
         segment_facts,
         key=lambda facts: len(answer_facts & facts),

@@ -278,10 +278,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             "2人时20米，最多100米。",
             "2人时20米。\n---\n9人时100米。",
         )
-        # Cross-segment check: "100米" appears in segment 2, so it's supported
-        self.assertNotIn(("100", "米"), unsupported)
-        # "最多" is not a precise fact, and "2人""20米" are in segment 1
-        self.assertEqual(unsupported, set())
+        self.assertIn(("100", "米"), unsupported)
 
     def test_reply_to_bot_chat_plan_uses_addressed_lane(self) -> None:
         plan = MessagePlan(

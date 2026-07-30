@@ -96,8 +96,8 @@ def restore_pending_messages(deps) -> int:
     cleaned = 0
     try:
         cleaned = deps.cleanup_stale_pending_messages()
-    except (AttributeError, TypeError):
-        pass
+    except (AttributeError, TypeError) as exc:
+        print("Stale pending cleanup skipped:", repr(exc))
     if cleaned:
         print("Cleaned stale pending entries:", cleaned)
     pending = deps.load_pending_messages(include_future=True)

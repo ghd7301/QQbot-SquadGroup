@@ -23,11 +23,11 @@ class QueueRuntime:
 
 class ConversationRuntime:
     def __init__(self) -> None:
-        self.topic_cooldown_lock = threading.Lock()
+        self.topic_cooldown_lock = threading.RLock()
         self.recent_reply_topics: dict[tuple[int, str], float] = {}
 
         self.history = ChatHistoryState()
-        self.chat_reply_lock = threading.Lock()
+        self.chat_reply_lock = threading.RLock()
         self.group_send_locks_lock = threading.Lock()
         self.group_send_locks: dict[int, threading.Lock] = {}
 
