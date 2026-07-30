@@ -85,7 +85,7 @@ squad-qqbot-mvp/
     worker_handlers.py 普通回复与闲聊队列消息处理
     runtime.py      队列、会话、知识库和健康状态的运行时装配
     runtime_dependencies.py 拆分模块使用的实时服务依赖代理
-    worker_runtime.py 队列 worker 的 pending 生命周期和优先级让行规则
+    worker_runtime.py 队列 worker 循环、pending 生命周期和优先级让行规则
     knowledge.py    Markdown 知识库检索
     llm.py          大模型调用和回复判断
     onebot.py       OneBot 消息处理

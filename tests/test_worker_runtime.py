@@ -1,9 +1,29 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from squad_bot import server
 from squad_bot.models import ProcessingDecision
-from squad_bot.worker_runtime import PendingItemLifecycle, normal_lane_should_yield
+from squad_bot.worker_runtime import (
+    PendingItemLifecycle,
+    normal_lane_should_yield,
+    run_chat_worker,
+    run_worker,
+)
+
+
+class OneShotQueue:
+    def __init__(self, value) -> None:
+        self.value = value
+        self.read = False
+        self.put = Mock()
+        self.task_done = Mock()
+
+    def get(self):
+        if self.read:
+            raise StopIteration
+        self.read = True
+        return self.value
 
 
 class PendingItemLifecycleTests(unittest.TestCase):
@@ -111,6 +131,48 @@ class WorkerItemProcessorTests(unittest.TestCase):
 
         self.assertFalse(lifecycle.terminal)
         failure.assert_called_once()
+
+
+class WorkerLoopTests(unittest.TestCase):
+    def test_priority_worker_acknowledges_completed_pending_item(self) -> None:
+        item = {"_pending_id": 12}
+        work_queue = OneShotQueue((0, 3, item))
+        delete = Mock()
+        process = Mock()
+        deps = SimpleNamespace(
+            normal_lane_should_yield=normal_lane_should_yield,
+            message_queue=SimpleNamespace(empty=lambda: True),
+            PendingItemLifecycle=PendingItemLifecycle,
+            process_worker_item=process,
+            delete_pending_message=delete,
+        )
+
+        with self.assertRaises(StopIteration):
+            run_worker(deps, work_queue, "priority")
+
+        process.assert_called_once()
+        delete.assert_called_once_with(12)
+        work_queue.task_done.assert_called_once()
+
+    def test_chat_worker_acknowledges_completed_pending_item(self) -> None:
+        item = {"_pending_id": 13}
+        decision = ProcessingDecision(True, "chat")
+        chat_queue = OneShotQueue((item, decision))
+        delete = Mock()
+        process = Mock()
+        deps = SimpleNamespace(
+            chat_queue=chat_queue,
+            PendingItemLifecycle=PendingItemLifecycle,
+            process_chat_item=process,
+            delete_pending_message=delete,
+        )
+
+        with self.assertRaises(StopIteration):
+            run_chat_worker(deps)
+
+        process.assert_called_once()
+        delete.assert_called_once_with(13)
+        chat_queue.task_done.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -41,7 +41,12 @@ from .knowledge import ContextResult
 from .knowledge_routing import KnowledgeRoutingService, attach_result
 from .runtime import BotRuntime
 from .runtime_dependencies import RuntimeDependencies
-from .worker_runtime import PendingItemLifecycle, normal_lane_should_yield
+from .worker_runtime import (
+    PendingItemLifecycle,
+    normal_lane_should_yield,
+    run_chat_worker,
+    run_worker,
+)
 from .models import (
     ConversationState,
     FollowupMatch,
@@ -3406,25 +3411,7 @@ def process_worker_item(
 
 
 def worker(work_queue: queue.PriorityQueue, lane: str) -> None:
-    while True:
-        priority, seq, item = work_queue.get()
-        if normal_lane_should_yield(
-            lane,
-            priority_pending=not message_queue.empty(),
-        ):
-            work_queue.put((priority, seq, item))
-            work_queue.task_done()
-            time.sleep(0.05)
-            continue
-        lifecycle = PendingItemLifecycle(item)
-        try:
-            process_worker_item(item, lane, lifecycle)
-        finally:
-            lifecycle.acknowledge(
-                delete_pending_message,
-                lambda exc: print("Pending queue acknowledge failed:", repr(exc)),
-            )
-            work_queue.task_done()
+    return run_worker(runtime_dependencies, work_queue, lane)
 
 
 def process_chat_item(
@@ -3442,20 +3429,7 @@ def process_chat_item(
 
 
 def chat_worker() -> None:
-    while True:
-        item, decision = chat_queue.get()
-        lifecycle = PendingItemLifecycle(item)
-        try:
-            process_chat_item(item, decision, lifecycle)
-        finally:
-            lifecycle.acknowledge(
-                delete_pending_message,
-                lambda exc: print(
-                    "Chat pending queue acknowledge failed:",
-                    repr(exc),
-                ),
-            )
-            chat_queue.task_done()
+    return run_chat_worker(runtime_dependencies)
 
 
 def handle_onebot_event(event: dict) -> tuple[int, dict]:
