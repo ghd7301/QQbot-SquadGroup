@@ -117,3 +117,27 @@ def pending_status_counts(deps, db_path: str | Path | None = None) -> dict[str, 
     return deps.pending_store.pending_status_counts(
         db_path=_pending_db_path(deps, db_path)
     )
+
+
+def mark_pending_superseded(
+    deps, pending_id: int, *, db_path: str | Path | None = None
+) -> None:
+    deps.pending_store.mark_pending_superseded(
+        pending_id, db_path=_pending_db_path(deps, db_path)
+    )
+
+
+def is_pending_superseded(
+    deps, pending_id: int, *, db_path: str | Path | None = None
+) -> bool:
+    return deps.pending_store.is_pending_superseded(
+        pending_id, db_path=_pending_db_path(deps, db_path)
+    )
+
+
+def find_queued_duplicates(
+    deps, group_id: int, message_ids: list[str], *, db_path: str | Path | None = None
+) -> list[int]:
+    return deps.pending_store.find_queued_duplicates(
+        group_id, message_ids, db_path=_pending_db_path(deps, db_path)
+    )
