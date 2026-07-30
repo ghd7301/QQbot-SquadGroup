@@ -632,6 +632,7 @@ class ChatMemoryStore:
 
     def recall(self, group_id: int, message_id: str) -> bool:
         found = False
+        affected_chunk_ids: list[int] = []
         with self._write_lock, self.connect() as connection:
             row = connection.execute(
                 "SELECT id FROM chat_messages WHERE group_id=? AND message_id=?",
@@ -659,11 +660,62 @@ class ChatMemoryStore:
             ).fetchall()
             for chunk in chunk_rows:
                 if str(message_id) in json.loads(chunk["message_ids_json"]):
+                    affected_chunk_ids.append(chunk["id"])
                     connection.execute("UPDATE memory_chunks SET active=0 WHERE id=?", (chunk["id"],))
                     connection.execute("DELETE FROM memory_chunks_fts WHERE chunk_id=?", (chunk["id"],))
-        if found:
-            self.rebuild_group(group_id)
+            # Incremental rebuild: only rebuild affected chunks, not the entire group
+            for chunk_id in affected_chunk_ids:
+                self._rebuild_chunk(connection, group_id, chunk_id)
         return found
+
+    def _rebuild_chunk(self, connection, group_id: int, chunk_id: int) -> None:
+        """Rebuild a single chunk from its remaining non-recalled messages."""
+        chunk_row = connection.execute(
+            "SELECT * FROM memory_chunks WHERE id=?", (chunk_id,)
+        ).fetchone()
+        if not chunk_row:
+            return
+        message_ids = json.loads(chunk_row["message_ids_json"])
+        # Fetch remaining non-recalled messages that were in this chunk
+        remaining = []
+        remaining_speakers: list[str] = []
+        for mid in message_ids:
+            msg_row = connection.execute(
+                "SELECT * FROM chat_messages WHERE group_id=? AND message_id=? AND recalled=0",
+                (group_id, mid),
+            ).fetchone()
+            if msg_row:
+                remaining.append(msg_row)
+                remaining_speakers.append(str(msg_row["speaker_id"]))
+        if not remaining:
+            # All messages in chunk were recalled — leave deactivated
+            return
+        # Rebuild chunk text from remaining messages
+        combined_text = "\n".join(str(r["text"]) for r in remaining)
+        search_text = " ".join(lexical_terms(combined_text))
+        blob, dimensions, provider = self._embedding(combined_text)
+        ended_at = max(float(r["event_time"]) for r in remaining)
+        connection.execute(
+            """UPDATE memory_chunks SET active=1, text=?, message_ids_json=?,
+               speaker_ids_json=?, ended_at=?, search_text=?,
+               embedding=?, dimensions=?, embedding_provider=?
+               WHERE id=?""",
+            (
+                combined_text,
+                json.dumps(message_ids),
+                json.dumps(remaining_speakers),
+                ended_at,
+                search_text,
+                blob,
+                dimensions,
+                provider,
+                chunk_id,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO memory_chunks_fts(chunk_id,group_id,search_text) VALUES(?,?,?)",
+            (chunk_id, group_id, search_text),
+        )
 
     def lexical_probe(
         self,
