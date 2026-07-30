@@ -1352,6 +1352,14 @@ def find_queued_duplicates(
     )
 
 
+def cleanup_stale_pending_messages(
+    *, db_path: str | Path | None = None, max_age_hours: int = 72
+) -> int:
+    return queue_store.cleanup_stale_pending_messages(
+        runtime_dependencies, db_path=db_path, max_age_hours=max_age_hours
+    )
+
+
 
 def recover_incomplete_pending_dispatches(db_path: str | Path | None = None) -> int:
     return queue_store.recover_incomplete_pending_dispatches(

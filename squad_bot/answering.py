@@ -10,7 +10,15 @@ from .models import ProcessingDecision
 
 
 def is_model_error_answer(answer: str) -> bool:
-    return answer.startswith(("模型接口", "还没有配置模型 API Key")) or is_provider_refusal_text(answer)
+    if not answer:
+        return False
+    return (
+        answer.startswith(("模型接口", "还没有配置模型 API Key"))
+        or is_provider_refusal_text(answer)
+        or answer.startswith(("{", "["))  # raw JSON error body
+        or "api key" in answer.lower()[:200]
+        or "rate limit" in answer.lower()[:200]
+    )
 
 
 def finalize_model_answer(deps, answer: str, *, unsolicited: bool = False) -> str:
@@ -106,6 +114,10 @@ def answer_question(
         semantic_context=semantic_context,
         timeout=timeout or getattr(deps.settings, "knowledge_generation_timeout_seconds", 10),
     )
+    # Fact guard only for weak matches; strong matches trust the model to
+    # synthesize precise values from the grounded knowledge context.
+    if not strong_match and unsupported_fallback_precise_facts(answer, result.context):
+        return "这个具体数值我没有可靠依据，不能给你拍一个。"
     return finalize_model_answer(deps, answer)
 
 
@@ -157,7 +169,7 @@ def deterministic_review_failure_answer(
             else ""
         )
         if not unsupported_fallback_precise_facts(candidate, knowledge_context):
-            return candidate
+            return finalize_model_answer(deps, candidate)
     if decision.semantic_intent == "knowledge":
         return "这个具体问题我暂时没有可靠信息，不能确定。"
     if decision.planner_status in {"unavailable", "circuit_open", "low_confidence"}:

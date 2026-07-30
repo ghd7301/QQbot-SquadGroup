@@ -508,6 +508,9 @@ def is_topic_on_cooldown(deps, group_id: int, key: str) -> bool:
         return False
     now = time.time()
     with deps.topic_cooldown_lock:
+        # Size-triggered full cleanup to prevent unbounded growth
+        if len(deps.recent_reply_topics) > 5000:
+            deps.recent_reply_topics.clear()
         expired = [
             item_key
             for item_key, timestamp in deps.recent_reply_topics.items()
@@ -684,6 +687,9 @@ def allow_hostile_reply(deps, group_id: int, user_id: str, *, now: float | None 
     current_time = time.time() if now is None else now
     key = (group_id, str(user_id or ""))
     with deps.hostile_reply_lock:
+        # Size-triggered cleanup to prevent unbounded key growth
+        if len(deps.hostile_reply_history) > 5000:
+            deps.hostile_reply_history.clear()
         recent = [
             timestamp
             for timestamp in deps.hostile_reply_history.get(key, ())

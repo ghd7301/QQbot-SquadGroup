@@ -93,6 +93,13 @@ def restore_pending_messages(deps) -> int:
     recovered = deps.recover_incomplete_pending_dispatches()
     if recovered:
         print("Marked interrupted message dispatches as sent_unknown", recovered)
+    cleaned = 0
+    try:
+        cleaned = deps.cleanup_stale_pending_messages()
+    except (AttributeError, TypeError):
+        pass
+    if cleaned:
+        print("Cleaned stale pending entries:", cleaned)
     pending = deps.load_pending_messages(include_future=True)
     if not pending:
         return 0

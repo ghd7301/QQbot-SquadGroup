@@ -57,7 +57,7 @@ def acquire_reply_slot(
             if not block:
                 return False
             sleep_for = (
-                max(1, 60 - (now - deps.reply_timestamps[0]))
+                max(0.1, 60 - (now - deps.reply_timestamps[0]))
                 if deps.reply_timestamps
                 else 60
             )

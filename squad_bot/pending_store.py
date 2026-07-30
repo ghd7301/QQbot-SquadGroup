@@ -501,6 +501,29 @@ def pending_status_counts(*, db_path: str | Path) -> dict[str, int]:
     return result
 
 
+def cleanup_stale_pending_messages(
+    *,
+    db_path: str | Path,
+    max_age_hours: int = 72,
+) -> int:
+    """Delete dead_letter, sent_unknown, and superseded entries older than max_age_hours."""
+    cutoff = time.time() - max_age_hours * 3600
+    connection = open_pending_queue_db(db_path)
+    try:
+        cursor = connection.execute(
+            """
+            DELETE FROM pending_messages
+            WHERE status IN ('dead_letter', 'sent_unknown', 'superseded')
+              AND created_at < ?
+            """,
+            (cutoff,),
+        )
+        connection.commit()
+        return cursor.rowcount
+    finally:
+        connection.close()
+
+
 def chat_reply_quota_reason(
     group_id: int,
     *,

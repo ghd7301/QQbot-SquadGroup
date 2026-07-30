@@ -12,7 +12,10 @@ class RuntimeDependencies:
         try:
             return self._namespace[name]
         except KeyError as exc:
-            raise AttributeError(name) from exc
+            raise AttributeError(
+                f"RuntimeDependencies: '{name}' not found in server globals. "
+                f"Was it added to server.py?"
+            ) from exc
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "_namespace":

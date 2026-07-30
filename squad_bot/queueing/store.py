@@ -141,3 +141,11 @@ def find_queued_duplicates(
     return deps.pending_store.find_queued_duplicates(
         group_id, message_ids, db_path=_pending_db_path(deps, db_path)
     )
+
+
+def cleanup_stale_pending_messages(
+    deps, *, db_path: str | Path | None = None, max_age_hours: int = 72
+) -> int:
+    return deps.pending_store.cleanup_stale_pending_messages(
+        db_path=_pending_db_path(deps, db_path), max_age_hours=max_age_hours
+    )
