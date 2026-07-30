@@ -21,6 +21,8 @@ from .message_fragments import (
 )
 from . import admin as admin_service
 from . import message_router, semantic_routing, worker_handlers
+from .workers.priority import process_worker_item as _process_worker_item_impl
+from .workers.chat import process_chat_item as _process_chat_item_impl
 from .delivery import policies as delivery_policies
 from .delivery import replies as reply_delivery
 from .delivery import review as delivery_review
@@ -2178,7 +2180,7 @@ def process_worker_item(
     lane: str,
     lifecycle: PendingItemLifecycle | None = None,
 ) -> PendingItemLifecycle:
-    return worker_handlers.process_worker_item(
+    return _process_worker_item_impl(
         runtime_dependencies,
         item,
         lane,
@@ -2196,7 +2198,7 @@ def process_chat_item(
     decision: ProcessingDecision,
     lifecycle: PendingItemLifecycle | None = None,
 ) -> PendingItemLifecycle:
-    return worker_handlers.process_chat_item(
+    return _process_chat_item_impl(
         runtime_dependencies,
         item,
         decision,
