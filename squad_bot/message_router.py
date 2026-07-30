@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# Quick-skip signals for unsolicited messages that rarely need a bot reply.
+_SHORT_SKIP_MAX_LENGTH = 3
+_QUESTION_SIGNALS = ("?", "？", "怎么", "如何", "什么", "啥", "为什么", "为啥",
+                     "能不能", "可以吗", "是不是", "怎么办", "求助", "请问")
+
 
 def should_process_message(
     deps,
@@ -26,16 +31,29 @@ def should_process_message(
         )
     normalized = question.strip()
     query_text = effective_question or normalized
-    knowledge_router = deps.KnowledgeRoutingService(
-        lambda query: deps.retrieve_knowledge(query, deps.settings.max_context_chars),
-        deps.is_strong_knowledge_match,
-    )
-    planner_enabled = bool(getattr(deps.settings, "semantic_planner_enabled", False))
+
+    # Fast pre-filter: skip unsolicited messages that are clearly casual noise
+    # before expensive knowledge retrieval and LLM planner calls.
     explicitly_addressed = bool(
         mentioned
         or explicit_knowledge_command
         or reply_target_user_id == deps.settings.bot_qq
     )
+    if not explicitly_addressed and not followup_of:
+        lowered = normalized.lower()
+        is_short = len(normalized) <= _SHORT_SKIP_MAX_LENGTH
+        has_question = any(cue in lowered for cue in _QUESTION_SIGNALS)
+        has_scene = bool(scene_context)
+        if is_short and not has_question and not has_scene:
+            return deps.ProcessingDecision(
+                False, "unsolicited pre-filter: short message without signal",
+            )
+
+    knowledge_router = deps.KnowledgeRoutingService(
+        lambda query: deps.retrieve_knowledge(query, deps.settings.max_context_chars),
+        deps.is_strong_knowledge_match,
+    )
+    planner_enabled = bool(getattr(deps.settings, "semantic_planner_enabled", False))
     planner_request_allowed = bool(
         not planner_enabled
         or explicitly_addressed
