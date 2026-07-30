@@ -318,6 +318,34 @@ def should_process_message(
             )
         if usable_plan and usable_plan.intent != "knowledge":
             if explicitly_addressed:
+                # Before falling back, check if the message looks like a
+                # knowledge question despite the planner saying otherwise.
+                # This prevents normal_chat from short-circuiting knowledge
+                # routing for @messages like "服务器怎么进不去".
+                if mentioned and deps.looks_like_direct_question(normalized):
+                    selection = knowledge_router.lookup(query_text)
+                    if selection.result.context and selection.strong_match:
+                        return deps.attach_knowledge_result(
+                            deps.ProcessingDecision(
+                                True,
+                                "addressed knowledge override (planner said non-knowledge)",
+                                True,
+                                tuple(selection.result.sources),
+                                query_text,
+                                followup_of,
+                                followup_scope,
+                                "knowledge",
+                                tuple(chat_context),
+                                selection.result.top_score,
+                                selection.result.query_coverage,
+                                semantic_intent=usable_plan.intent,
+                                semantic_topic=usable_plan.topic_summary,
+                                implicit_meaning=usable_plan.implicit_meaning,
+                                semantic_confidence=usable_plan.confidence,
+                            ),
+                            query_text,
+                            selection.result,
+                        )
                 return deps.ProcessingDecision(
                     True,
                     f"semantic plan: addressed {usable_plan.intent}",

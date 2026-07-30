@@ -356,20 +356,38 @@ def process_worker_item(
             baseline_revision = int(
                 item.get("chat_sequence") or deps.latest_group_user_sequence(group_id)
             )
+            answer = ""
             if decision.reply_mode in deps.LOCAL_REPLY_MODES:
                 generation_timeout = 1 if deps.time.monotonic() < deadline else 0
             else:
                 review_reserve = getattr(
                     deps.settings, "final_reply_review_timeout_seconds", 4
                 )
-                generation_timeout = deps.remaining_reply_timeout(
-                    deadline,
-                    cap=getattr(
-                        deps.settings, "knowledge_generation_timeout_seconds", 10
-                    ),
-                    reserve=review_reserve,
-                )
-            if not generation_timeout:
+                # Hard minimums: generation needs at least 3s, review needs at least 2s
+                min_generation = 3
+                min_review = 2
+                remaining_total = max(0, deadline - deps.time.monotonic())
+                if remaining_total < min_generation + min_review:
+                    # Not enough budget for generation + review — degrade gracefully
+                    degraded = deps.deterministic_review_failure_answer(
+                        decision, "", mentioned=mentioned,
+                    )
+                    if degraded:
+                        # Send the degraded answer directly
+                        answer = degraded
+                        generation_timeout = 0
+                    else:
+                        generation_timeout = 0
+                else:
+                    # Cap generation to leave hard minimum for review
+                    generation_timeout = deps.remaining_reply_timeout(
+                        deadline,
+                        cap=getattr(
+                            deps.settings, "knowledge_generation_timeout_seconds", 10
+                        ),
+                        reserve=max(review_reserve, min_review),
+                    )
+            if not generation_timeout and not answer:
                 deps.write_message_audit(
                     decision="skipped",
                     reason="reply deadline exhausted before generation",
@@ -381,7 +399,8 @@ def process_worker_item(
                     event_time=event_time,
                 )
                 continue
-            answer = deps.answer_for_decision(
+            if not answer:
+                answer = deps.answer_for_decision(
                 question,
                 decision,
                 decision.effective_question or generation_question,

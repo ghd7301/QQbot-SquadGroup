@@ -292,6 +292,15 @@ def review_and_refresh_answer(
             cap=getattr(deps.settings, "final_reply_review_timeout_seconds", 4),
         )
         if not review_timeout:
+            if mentioned or decision.reply_mode in {"knowledge", "fallback"}:
+                degraded = deps.deterministic_review_failure_answer(
+                    decision, candidate, mentioned=mentioned,
+                    context_changed=context_changed,
+                )
+                if degraded:
+                    return degraded, "reply deadline exhausted; deterministic fallback", latest_revision
+                if candidate:
+                    return candidate, "reply deadline exhausted; raw candidate sent", latest_revision
             return "", "reply deadline exhausted before final review", latest_revision
         review = deps.review_candidate_reply(
             base_url=deps.settings.llm_base_url,
@@ -338,9 +347,21 @@ def review_and_refresh_answer(
                     f"{failure_reason}; deterministic addressed degradation",
                     latest_revision,
                 )
+            if mentioned or decision.reply_mode in {"knowledge", "fallback"}:
+                if candidate:
+                    return candidate, f"{failure_reason}; raw candidate sent", latest_revision
             return "", failure_reason, latest_revision
         deps.merge_review_message_ids(target_item, review, latest_context)
         if review.action == "drop":
+            if mentioned or decision.reply_mode in {"knowledge", "fallback"}:
+                degraded = deps.deterministic_review_failure_answer(
+                    decision, candidate, mentioned=mentioned,
+                    context_changed=context_changed,
+                )
+                if degraded:
+                    return degraded, f"review dropped [{review.context_relation}]; deterministic fallback", latest_revision
+                if candidate:
+                    return candidate, f"review dropped [{review.context_relation}]; raw candidate sent", latest_revision
             return (
                 "",
                 f"final review dropped [{review.context_relation}]: {review.reason}",
@@ -386,6 +407,8 @@ def review_and_refresh_answer(
                 )
             )
             if refreshed_decision is None:
+                if mentioned or decision.reply_mode in {"knowledge", "fallback"} and candidate:
+                    return candidate, f"{semantic_replan_reason}; raw candidate sent", latest_revision
                 return "", semantic_replan_reason, latest_revision
             decision = refreshed_decision
         updated_question = (
@@ -409,6 +432,8 @@ def review_and_refresh_answer(
             reserve=reserve,
         )
         if not generation_timeout:
+            if mentioned or decision.reply_mode in {"knowledge", "fallback"} and candidate:
+                return candidate, "reply deadline exhausted before regeneration; raw candidate sent", latest_revision
             return "", "reply deadline exhausted before regeneration", latest_revision
         candidate = deps.answer_for_decision(
             updated_question,
