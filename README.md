@@ -58,6 +58,7 @@ squad-qqbot-mvp/
   squad_bot/
     admin.py        管理命令识别、权限判断和运行态维护操作
     delivery/
+      policies.py   消息时效、事件过期判定和全局回复限流
       replies.py    回复发送、短期历史落盘和消息覆盖关系维护
     ingress/
       events.py     OneBot 撤回、群过滤、上下文记录和入队编排

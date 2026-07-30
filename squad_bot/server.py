@@ -20,6 +20,7 @@ from .message_fragments import (
 )
 from . import admin as admin_service
 from . import message_router, semantic_routing, worker_handlers
+from .delivery import policies as delivery_policies
 from .delivery import replies as reply_delivery
 from .ingress import events as ingress_events
 from .ingress import fragments as fragment_ingress
@@ -3234,9 +3235,7 @@ def restore_pending_messages() -> int:
 
 
 def message_max_age_seconds(mentioned: bool) -> int:
-    if mentioned:
-        return settings.mentioned_message_max_age_seconds
-    return settings.normal_message_max_age_seconds
+    return delivery_policies.message_max_age_seconds(runtime_dependencies, mentioned)
 
 
 def is_message_too_old(
@@ -3246,22 +3245,17 @@ def is_message_too_old(
     fallback_time=None,
     now: float | None = None,
 ) -> bool:
-    timestamp_value = event_time if event_time is not None else fallback_time
-    try:
-        event_timestamp = float(timestamp_value)
-    except (TypeError, ValueError):
-        return False
-    max_age = message_max_age_seconds(mentioned)
-    if max_age <= 0:
-        return False
-    current_time = time.time() if now is None else now
-    return current_time - event_timestamp > max_age
+    return delivery_policies.is_message_too_old(
+        runtime_dependencies,
+        event_time,
+        mentioned,
+        fallback_time=fallback_time,
+        now=now,
+    )
 
 
 def is_event_too_old(event: dict) -> bool:
-    raw_message = event.get("message", "")
-    mentioned = is_mentioned(settings.bot_qq, raw_message)
-    return is_message_too_old(event.get("time"), mentioned)
+    return delivery_policies.is_event_too_old(runtime_dependencies, event)
 
 
 def acquire_reply_slot(
@@ -3270,32 +3264,16 @@ def acquire_reply_slot(
     reserve_slots: int = 0,
     deadline: float | None = None,
 ) -> bool:
-    while True:
-        now = time.time()
-        with rate_limit_lock:
-            reply_timestamps[:] = [
-                timestamp for timestamp in reply_timestamps if now - timestamp < 60
-            ]
-            capacity = max(0, settings.max_replies_per_minute - reserve_slots)
-            if len(reply_timestamps) < capacity:
-                reply_timestamps.append(now)
-                return True
-            if not block:
-                return False
-            sleep_for = (
-                max(1, 60 - (now - reply_timestamps[0]))
-                if reply_timestamps
-                else 60
-            )
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or sleep_for > remaining:
-                return False
-        time.sleep(sleep_for)
+    return delivery_policies.acquire_reply_slot(
+        runtime_dependencies,
+        block=block,
+        reserve_slots=reserve_slots,
+        deadline=deadline,
+    )
 
 
 def wait_for_rate_limit(deadline: float | None = None) -> bool:
-    return acquire_reply_slot(deadline=deadline)
+    return delivery_policies.wait_for_rate_limit(runtime_dependencies, deadline)
 
 
 def consider_chat_reply(
