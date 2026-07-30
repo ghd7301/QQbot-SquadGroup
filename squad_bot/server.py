@@ -38,12 +38,7 @@ from .transport import http as http_transport
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
 from .embedding import build_embedding_provider
-from .fact_guard import (
-    candidate_knowledge_segments,
-    normalize_chinese_number,
-    precise_fact_tokens,
-    unsupported_fallback_precise_facts,
-)
+from .fact_guard import precise_fact_tokens, unsupported_fallback_precise_facts
 from .knowledge import ContextResult
 from .knowledge_routing import KnowledgeRoutingService, attach_result
 from .runtime import BotRuntime
@@ -746,7 +741,6 @@ def refresh_answer_for_late_context(
 
 
 def clear_chat_state() -> None:
-    global chat_message_sequence
     return conversation_service.clear_chat_state(runtime_dependencies)
 
 
