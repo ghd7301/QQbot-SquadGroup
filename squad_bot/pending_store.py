@@ -12,6 +12,8 @@ def open_pending_queue_db(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=5)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=5000")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_messages (
