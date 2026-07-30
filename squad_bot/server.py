@@ -16,6 +16,7 @@ from . import chat_history as chat_history_service
 from . import chat_scene as chat_scene_service
 from . import conversation as conversation_service
 from . import context_pipeline as context_pipeline_service
+from . import answering as answering_service
 from .message_fragments import (
     classify_audience,
     items_compatible,
@@ -1156,35 +1157,13 @@ def enrich_decision_with_chat_memory(
 
 
 def answer_bot_meta(capability: str, *, admin: bool) -> str:
-    if not admin:
-        return "这类内部状态只对管理员开放。"
-    knowledge_path = Path(settings.knowledge_dir)
-    files = sorted(path.name for path in knowledge_path.glob("*.md"))
-    if capability == "knowledge_files":
-        if not files:
-            return "当前没有发现可加载的知识库文件。"
-        return "当前加载的知识库文件有：" + "、".join(files)
-    if capability == "knowledge_status":
-        return f"知识库已加载，当前有 {len(files)} 个文件、{len(kb.chunks)} 个片段。"
-    if capability == "model_status":
-        return f"知识问答使用 {settings.llm_model}，闲聊使用 {settings.chat_model}。"
-    if capability in {"runtime_status", "health"}:
-        queued = message_queue.qsize() + normal_message_queue.qsize() + chat_queue.qsize()
-        return f"服务正在运行，知识片段 {len(kb.chunks)} 个，队列 {queued} 条。"
-    return "可以查看知识库加载状态、知识库文件、当前模型和服务健康状态。"
+    return answering_service.answer_bot_meta(runtime_dependencies, capability, admin=admin)
 
 
 def finalize_model_answer(answer: str, *, unsolicited: bool = False) -> str:
-    if is_model_error_answer(answer):
-        if unsolicited:
-            return ""
-        return "这会儿回复服务有点忙，稍后再问我一下。"
-    normalized = normalize_model_answer(answer, settings.max_answer_chars)
-    if normalized:
-        return normalized
-    if unsolicited:
-        return ""
-    return "这会儿回复服务有点忙，稍后再问我一下。"
+    return answering_service.finalize_model_answer(
+        runtime_dependencies, answer, unsolicited=unsolicited,
+    )
 
 
 def answer_question(
@@ -1200,69 +1179,19 @@ def answer_question(
     knowledge_result: ContextResult | None = None,
     timeout: int | None = None,
 ) -> str:
-    if is_identity_question(question):
-        return (
-            "叫我新兵营教官就行，主要给刚入坑 Squad 的兄弟答疑。"
-            "HAB、FOB、医疗兵、反坦、搜不到服、卡三点、TS 设置这些都能问。"
-            "要是问到本服规则，我不乱拍板，按群公告和管理员说法来。"
-        )
-
-    llm_question = effective_question or question
-    result = knowledge_result or retrieve_knowledge(
-        retrieval_question or llm_question,
-        settings.max_context_chars,
+    return answering_service.answer_question(
+        runtime_dependencies, question, effective_question,
+        retrieval_question=retrieval_question, allow_fallback=allow_fallback,
+        chat_context=chat_context, memory_context=memory_context,
+        self_history_context=self_history_context, semantic_context=semantic_context,
+        knowledge_result=knowledge_result, timeout=timeout,
     )
-    strong_match = is_strong_knowledge_match(
-        result.top_score,
-        result.query_coverage,
-    )
-    if not result.context or not strong_match:
-        if settings.llm_fallback_enabled and allow_fallback:
-            answer = ask_fallback_llm(
-                base_url=settings.llm_base_url,
-                api_key=settings.llm_api_key,
-                model=settings.llm_model,
-                question=llm_question,
-                context=tuple(chat_context[-8:]),
-                memory_context=tuple(memory_context),
-                self_history_context=tuple(self_history_context),
-                semantic_context=semantic_context,
-                candidate_knowledge_context=result.context,
-                timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
-            )
-            if unsupported_fallback_precise_facts(answer, result.context):
-                return "这个具体数值我没有可靠依据，不能给你拍一个。"
-            return finalize_model_answer(answer)
-        return "这个我库里暂时没有准确信息。你可以换个更具体的问法，或者问一下小队长和管理员；涉及服务器规则的话，还是以本服公告为准。"
-
-    answer = ask_llm(
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-        model=settings.llm_model,
-        question=llm_question,
-        context=result.context,
-        chat_context=tuple(chat_context[-8:]),
-        memory_context=tuple(memory_context),
-        self_history_context=tuple(self_history_context),
-        semantic_context=semantic_context,
-        timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
-    )
-    return finalize_model_answer(answer)
 
 
 def fallback_grounding_issue(decision: ProcessingDecision, answer: str) -> str:
-    if decision.reply_mode != "fallback":
-        return ""
-    candidate_context = (
-        decision.knowledge_result.context
-        if decision.knowledge_result is not None
-        else ""
+    return answering_service.fallback_grounding_issue(
+        runtime_dependencies, decision, answer,
     )
-    unsupported = unsupported_fallback_precise_facts(answer, candidate_context)
-    if not unsupported:
-        return ""
-    rendered = ", ".join(f"{value}{unit}" for value, unit in sorted(unsupported))
-    return f"unsupported precise fact in fallback reply: {rendered}"
 
 
 def deterministic_review_failure_answer(
@@ -1272,37 +1201,10 @@ def deterministic_review_failure_answer(
     mentioned: bool,
     context_changed: bool = False,
 ) -> str:
-    explicitly_addressed = bool(
-        mentioned
-        or decision.participation_role == "addressed"
-        or decision.semantic_audience == "bot"
+    return answering_service.deterministic_review_failure_answer(
+        runtime_dependencies, decision, candidate,
+        mentioned=mentioned, context_changed=context_changed,
     )
-    if not explicitly_addressed:
-        return ""
-    if decision.semantic_intent == "control_attempt":
-        return "这类操作不能通过普通聊天执行。"
-    if (
-        decision.reply_mode == "knowledge"
-        and candidate
-        and not context_changed
-        and not decision.risk_flags
-        and is_strong_knowledge_match(
-            decision.retrieval_score,
-            decision.retrieval_coverage,
-        )
-    ):
-        knowledge_context = (
-            decision.knowledge_result.context
-            if decision.knowledge_result is not None
-            else ""
-        )
-        if not unsupported_fallback_precise_facts(candidate, knowledge_context):
-            return candidate
-    if decision.semantic_intent == "knowledge":
-        return "这个具体问题我暂时没有可靠信息，不能确定。"
-    if decision.planner_status in {"unavailable", "circuit_open", "low_confidence"}:
-        return "这次我没判断清楚你在问什么，换个说法再问我一次。"
-    return ""
 
 
 def answer_for_decision(
@@ -1313,71 +1215,14 @@ def answer_for_decision(
     admin: bool = False,
     timeout: int | None = None,
 ) -> str:
-    llm_question = generation_question or decision.effective_question or question
-    semantic_context = semantic_context_for_decision(decision)
-    if decision.reply_mode == "control_boundary":
-        return "这类操作不能通过普通聊天执行。"
-    if decision.reply_mode == "bot_meta":
-        return answer_bot_meta(decision.capability, admin=admin)
-    if decision.draft_reply and decision.reply_mode in {"fallback", "chat"}:
-        return finalize_model_answer(
-            decision.draft_reply,
-            unsolicited=decision.reply_mode == "chat",
-        )
-    if decision.reply_mode == "fallback":
-        candidate_knowledge_context = (
-            decision.knowledge_result.context
-            if decision.knowledge_result is not None
-            else ""
-        )
-        answer = ask_fallback_llm(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            model=settings.llm_model,
-            question=llm_question,
-            context=decision.chat_context,
-            memory_context=decision.memory_context,
-            self_history_context=decision.self_history_context,
-            semantic_context=semantic_context,
-            candidate_knowledge_context=candidate_knowledge_context,
-            timeout=timeout or getattr(settings, "knowledge_generation_timeout_seconds", 10),
-        )
-        if fallback_grounding_issue(decision, answer):
-            return "这个具体数值我没有可靠依据，不能给你拍一个。"
-        return finalize_model_answer(answer)
-    if decision.reply_mode == "chat":
-        answer = answer_chat(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            model=settings.chat_model,
-            message=question,
-            context=decision.chat_context,
-            memory_context=decision.memory_context,
-            self_history_context=decision.self_history_context,
-            semantic_context=semantic_context,
-            timeout=timeout or getattr(settings, "chat_generation_timeout_seconds", 7),
-        )
-        return finalize_model_answer(answer, unsolicited=True)
-    return answer_question(
-        question,
-        llm_question,
-        retrieval_question=decision.effective_question or question,
-        allow_fallback=False,
-        chat_context=decision.chat_context,
-        memory_context=decision.memory_context,
-        self_history_context=decision.self_history_context,
-        semantic_context=semantic_context,
-        knowledge_result=(
-            decision.knowledge_result
-            if decision.knowledge_query == (decision.effective_question or question)
-            else None
-        ),
-        timeout=timeout,
+    return answering_service.answer_for_decision(
+        runtime_dependencies, question, decision, generation_question,
+        admin=admin, timeout=timeout,
     )
 
 
 def is_model_error_answer(answer: str) -> bool:
-    return answer.startswith(("模型接口", "还没有配置模型 API Key")) or is_provider_refusal_text(answer)
+    return answering_service.is_model_error_answer(answer)
 
 
 def next_sequence() -> int:
