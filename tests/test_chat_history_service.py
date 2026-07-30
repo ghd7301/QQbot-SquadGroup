@@ -1,3 +1,4 @@
+import json
 import threading
 import unittest
 from types import SimpleNamespace
@@ -62,6 +63,47 @@ class ChatHistoryServiceTests(unittest.TestCase):
 
         self.assertEqual((sender, text), ("200", "本地消息"))
         remote_lookup.assert_not_called()
+
+    def test_recent_context_marks_focus_and_anonymizes_members(self) -> None:
+        state = chat_history.ChatHistoryState()
+        state.record(
+            100,
+            "200",
+            "上下文消息",
+            10,
+            context_seconds=300,
+            context_messages=20,
+            message_id="m1",
+        )
+        settings = SimpleNamespace(
+            bot_qq="999",
+            member_id_secret="secret",
+            onebot_access_token="",
+            chat_context_seconds=300,
+            chat_context_messages=20,
+        )
+        deps = SimpleNamespace(settings=settings, chat_history_state=state)
+        deps.stable_member_id = lambda group_id, user_id: (
+            chat_history.stable_member_id(deps, group_id, user_id)
+        )
+        deps._context_message_payload = lambda group_id, item, current: (
+            chat_history.context_message_payload(
+                deps, group_id, item, current=current
+            )
+        )
+
+        context = chat_history.recent_group_chat_context(
+            deps,
+            100,
+            now=10,
+            focus_sequence=1,
+        )
+        payload = json.loads(context[0])
+
+        self.assertTrue(payload["current"])
+        self.assertEqual(payload["message_id"], "m1")
+        self.assertTrue(payload["speaker"]["id"].startswith("member_"))
+        self.assertNotEqual(payload["speaker"]["id"], "200")
 
 
 if __name__ == "__main__":

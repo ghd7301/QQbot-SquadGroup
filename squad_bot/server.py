@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import queue
 import re
@@ -1018,23 +1016,9 @@ def resolve_reply_message_context(
 
 
 def stable_member_id(group_id: int, user_id: str) -> str:
-    user_key = str(user_id or "").strip()
-    if user_key == settings.bot_qq:
-        return "bot"
-    if not user_key:
-        return "unknown_member"
-    secret = (
-        getattr(settings, "member_id_secret", "")
-        or getattr(settings, "onebot_access_token", "")
-        or settings.bot_qq
-        or "local-member-id"
+    return chat_history_service.stable_member_id(
+        runtime_dependencies, group_id, user_id
     )
-    digest = hmac.new(
-        secret.encode("utf-8"),
-        f"{group_id}:{user_key}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()[:10]
-    return f"member_{digest}"
 
 
 def _context_message_payload(
@@ -1043,47 +1027,9 @@ def _context_message_payload(
     *,
     current: bool,
 ) -> dict:
-    speaker_id = stable_member_id(group_id, item.user_id)
-    payload: dict = {
-        "current": current,
-        "message_id": item.message_id,
-        "sequence": item.sequence,
-        "event_time": item.timestamp,
-        "received_time": item.received_time,
-        "message_status": item.message_status,
-        "speaker": {
-            "id": speaker_id,
-            "role": "bot" if speaker_id == "bot" else "member",
-            "is_self": speaker_id == "bot",
-            "display_name": (
-                item.display_name
-                if speaker_id != "bot"
-                else "机器人"
-            ),
-        },
-        "text": item.text,
-        "content_segments": list(item.content_segments),
-        "mentions": [
-            stable_member_id(group_id, user_id)
-            for user_id in item.mentioned_user_ids
-        ],
-        "mentions_bot": item.mentioned_bot,
-        "generated_for_message_ids": list(item.generated_for_message_ids),
-        "turn_id": item.turn_id,
-        "reply_mode": item.reply_mode,
-        "semantic_topic": item.semantic_topic,
-    }
-    if item.reply_message_id:
-        target_id = stable_member_id(group_id, item.reply_target_user_id)
-        payload["reply_to"] = {
-            "message_id": item.reply_message_id,
-            "speaker_id": target_id,
-            "speaker_role": "bot" if target_id == "bot" else "member",
-            "quoted_text": item.reply_text,
-        }
-    else:
-        payload["reply_to"] = None
-    return payload
+    return chat_history_service.context_message_payload(
+        runtime_dependencies, group_id, item, current=current
+    )
 
 
 def recent_group_chat_context(
@@ -1095,28 +1041,14 @@ def recent_group_chat_context(
     focus_sequence: int = 0,
     through_sequence: int = 0,
 ) -> tuple[str, ...]:
-    current_time = time.time() if now is None else now
-    window = settings.chat_context_seconds if context_seconds is None else context_seconds
-    limit = settings.chat_context_messages if max_messages is None else max_messages
-    selected = chat_history_state.recent(
+    return chat_history_service.recent_group_chat_context(
+        runtime_dependencies,
         group_id,
-        now=current_time,
-        context_seconds=window,
-        max_messages=limit,
+        now=now,
+        context_seconds=context_seconds,
+        max_messages=max_messages,
         focus_sequence=focus_sequence,
         through_sequence=through_sequence,
-    )
-    return tuple(
-        json.dumps(
-            _context_message_payload(
-                group_id,
-                item,
-                current=item.sequence == focus_sequence,
-            ),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        for item in selected
     )
 
 

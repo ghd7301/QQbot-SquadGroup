@@ -77,7 +77,7 @@ squad-qqbot-mvp/
     fact_guard.py   精确事实提取与知识回答安全校验
     planner_health.py 语义规划熔断、半开探测和可用率状态
     pending_store.py SQLite 表结构、会话轮次和待发送消息状态
-    chat_history.py 短期群聊历史、记录服务、引用解析和 JSON 持久化
+    chat_history.py 短期历史、成员匿名化、上下文构建和 JSON 持久化
     chat_scene.py   群聊场景快照和更新调度状态
     message_fragments.py 分段消息聚合、受话人边界和超时状态
     semantic_routing.py 语义路由上下文、关系推导和决策归一化
