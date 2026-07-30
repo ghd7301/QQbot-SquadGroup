@@ -40,20 +40,31 @@ def send_and_record_bot_turn(
     item["_dispatch_completed"] = True
     item["_sent_message_id"] = str(bot_message_id or "")
     trigger_message_ids, turn_id = deps.bot_turn_metadata(item, bot_message_id)
-    deps.record_group_chat_message(
-        group_id,
-        deps.settings.bot_qq,
-        answer,
-        message_id=bot_message_id,
-        reply_message_id=trigger_message_id if reply_to_trigger else "",
-        reply_target_user_id=user_id if reply_to_trigger else "",
-        reply_text=str(item.get("question") or "") if reply_to_trigger else "",
-        generated_for_message_ids=trigger_message_ids,
-        turn_id=turn_id,
-        reply_mode=reply_mode,
-        semantic_topic=semantic_topic,
-    )
-    deps.save_chat_history()
+    try:
+        deps.record_group_chat_message(
+            group_id,
+            deps.settings.bot_qq,
+            answer,
+            message_id=bot_message_id,
+            reply_message_id=trigger_message_id if reply_to_trigger else "",
+            reply_target_user_id=user_id if reply_to_trigger else "",
+            reply_text=str(item.get("question") or "") if reply_to_trigger else "",
+            generated_for_message_ids=trigger_message_ids,
+            turn_id=turn_id,
+            reply_mode=reply_mode,
+            semantic_topic=semantic_topic,
+        )
+        deps.save_chat_history()
+    except Exception as record_exc:
+        print("Post-send recording failed:", repr(record_exc))
+        deps.write_message_audit(
+            decision="error",
+            reason=f"post-send recording failed: {record_exc!r}",
+            group_id=group_id,
+            user_id=user_id,
+            question=str(item.get("question") or ""),
+            event_time=item.get("time"),
+        )
     return bot_message_id, trigger_message_ids, turn_id
 
 
