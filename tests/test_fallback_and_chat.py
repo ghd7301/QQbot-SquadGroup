@@ -201,15 +201,18 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
             )
 
         self.assertTrue(decision.should_reply)
-        self.assertEqual(decision.reply_mode, "fallback")
-        self.assertEqual(decision.planner_status, "unavailable")
+        self.assertEqual(decision.reply_mode, "knowledge")
+        self.assertEqual(
+            decision.reason,
+            "addressed direct question with knowledge context",
+        )
         self.assertIs(decision.knowledge_result, strong)
 
         with (
             patch.object(server, "settings", configured),
             patch.object(
                 server,
-                "ask_fallback_llm",
+                "ask_llm",
                 return_value="2人时是20米，人数越多范围越大，9人时最远90米。",
             ) as generate,
         ):
@@ -222,9 +225,37 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertIn("2人时是20米", answer)
         self.assertNotIn("100米", answer)
         self.assertEqual(
-            generate.call_args.kwargs["candidate_knowledge_context"],
+            generate.call_args.kwargs["context"],
             strong.context,
         )
+
+    def test_mentioned_troubleshooting_question_prefers_weak_knowledge_context(self) -> None:
+        weak = ContextResult(
+            "前几十小时迷路、看不见人、听不懂黑话都正常。先跟队、看地图、学复活点和报点。",
+            ["knowledge/13-新手实战流程.md"],
+            2.1,
+            0.5,
+        )
+        configured = routing_settings(semantic_planner_enabled=True)
+        with (
+            patch.object(server, "settings", configured),
+            patch.object(server, "semantic_plan_for_message", return_value=None) as planner,
+            patch.object(server, "retrieve_knowledge", return_value=weak),
+        ):
+            decision = server.should_process_message(
+                "看不到人怎么办",
+                True,
+                group_id=983063031,
+            )
+
+        self.assertTrue(decision.should_reply)
+        self.assertEqual(decision.reply_mode, "knowledge")
+        self.assertEqual(
+            decision.reason,
+            "addressed direct question with knowledge context",
+        )
+        self.assertIs(decision.knowledge_result, weak)
+        planner.assert_not_called()
 
     def test_addressed_messages_get_separate_semantic_planner_timeout(self) -> None:
         configured = routing_settings(

@@ -57,6 +57,40 @@ def should_process_message(
         lambda query: deps.retrieve_knowledge(query, deps.settings.max_context_chars),
         deps.is_strong_knowledge_match,
     )
+    if (
+        mentioned
+        and deps.looks_like_direct_question(normalized)
+        and deps.has_auto_reply_keyword(query_text)
+    ):
+        selection = knowledge_router.lookup(query_text)
+        lowered_query = query_text.lower()
+        troubleshooting_visibility_query = any(
+            cue in lowered_query
+            for cue in ("看不到人", "看不见人", "看不到小队", "看不见小队")
+        )
+        if selection.result.context and (
+            selection.strong_match or troubleshooting_visibility_query
+        ):
+            return deps.attach_knowledge_result(
+                deps.ProcessingDecision(
+                    True,
+                    "addressed direct question with knowledge context",
+                    True,
+                    tuple(selection.result.sources),
+                    query_text,
+                    followup_of,
+                    followup_scope,
+                    "knowledge",
+                    tuple(chat_context),
+                    selection.result.top_score,
+                    selection.result.query_coverage,
+                    semantic_intent="knowledge",
+                    semantic_audience="bot",
+                    participation_role="addressed",
+                ),
+                query_text,
+                selection.result,
+            )
     planner_enabled = bool(getattr(deps.settings, "semantic_planner_enabled", False))
     planner_request_allowed = bool(
         not planner_enabled
@@ -382,6 +416,11 @@ def should_process_message(
                 explicitly_addressed or not deps.settings.fallback_only_when_mentioned
             ),
             low_confidence=plan is not None,
+            prefer_knowledge_when_strong=bool(
+                mentioned
+                and deps.looks_like_direct_question(normalized)
+                and deps.has_auto_reply_keyword(query_text)
+            ),
         )
         if decision is not None:
             return decision

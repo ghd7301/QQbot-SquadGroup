@@ -130,12 +130,17 @@ def addressed_planner_fallback(
     strong_match: bool,
     fallback_allowed: bool,
     low_confidence: bool,
+    prefer_knowledge_when_strong: bool = False,
 ) -> ProcessingDecision | None:
     planner_status = "low_confidence" if low_confidence else "unavailable"
-    if explicit_knowledge_command and strong_match:
+    if (explicit_knowledge_command or prefer_knowledge_when_strong) and strong_match:
         decision = ProcessingDecision(
             True,
-            "explicit knowledge command with strong context",
+            (
+                "explicit knowledge command with strong context"
+                if explicit_knowledge_command
+                else "addressed strong knowledge while planner unavailable"
+            ),
             True,
             tuple(result.sources),
             query_text,

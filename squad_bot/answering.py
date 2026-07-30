@@ -172,6 +172,19 @@ def deterministic_review_failure_answer(
         )
         if not unsupported_fallback_precise_facts(candidate, knowledge_context):
             return finalize_model_answer(deps, candidate)
+    if (
+        candidate
+        and not context_changed
+        and not decision.risk_flags
+        and decision.knowledge_result is not None
+        and deps.is_strong_knowledge_match(
+            decision.retrieval_score,
+            decision.retrieval_coverage,
+        )
+    ):
+        knowledge_context = decision.knowledge_result.context
+        if not unsupported_fallback_precise_facts(candidate, knowledge_context):
+            return finalize_model_answer(deps, candidate)
     if decision.semantic_intent == "knowledge":
         return "这个具体问题我暂时没有可靠信息，不能确定。"
     if decision.planner_status in {"unavailable", "circuit_open", "low_confidence"}:
