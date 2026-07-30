@@ -21,6 +21,22 @@ def process_worker_item(
                 ),
                 mentioned,
             )
+            # Skip if this entry was superseded by a higher-priority duplicate
+            pending_id = item.get("_pending_id")
+            if pending_id is not None and not mentioned:
+                if deps.is_pending_superseded(int(pending_id)):
+                    print("Skip superseded item", pending_id, group_id, question)
+                    deps.write_message_audit(
+                        decision="skipped",
+                        reason="superseded by mentioned=true duplicate",
+                        group_id=group_id,
+                        user_id=user_id,
+                        question=question,
+                        mentioned=mentioned,
+                        event_time=event_time,
+                    )
+                    lifecycle.terminal = True
+                    continue
             admin_user = deps.is_admin_user(user_id, sender_role)
             command = deps.get_admin_command(question) if admin_user else ""
             if deps.is_restored_admin_command(item):

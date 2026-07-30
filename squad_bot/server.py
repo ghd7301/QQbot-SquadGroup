@@ -1332,6 +1332,26 @@ def mark_pending_dispatch_started(
     )
 
 
+def mark_pending_superseded(pending_id: int, *, db_path: str | Path | None = None) -> None:
+    return queue_store.mark_pending_superseded(
+        runtime_dependencies, pending_id, db_path=db_path
+    )
+
+
+def is_pending_superseded(pending_id: int, *, db_path: str | Path | None = None) -> bool:
+    return queue_store.is_pending_superseded(
+        runtime_dependencies, pending_id, db_path=db_path
+    )
+
+
+def find_queued_duplicates(
+    group_id: int, message_ids: list[str], *, db_path: str | Path | None = None
+) -> list[int]:
+    return queue_store.find_queued_duplicates(
+        runtime_dependencies, group_id, message_ids, db_path=db_path
+    )
+
+
 
 def recover_incomplete_pending_dispatches(db_path: str | Path | None = None) -> int:
     return queue_store.recover_incomplete_pending_dispatches(

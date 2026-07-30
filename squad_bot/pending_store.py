@@ -365,6 +365,86 @@ def mark_pending_dispatch_started(
         connection.close()
 
 
+def mark_pending_superseded(
+    pending_id: int,
+    *,
+    db_path: str | Path,
+) -> None:
+    """Mark a queued entry as superseded by a higher-priority duplicate."""
+    connection = open_pending_queue_db(db_path)
+    try:
+        connection.execute(
+            """
+            UPDATE pending_messages
+            SET status = 'superseded', next_attempt_at = 0
+            WHERE id = ? AND status IN ('queued', 'retry')
+            """,
+            (pending_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def is_pending_superseded(
+    pending_id: int,
+    *,
+    db_path: str | Path,
+) -> bool:
+    """Check if a pending entry has been marked as superseded."""
+    connection = open_pending_queue_db(db_path)
+    try:
+        row = connection.execute(
+            "SELECT status FROM pending_messages WHERE id = ?",
+            (pending_id,),
+        ).fetchone()
+        return bool(row and row[0] == "superseded")
+    finally:
+        connection.close()
+
+
+def find_queued_duplicates(
+    group_id: int,
+    message_ids: list[str],
+    *,
+    db_path: str | Path,
+) -> list[int]:
+    """Find pending entries for the same group with overlapping message_ids."""
+    if not message_ids:
+        return []
+    connection = open_pending_queue_db(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, payload FROM pending_messages
+            WHERE status IN ('queued', 'retry')
+            """,
+        ).fetchall()
+    finally:
+        connection.close()
+    target_ids = set(message_ids)
+    result: list[int] = []
+    import json as _json
+    for row in rows:
+        try:
+            payload = _json.loads(row[1])
+        except (TypeError, ValueError):
+            continue
+        if int(payload.get("group_id") or 0) != group_id:
+            continue
+        existing_ids = set()
+        for candidate in payload.get("message_ids") or ():
+            value = str(candidate or "").strip()
+            if value:
+                existing_ids.add(value)
+        msg_id = str(payload.get("message_id") or "").strip()
+        if msg_id:
+            existing_ids.add(msg_id)
+        if existing_ids & target_ids:
+            result.append(row[0])
+    return result
+
+
 def recover_incomplete_pending_dispatches(*, db_path: str | Path) -> int:
     connection = open_pending_queue_db(db_path)
     try:

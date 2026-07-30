@@ -11,6 +11,22 @@ def next_sequence(deps) -> int:
 
 
 def enqueue_persistent_message(deps, priority: int, item: dict) -> int:
+    # When enqueuing a mentioned=true item (priority 0), check for and
+    # supersede any existing queued entry with the same message_ids that
+    # was dispatched as mentioned=false. This prevents the same message
+    # from being processed twice through different queue lanes.
+    if priority == 0:
+        group_id = int(item.get("group_id") or 0)
+        ids = []
+        for candidate in item.get("message_ids") or (item.get("message_id"),):
+            value = str(candidate or "").strip()
+            if value:
+                ids.append(value)
+        if group_id and ids:
+            duplicate_ids = deps.find_queued_duplicates(group_id, ids)
+            for dup_id in duplicate_ids:
+                deps.mark_pending_superseded(int(dup_id))
+                print("Superseded pending entry", dup_id, "for group", group_id)
     sequence = deps.next_sequence()
     pending_id = deps.persist_pending_message(priority, sequence, item)
     queued_item = dict(item)
