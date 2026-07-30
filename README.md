@@ -57,6 +57,8 @@ squad-qqbot-mvp/
   docs/             设计与运行链路说明
   squad_bot/
     admin.py        管理命令识别、权限判断和运行态维护操作
+    delivery/
+      replies.py    回复发送、短期历史落盘和消息覆盖关系维护
     ingress/
       events.py     OneBot 撤回、群过滤、上下文记录和入队编排
       fragments.py  分段消息分类、聚合、语义切分和派发

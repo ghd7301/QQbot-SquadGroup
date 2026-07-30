@@ -20,6 +20,7 @@ from .message_fragments import (
 )
 from . import admin as admin_service
 from . import message_router, semantic_routing, worker_handlers
+from .delivery import replies as reply_delivery
 from .ingress import events as ingress_events
 from .ingress import fragments as fragment_ingress
 from .observability import audit as audit_observability
@@ -3105,14 +3106,13 @@ def fragment_items_compatible(
 
 
 def _message_ids(item: dict) -> list[str]:
-    return message_ids(item)
+    return reply_delivery.message_ids(runtime_dependencies, item)
 
 
 def bot_turn_metadata(item: dict, bot_message_id) -> tuple[tuple[str, ...], str]:
-    trigger_ids = tuple(_message_ids(item))
-    bot_id = str(bot_message_id or "").strip()
-    turn_id = f"bot:{bot_id}" if bot_id else ""
-    return trigger_ids, turn_id
+    return reply_delivery.bot_turn_metadata(
+        runtime_dependencies, item, bot_message_id
+    )
 
 
 def send_and_record_bot_turn(
@@ -3125,85 +3125,32 @@ def send_and_record_bot_turn(
     mention_user_id: str = "",
     reply_to_trigger: bool = False,
 ) -> tuple[object, tuple[str, ...], str]:
-    trigger_message_id = str(item.get("message_id") or "")
-    user_id = str(item.get("user_id") or "")
-    begin_pending_dispatch(item)
-    bot_message_id = send_group_msg(
-        settings.onebot_api_url,
-        group_id,
-        answer,
-        settings.onebot_access_token,
-        mention_user_id=mention_user_id,
-        reply_to_message_id=trigger_message_id if reply_to_trigger else "",
-    )
-    item["_dispatch_completed"] = True
-    item["_sent_message_id"] = str(bot_message_id or "")
-    trigger_message_ids, turn_id = bot_turn_metadata(item, bot_message_id)
-    record_group_chat_message(
-        group_id,
-        settings.bot_qq,
-        answer,
-        message_id=bot_message_id,
-        reply_message_id=trigger_message_id if reply_to_trigger else "",
-        reply_target_user_id=user_id if reply_to_trigger else "",
-        reply_text=str(item.get("question") or "") if reply_to_trigger else "",
-        generated_for_message_ids=trigger_message_ids,
-        turn_id=turn_id,
+    return reply_delivery.send_and_record_bot_turn(
+        runtime_dependencies,
+        group_id=group_id,
+        item=item,
+        answer=answer,
         reply_mode=reply_mode,
         semantic_topic=semantic_topic,
+        mention_user_id=mention_user_id,
+        reply_to_trigger=reply_to_trigger,
     )
-    save_chat_history()
-    return bot_message_id, trigger_message_ids, turn_id
 
 
 def message_already_covered_by_bot(group_id: int, message_id) -> bool:
-    """Return whether a completed bot turn already covers this incoming message."""
-    target = str(message_id or "").strip()
-    if not target:
-        return False
-    with chat_history_lock:
-        return any(
-            entry.user_id == str(settings.bot_qq or "")
-            and entry.message_status == "active"
-            and target in entry.generated_for_message_ids
-            for entry in group_chat_history.get(int(group_id), ())
-        )
+    return reply_delivery.message_already_covered_by_bot(
+        runtime_dependencies, group_id, message_id
+    )
 
 
 def _context_message_speakers(context: Sequence[str]) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for line in context:
-        try:
-            payload = json.loads(line)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        message_id = str(payload.get("message_id") or "").strip()
-        if message_id:
-            speaker = payload.get("speaker") if isinstance(payload.get("speaker"), dict) else {}
-            result[message_id] = str(speaker.get("id") or "").strip()
-    return result
+    return reply_delivery.context_message_speakers(context)
 
 
 def merge_review_message_ids(item: dict | None, review, latest_context: Sequence[str]) -> None:
-    """Attach only real context message IDs selected by the semantic reviewer."""
-    if item is None:
-        return
-    existing = _message_ids(item)
-    context_speakers = _context_message_speakers(latest_context)
-    original_speakers = {
-        context_speakers[message_id]
-        for message_id in existing
-        if context_speakers.get(message_id)
-    }
-    for message_id in review.related_message_ids:
-        value = str(message_id or "").strip()
-        same_sender = bool(
-            original_speakers
-            and context_speakers.get(value) in original_speakers
-        )
-        if value and same_sender and value not in existing:
-            existing.append(value)
-    item["message_ids"] = existing
+    return reply_delivery.merge_review_message_ids(
+        runtime_dependencies, item, review, latest_context
+    )
 
 
 def _new_fragment_buffer(
