@@ -2,18 +2,40 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
 from .models import ConversationState, PendingFailureResult
 
+_local = threading.local()
+
 
 def open_pending_queue_db(db_path: str | Path) -> sqlite3.Connection:
+    """Return a thread-local SQLite connection, creating and migrating on first use."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=5)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=5000")
+    key = str(path.resolve())
+    cache = getattr(_local, "connections", None)
+    if cache is None:
+        cache = {}
+        _local.connections = cache
+    conn = cache.get(key)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            cache.pop(key, None)
+    conn = sqlite3.connect(str(path), timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    _run_migrations(conn)
+    cache[key] = conn
+    return conn
+
+
+def _run_migrations(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_messages (
@@ -125,37 +147,34 @@ def persist_conversation_turn(
     db_path: str | Path,
 ) -> int:
     connection = open_pending_queue_db(db_path)
-    try:
-        cutoff = time.time() - 30 * 86400
-        connection.execute("DELETE FROM conversation_turns WHERE created_at < ?", (cutoff,))
-        cursor = connection.execute(
-            """
-            INSERT INTO conversation_turns (
-                group_id, user_id, user_message_id, bot_message_id,
-                question, answer, reply_mode, sources_json, created_at,
-                trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(group_id),
-                state.user_id,
-                state.user_message_id,
-                state.bot_message_id,
-                state.last_question,
-                state.last_answer,
-                state.reply_mode,
-                json.dumps(list(state.sources), ensure_ascii=False),
-                state.timestamp,
-                json.dumps(list(state.trigger_message_ids), ensure_ascii=False),
-                state.turn_id,
-                state.semantic_intent,
-                state.semantic_topic,
-            ),
-        )
-        connection.commit()
-        return int(cursor.lastrowid)
-    finally:
-        connection.close()
+    cutoff = time.time() - 30 * 86400
+    connection.execute("DELETE FROM conversation_turns WHERE created_at < ?", (cutoff,))
+    cursor = connection.execute(
+        """
+        INSERT INTO conversation_turns (
+            group_id, user_id, user_message_id, bot_message_id,
+            question, answer, reply_mode, sources_json, created_at,
+            trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(group_id),
+            state.user_id,
+            state.user_message_id,
+            state.bot_message_id,
+            state.last_question,
+            state.last_answer,
+            state.reply_mode,
+            json.dumps(list(state.sources), ensure_ascii=False),
+            state.timestamp,
+            json.dumps(list(state.trigger_message_ids), ensure_ascii=False),
+            state.turn_id,
+            state.semantic_intent,
+            state.semantic_topic,
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
 
 
 def conversation_state_from_row(row) -> ConversationState:
@@ -189,20 +208,17 @@ def load_conversation_turn_by_bot_message_id(
     if not target:
         return None
     connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            """
-            SELECT id, user_id, user_message_id, bot_message_id,
-                   question, answer, reply_mode, sources_json, created_at,
-                   trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
-            FROM conversation_turns
-            WHERE group_id = ? AND bot_message_id = ?
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (str(group_id), target),
-        ).fetchone()
-    finally:
-        connection.close()
+    row = connection.execute(
+        """
+        SELECT id, user_id, user_message_id, bot_message_id,
+               question, answer, reply_mode, sources_json, created_at,
+               trigger_message_ids_json,turn_id,semantic_intent,semantic_topic
+        FROM conversation_turns
+        WHERE group_id = ? AND bot_message_id = ?
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (str(group_id), target),
+    ).fetchone()
     return conversation_state_from_row(row) if row else None
 
 
@@ -214,15 +230,12 @@ def persist_pending_message(
     db_path: str | Path,
 ) -> int:
     connection = open_pending_queue_db(db_path)
-    try:
-        cursor = connection.execute(
-            "INSERT INTO pending_messages (priority, sequence, payload, created_at) VALUES (?, ?, ?, ?)",
-            (priority, sequence, json.dumps(item, ensure_ascii=False), time.time()),
-        )
-        connection.commit()
-        return int(cursor.lastrowid)
-    finally:
-        connection.close()
+    cursor = connection.execute(
+        "INSERT INTO pending_messages (priority, sequence, payload, created_at) VALUES (?, ?, ?, ?)",
+        (priority, sequence, json.dumps(item, ensure_ascii=False), time.time()),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
 
 
 def load_pending_messages(
@@ -231,21 +244,18 @@ def load_pending_messages(
     include_future: bool = False,
 ) -> list[tuple[int, int, dict]]:
     connection = open_pending_queue_db(db_path)
-    try:
-        query = """
-            SELECT id, priority, sequence, payload, created_at,
-                   status, attempts, next_attempt_at, last_error, dispatch_id
-            FROM pending_messages
-            WHERE status IN ('queued', 'retry')
-        """
-        parameters: tuple = ()
-        if not include_future:
-            query += " AND next_attempt_at <= ?"
-            parameters = (time.time(),)
-        query += " ORDER BY priority, sequence"
-        rows = connection.execute(query, parameters).fetchall()
-    finally:
-        connection.close()
+    query = """
+        SELECT id, priority, sequence, payload, created_at,
+               status, attempts, next_attempt_at, last_error, dispatch_id
+        FROM pending_messages
+        WHERE status IN ('queued', 'retry')
+    """
+    parameters: tuple = ()
+    if not include_future:
+        query += " AND next_attempt_at <= ?"
+        parameters = (time.time(),)
+    query += " ORDER BY priority, sequence"
+    rows = connection.execute(query, parameters).fetchall()
 
     pending: list[tuple[int, int, dict]] = []
     for (
@@ -293,34 +303,31 @@ def mark_pending_failure(
     current_time = time.time() if now is None else float(now)
     limit = max(1, int(max_attempts))
     connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            "SELECT attempts FROM pending_messages WHERE id = ?",
-            (pending_id,),
-        ).fetchone()
-        if not row:
-            return PendingFailureResult("missing", 0, 0.0)
-        attempts = int(row[0] or 0) + 1
-        if attempts >= limit:
-            status = "dead_letter"
-            next_attempt_at = 0.0
-        else:
-            status = "retry"
-            delays = (1.0, 3.0, 10.0)
-            delay = delays[min(attempts - 1, len(delays) - 1)]
-            next_attempt_at = current_time + delay
-        connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?
-            WHERE id = ?
-            """,
-            (status, attempts, next_attempt_at, str(error or "")[:500], pending_id),
-        )
-        connection.commit()
-        return PendingFailureResult(status, attempts, next_attempt_at)
-    finally:
-        connection.close()
+    row = connection.execute(
+        "SELECT attempts FROM pending_messages WHERE id = ?",
+        (pending_id,),
+    ).fetchone()
+    if not row:
+        return PendingFailureResult("missing", 0, 0.0)
+    attempts = int(row[0] or 0) + 1
+    if attempts >= limit:
+        status = "dead_letter"
+        next_attempt_at = 0.0
+    else:
+        status = "retry"
+        delays = (1.0, 3.0, 10.0)
+        delay = delays[min(attempts - 1, len(delays) - 1)]
+        next_attempt_at = current_time + delay
+    connection.execute(
+        """
+        UPDATE pending_messages
+        SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?
+        WHERE id = ?
+        """,
+        (status, attempts, next_attempt_at, str(error or "")[:500], pending_id),
+    )
+    connection.commit()
+    return PendingFailureResult(status, attempts, next_attempt_at)
 
 
 def mark_pending_sent_unknown(
@@ -330,18 +337,15 @@ def mark_pending_sent_unknown(
     db_path: str | Path,
 ) -> None:
     connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = 'sent_unknown', last_error = ?, next_attempt_at = 0
-            WHERE id = ?
-            """,
-            (str(error or "")[:500], pending_id),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    connection.execute(
+        """
+        UPDATE pending_messages
+        SET status = 'sent_unknown', last_error = ?, next_attempt_at = 0
+        WHERE id = ?
+        """,
+        (str(error or "")[:500], pending_id),
+    )
+    connection.commit()
 
 
 def mark_pending_dispatch_started(
@@ -351,18 +355,15 @@ def mark_pending_dispatch_started(
     db_path: str | Path,
 ) -> None:
     connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = 'dispatching', dispatch_id = ?, last_error = ''
-            WHERE id = ? AND status IN ('queued', 'retry')
-            """,
-            (str(dispatch_id), pending_id),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    connection.execute(
+        """
+        UPDATE pending_messages
+        SET status = 'dispatching', dispatch_id = ?, last_error = ''
+        WHERE id = ? AND status IN ('queued', 'retry')
+        """,
+        (str(dispatch_id), pending_id),
+    )
+    connection.commit()
 
 
 def mark_pending_superseded(
@@ -372,18 +373,15 @@ def mark_pending_superseded(
 ) -> None:
     """Mark a queued or dispatching entry as superseded by a higher-priority duplicate."""
     connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = 'superseded', next_attempt_at = 0
-            WHERE id = ? AND status IN ('queued', 'retry', 'dispatching')
-            """,
-            (pending_id,),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    connection.execute(
+        """
+        UPDATE pending_messages
+        SET status = 'superseded', next_attempt_at = 0
+        WHERE id = ? AND status IN ('queued', 'retry', 'dispatching')
+        """,
+        (pending_id,),
+    )
+    connection.commit()
 
 
 def is_pending_superseded(
@@ -393,14 +391,11 @@ def is_pending_superseded(
 ) -> bool:
     """Check if a pending entry has been marked as superseded."""
     connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            "SELECT status FROM pending_messages WHERE id = ?",
-            (pending_id,),
-        ).fetchone()
-        return bool(row and row[0] == "superseded")
-    finally:
-        connection.close()
+    row = connection.execute(
+        "SELECT status FROM pending_messages WHERE id = ?",
+        (pending_id,),
+    ).fetchone()
+    return bool(row and row[0] == "superseded")
 
 
 def find_queued_duplicates(
@@ -413,15 +408,12 @@ def find_queued_duplicates(
     if not message_ids:
         return []
     connection = open_pending_queue_db(db_path)
-    try:
-        rows = connection.execute(
-            """
-            SELECT id, payload FROM pending_messages
-            WHERE status IN ('queued', 'retry', 'dispatching')
-            """,
-        ).fetchall()
-    finally:
-        connection.close()
+    rows = connection.execute(
+        """
+        SELECT id, payload FROM pending_messages
+        WHERE status IN ('queued', 'retry', 'dispatching')
+        """,
+    ).fetchall()
     target_ids = set(message_ids)
     result: list[int] = []
     import json as _json
@@ -447,39 +439,30 @@ def find_queued_duplicates(
 
 def recover_incomplete_pending_dispatches(*, db_path: str | Path) -> int:
     connection = open_pending_queue_db(db_path)
-    try:
-        cursor = connection.execute(
-            """
-            UPDATE pending_messages
-            SET status = 'sent_unknown', next_attempt_at = 0,
-                last_error = 'service stopped during message dispatch'
-            WHERE status = 'dispatching'
-            """
-        )
-        connection.commit()
-        return max(0, int(cursor.rowcount or 0))
-    finally:
-        connection.close()
+    cursor = connection.execute(
+        """
+        UPDATE pending_messages
+        SET status = 'sent_unknown', next_attempt_at = 0,
+            last_error = 'service stopped during message dispatch'
+        WHERE status = 'dispatching'
+        """
+    )
+    connection.commit()
+    return max(0, int(cursor.rowcount or 0))
 
 
 def delete_pending_message(pending_id: int, *, db_path: str | Path) -> None:
     connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute("DELETE FROM pending_messages WHERE id = ?", (pending_id,))
-        connection.commit()
-    finally:
-        connection.close()
+    connection.execute("DELETE FROM pending_messages WHERE id = ?", (pending_id,))
+    connection.commit()
 
 
 def pending_message_count(*, db_path: str | Path) -> int:
     connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM pending_messages WHERE status IN ('queued', 'retry')"
-        ).fetchone()
-        return int(row[0]) if row else 0
-    finally:
-        connection.close()
+    row = connection.execute(
+        "SELECT COUNT(*) FROM pending_messages WHERE status IN ('queued', 'retry')"
+    ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def pending_status_counts(*, db_path: str | Path) -> dict[str, int]:
@@ -491,13 +474,10 @@ def pending_status_counts(*, db_path: str | Path) -> dict[str, int]:
         "sent_unknown": 0,
     }
     connection = open_pending_queue_db(db_path)
-    try:
-        for status, count in connection.execute(
-            "SELECT status, COUNT(*) FROM pending_messages GROUP BY status"
-        ):
-            result[str(status or "queued")] = int(count or 0)
-    finally:
-        connection.close()
+    for status, count in connection.execute(
+        "SELECT status, COUNT(*) FROM pending_messages GROUP BY status"
+    ):
+        result[str(status or "queued")] = int(count or 0)
     return result
 
 
@@ -509,19 +489,16 @@ def cleanup_stale_pending_messages(
     """Delete dead_letter, sent_unknown, and superseded entries older than max_age_hours."""
     cutoff = time.time() - max_age_hours * 3600
     connection = open_pending_queue_db(db_path)
-    try:
-        cursor = connection.execute(
-            """
-            DELETE FROM pending_messages
-            WHERE status IN ('dead_letter', 'sent_unknown', 'superseded')
-              AND created_at < ?
-            """,
-            (cutoff,),
-        )
-        connection.commit()
-        return cursor.rowcount
-    finally:
-        connection.close()
+    cursor = connection.execute(
+        """
+        DELETE FROM pending_messages
+        WHERE status IN ('dead_letter', 'sent_unknown', 'superseded')
+          AND created_at < ?
+        """,
+        (cutoff,),
+    )
+    connection.commit()
+    return cursor.rowcount
 
 
 def chat_reply_quota_reason(
@@ -533,14 +510,11 @@ def chat_reply_quota_reason(
     max_per_hour: int,
 ) -> str:
     connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            "SELECT MAX(replied_at), COUNT(*) FROM chat_reply_history "
-            "WHERE group_id = ? AND replied_at > ?",
-            (str(group_id), now - 3600),
-        ).fetchone()
-    finally:
-        connection.close()
+    row = connection.execute(
+        "SELECT MAX(replied_at), COUNT(*) FROM chat_reply_history "
+        "WHERE group_id = ? AND replied_at > ?",
+        (str(group_id), now - 3600),
+    ).fetchone()
     previous = float(row[0]) if row and row[0] is not None else None
     recent_count = int(row[1]) if row else 0
     if cooldown_seconds > 0 and previous is not None and now - previous < cooldown_seconds:
@@ -557,18 +531,15 @@ def mark_chat_replied(
     now: float,
 ) -> None:
     connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute(
-            "DELETE FROM chat_reply_history WHERE replied_at <= ?",
-            (now - 3600,),
-        )
-        connection.execute(
-            "INSERT INTO chat_reply_history (group_id, replied_at) VALUES (?, ?)",
-            (str(group_id), now),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    connection.execute(
+        "DELETE FROM chat_reply_history WHERE replied_at <= ?",
+        (now - 3600,),
+    )
+    connection.execute(
+        "INSERT INTO chat_reply_history (group_id, replied_at) VALUES (?, ?)",
+        (str(group_id), now),
+    )
+    connection.commit()
 
 
 def celebration_was_replied(
@@ -581,15 +552,12 @@ def celebration_was_replied(
     window_seconds: int,
 ) -> bool:
     connection = open_pending_queue_db(db_path)
-    try:
-        row = connection.execute(
-            "SELECT 1 FROM celebration_reply_history "
-            "WHERE group_id = ? AND target_key = ? AND event_kind = ? "
-            "AND replied_at > ? LIMIT 1",
-            (str(group_id), target_key, event_kind, now - window_seconds),
-        ).fetchone()
-    finally:
-        connection.close()
+    row = connection.execute(
+        "SELECT 1 FROM celebration_reply_history "
+        "WHERE group_id = ? AND target_key = ? AND event_kind = ? "
+        "AND replied_at > ? LIMIT 1",
+        (str(group_id), target_key, event_kind, now - window_seconds),
+    ).fetchone()
     return row is not None
 
 
@@ -602,16 +570,13 @@ def mark_celebration_replied(
     now: float,
 ) -> None:
     connection = open_pending_queue_db(db_path)
-    try:
-        connection.execute(
-            "DELETE FROM celebration_reply_history WHERE replied_at <= ?",
-            (now - 604800,),
-        )
-        connection.execute(
-            "INSERT INTO celebration_reply_history "
-            "(group_id, target_key, event_kind, replied_at) VALUES (?, ?, ?, ?)",
-            (str(group_id), target_key, event_kind, now),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    connection.execute(
+        "DELETE FROM celebration_reply_history WHERE replied_at <= ?",
+        (now - 604800,),
+    )
+    connection.execute(
+        "INSERT INTO celebration_reply_history "
+        "(group_id, target_key, event_kind, replied_at) VALUES (?, ?, ?, ?)",
+        (str(group_id), target_key, event_kind, now),
+    )
+    connection.commit()
