@@ -406,6 +406,12 @@ def mark_topic_replied(group_id: int, key: str) -> None:
     return conversation_service.mark_topic_replied(runtime_dependencies, group_id, key)
 
 
+def check_and_mark_topic_replied(group_id: int, key: str) -> bool:
+    return conversation_service.check_and_mark_topic_replied(
+        runtime_dependencies, group_id, key,
+    )
+
+
 def followup_context_for(
     group_id: int,
     user_id,
@@ -812,6 +818,21 @@ def mark_chat_replied(
 ) -> None:
     return conversation_service.mark_chat_replied(
         runtime_dependencies, group_id, now=now, db_path=db_path,
+    )
+
+
+def check_and_mark_chat_reply_quota(
+    group_id: int,
+    *,
+    now: float | None = None,
+    cooldown_seconds: int | None = None,
+    max_per_hour: int | None = None,
+    db_path: str | Path | None = None,
+) -> str:
+    return conversation_service.check_and_mark_chat_reply_quota(
+        runtime_dependencies, group_id,
+        now=now, cooldown_seconds=cooldown_seconds,
+        max_per_hour=max_per_hour, db_path=db_path,
     )
 
 

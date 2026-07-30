@@ -526,6 +526,26 @@ def mark_topic_replied(deps, group_id: int, key: str) -> None:
         deps.recent_reply_topics[(group_id, key)] = time.time()
 
 
+def check_and_mark_topic_replied(deps, group_id: int, key: str) -> bool:
+    """Atomically check cooldown and mark if not on cooldown. Returns True if on cooldown."""
+    if deps.settings.same_topic_cooldown_seconds <= 0:
+        return False
+    now = time.time()
+    with deps.topic_cooldown_lock:
+        expired = [
+            item_key
+            for item_key, timestamp in deps.recent_reply_topics.items()
+            if now - timestamp > deps.settings.same_topic_cooldown_seconds
+        ]
+        for item_key in expired:
+            deps.recent_reply_topics.pop(item_key, None)
+        last_reply = deps.recent_reply_topics.get((group_id, key))
+        if last_reply is not None and now - last_reply <= deps.settings.same_topic_cooldown_seconds:
+            return True
+        deps.recent_reply_topics[(group_id, key)] = now
+        return False
+
+
 def followup_context_for(
     deps,
     group_id: int,
@@ -732,6 +752,44 @@ def mark_chat_replied(
             db_path=deps._pending_db_path(db_path),
             now=timestamp,
         )
+
+
+def check_and_mark_chat_reply_quota(
+    deps,
+    group_id: int,
+    *,
+    now: float | None = None,
+    cooldown_seconds: int | None = None,
+    max_per_hour: int | None = None,
+    db_path: str | Path | None = None,
+) -> str:
+    """Atomically check quota and mark if allowed. Returns empty string if OK, reason if blocked."""
+    current_time = time.time() if now is None else now
+    cooldown = (
+        deps.settings.chat_reply_cooldown_seconds
+        if cooldown_seconds is None
+        else cooldown_seconds
+    )
+    hourly_limit = (
+        deps.settings.max_chat_replies_per_hour
+        if max_per_hour is None
+        else max_per_hour
+    )
+    with deps.chat_reply_lock:
+        reason = deps.pending_store.chat_reply_quota_reason(
+            group_id,
+            db_path=deps._pending_db_path(db_path),
+            now=current_time,
+            cooldown_seconds=cooldown,
+            max_per_hour=hourly_limit,
+        )
+        if not reason:
+            deps.pending_store.mark_chat_replied(
+                group_id,
+                db_path=deps._pending_db_path(db_path),
+                now=current_time,
+            )
+        return reason
 
 
 def celebration_was_replied(

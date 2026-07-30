@@ -292,7 +292,7 @@ def process_worker_item(
             if (
                 not mentioned
                 and decision.reply_mode == "knowledge"
-                and deps.is_topic_on_cooldown(group_id, current_topic_key)
+                and deps.check_and_mark_topic_replied(group_id, current_topic_key)
             ):
                 print(
                     "Skip message: recent topic cooldown",
@@ -478,8 +478,6 @@ def process_worker_item(
                     **deps.semantic_relation_audit_fields(decision),
                     event_time=item.get("time"),
                 )
-                if decision.reply_mode == "knowledge":
-                    deps.mark_topic_replied(group_id, current_topic_key)
                 continue
             if not deps.wait_for_rate_limit(deadline):
                 deps.write_message_audit(
@@ -649,8 +647,6 @@ def process_worker_item(
                 trigger_message_ids=trigger_message_ids,
                 turn_id=turn_id,
             )
-            if decision.reply_mode == "knowledge":
-                deps.mark_topic_replied(group_id, current_topic_key)
         except Exception as exc:
             lifecycle.handle_failure(repr(exc), deps.handle_pending_worker_failure)
             print(f"{lane} worker error:", repr(exc))

@@ -46,7 +46,7 @@ def process_chat_item(
                     event_time=event_time,
                 )
                 continue
-            quota_reason = deps.chat_reply_quota_reason(group_id)
+            quota_reason = deps.check_and_mark_chat_reply_quota(group_id)
             if quota_reason:
                 deps.write_message_audit(
                     decision="skipped",
@@ -323,7 +323,6 @@ def process_chat_item(
                     **deps.semantic_relation_audit_fields(decision),
                     event_time=event_time,
                 )
-                deps.mark_chat_replied(group_id)
                 if social_event_kind:
                     deps.mark_celebration_replied(
                         group_id, celebration_target_key, social_event_kind
@@ -426,7 +425,6 @@ def process_chat_item(
                         mention_user_id=mention_user_id,
                     )
                 )
-                deps.mark_chat_replied(group_id)
             if social_event_kind:
                 deps.mark_celebration_replied(
                     group_id, celebration_target_key, social_event_kind
