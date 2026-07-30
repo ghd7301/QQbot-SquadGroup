@@ -13,6 +13,7 @@ from http.server import ThreadingHTTPServer
 from typing import Sequence
 
 from . import pending_store
+from . import chat_history as chat_history_service
 from .message_fragments import (
     classify_audience,
     items_compatible,
@@ -976,66 +977,33 @@ def record_group_chat_message(
     content_segments: Sequence[dict[str, str]] = (),
     message_status: str = "active",
 ) -> int:
-    global chat_message_sequence
-    with chat_history_lock:
-        entry = chat_history_state.record(
-            group_id,
-            user_id,
-            text,
-            event_time,
-            context_seconds=settings.chat_context_seconds,
-            context_messages=settings.chat_context_messages,
-            message_id=message_id,
-            reply_message_id=reply_message_id,
-            reply_target_user_id=reply_target_user_id,
-            reply_text=reply_text,
-            mentioned_bot=mentioned_bot,
-            mentioned_user_ids=mentioned_user_ids,
-            display_name=display_name,
-            generated_for_message_ids=generated_for_message_ids,
-            turn_id=turn_id,
-            reply_mode=reply_mode,
-            semantic_topic=semantic_topic,
-            received_time=received_time,
-            content_segments=content_segments,
-            message_status=message_status,
-        )
-        if entry is None:
-            return 0
-        chat_message_sequence = chat_history_state.sequence
-    if chat_memory_manager:
-        speaker_id = stable_member_id(group_id, entry.user_id)
-        chat_memory_manager.enqueue(
-            MemoryMessage(
-                group_id=group_id,
-                message_id=entry.message_id or f"local:{group_id}:{entry.sequence}",
-                speaker_id=speaker_id,
-                display_name=entry.display_name if speaker_id != "bot" else "机器人",
-                speaker_role="bot" if speaker_id == "bot" else "member",
-                text=entry.text,
-                event_time=entry.timestamp,
-                reply_message_id=entry.reply_message_id,
-                reply_speaker_id=stable_member_id(group_id, entry.reply_target_user_id),
-                quoted_text=entry.reply_text,
-                mentions=tuple(
-                    stable_member_id(group_id, value)
-                    for value in entry.mentioned_user_ids
-                ),
-                generated_for_message_ids=entry.generated_for_message_ids,
-                turn_id=entry.turn_id,
-                reply_mode=entry.reply_mode,
-                semantic_topic=entry.semantic_topic,
-                sequence=entry.sequence,
-                received_time=entry.received_time,
-                content_segments=entry.content_segments,
-                message_status=entry.message_status,
-            )
-        )
-    return entry.sequence
+    return chat_history_service.record_group_chat_message(
+        runtime_dependencies,
+        group_id,
+        user_id,
+        text,
+        event_time,
+        message_id=message_id,
+        reply_message_id=reply_message_id,
+        reply_target_user_id=reply_target_user_id,
+        reply_text=reply_text,
+        mentioned_bot=mentioned_bot,
+        mentioned_user_ids=mentioned_user_ids,
+        display_name=display_name,
+        generated_for_message_ids=generated_for_message_ids,
+        turn_id=turn_id,
+        reply_mode=reply_mode,
+        semantic_topic=semantic_topic,
+        received_time=received_time,
+        content_segments=content_segments,
+        message_status=message_status,
+    )
 
 
 def find_group_chat_message(group_id: int, message_id: str) -> GroupChatMessage | None:
-    return chat_history_state.find(group_id, message_id)
+    return chat_history_service.find_group_chat_message(
+        runtime_dependencies, group_id, message_id
+    )
 
 
 def resolve_reply_message_context(
@@ -1044,28 +1012,9 @@ def resolve_reply_message_context(
     *,
     db_path: str | Path | None = None,
 ) -> tuple[str, str]:
-    target = str(message_id or "").strip()
-    if not target:
-        return "", ""
-    replied = find_group_chat_message(group_id, target)
-    if replied:
-        return replied.user_id, replied.text
-    sender_id, text = get_message_info(
-        settings.onebot_api_url,
-        target,
-        settings.onebot_access_token,
-        settings.onebot_message_lookup_timeout_seconds,
+    return chat_history_service.resolve_reply_message_context(
+        runtime_dependencies, group_id, message_id, db_path=db_path
     )
-    if sender_id:
-        return sender_id, text
-    turn = load_conversation_turn_by_bot_message_id(
-        group_id,
-        target,
-        db_path=db_path,
-    )
-    if turn:
-        return settings.bot_qq, turn.last_answer
-    return "", text
 
 
 def stable_member_id(group_id: int, user_id: str) -> str:

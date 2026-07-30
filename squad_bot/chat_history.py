@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from .chat_memory import MemoryMessage
 from .models import GroupChatMessage
 
 
@@ -278,3 +279,119 @@ class ChatHistoryState:
             content_segments=tuple(raw.get("content_segments") or ()),
             message_status=str(raw.get("message_status") or "active"),
         )
+
+
+def record_group_chat_message(
+    deps,
+    group_id: int,
+    user_id,
+    text: str,
+    event_time=None,
+    *,
+    message_id: str = "",
+    reply_message_id: str = "",
+    reply_target_user_id: str = "",
+    reply_text: str = "",
+    mentioned_bot: bool = False,
+    mentioned_user_ids: Sequence[str] = (),
+    display_name: str = "",
+    generated_for_message_ids: Sequence[str] = (),
+    turn_id: str = "",
+    reply_mode: str = "",
+    semantic_topic: str = "",
+    received_time=None,
+    content_segments: Sequence[dict[str, str]] = (),
+    message_status: str = "active",
+) -> int:
+    with deps.chat_history_lock:
+        entry = deps.chat_history_state.record(
+            group_id,
+            user_id,
+            text,
+            event_time,
+            context_seconds=deps.settings.chat_context_seconds,
+            context_messages=deps.settings.chat_context_messages,
+            message_id=message_id,
+            reply_message_id=reply_message_id,
+            reply_target_user_id=reply_target_user_id,
+            reply_text=reply_text,
+            mentioned_bot=mentioned_bot,
+            mentioned_user_ids=mentioned_user_ids,
+            display_name=display_name,
+            generated_for_message_ids=generated_for_message_ids,
+            turn_id=turn_id,
+            reply_mode=reply_mode,
+            semantic_topic=semantic_topic,
+            received_time=received_time,
+            content_segments=content_segments,
+            message_status=message_status,
+        )
+        if entry is None:
+            return 0
+        deps.chat_message_sequence = deps.chat_history_state.sequence
+    if deps.chat_memory_manager:
+        speaker_id = deps.stable_member_id(group_id, entry.user_id)
+        deps.chat_memory_manager.enqueue(
+            MemoryMessage(
+                group_id=group_id,
+                message_id=entry.message_id or f"local:{group_id}:{entry.sequence}",
+                speaker_id=speaker_id,
+                display_name=entry.display_name if speaker_id != "bot" else "机器人",
+                speaker_role="bot" if speaker_id == "bot" else "member",
+                text=entry.text,
+                event_time=entry.timestamp,
+                reply_message_id=entry.reply_message_id,
+                reply_speaker_id=deps.stable_member_id(
+                    group_id, entry.reply_target_user_id
+                ),
+                quoted_text=entry.reply_text,
+                mentions=tuple(
+                    deps.stable_member_id(group_id, value)
+                    for value in entry.mentioned_user_ids
+                ),
+                generated_for_message_ids=entry.generated_for_message_ids,
+                turn_id=entry.turn_id,
+                reply_mode=entry.reply_mode,
+                semantic_topic=entry.semantic_topic,
+                sequence=entry.sequence,
+                received_time=entry.received_time,
+                content_segments=entry.content_segments,
+                message_status=entry.message_status,
+            )
+        )
+    return entry.sequence
+
+
+def find_group_chat_message(deps, group_id: int, message_id: str) -> GroupChatMessage | None:
+    return deps.chat_history_state.find(group_id, message_id)
+
+
+def resolve_reply_message_context(
+    deps,
+    group_id: int,
+    message_id: str,
+    *,
+    db_path: str | Path | None = None,
+) -> tuple[str, str]:
+    target = str(message_id or "").strip()
+    if not target:
+        return "", ""
+    replied = deps.find_group_chat_message(group_id, target)
+    if replied:
+        return replied.user_id, replied.text
+    sender_id, text = deps.get_message_info(
+        deps.settings.onebot_api_url,
+        target,
+        deps.settings.onebot_access_token,
+        deps.settings.onebot_message_lookup_timeout_seconds,
+    )
+    if sender_id:
+        return sender_id, text
+    turn = deps.load_conversation_turn_by_bot_message_id(
+        group_id,
+        target,
+        db_path=db_path,
+    )
+    if turn:
+        return deps.settings.bot_qq, turn.last_answer
+    return "", text
