@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # Quick-skip signals for unsolicited messages that rarely need a bot reply.
-_SHORT_SKIP_MAX_LENGTH = 3
+_SHORT_SKIP_MAX_LENGTH = 4
 _QUESTION_SIGNALS = ("?", "？", "怎么", "如何", "什么", "啥", "为什么", "为啥",
                      "能不能", "可以吗", "是不是", "怎么办", "求助", "请问")
 
@@ -41,7 +41,7 @@ def should_process_message(
     )
     if not explicitly_addressed and not followup_of:
         lowered = normalized.lower()
-        is_short = len(normalized) <= _SHORT_SKIP_MAX_LENGTH
+        is_short = len(normalized) < _SHORT_SKIP_MAX_LENGTH
         has_question = any(cue in lowered for cue in _QUESTION_SIGNALS)
         has_scene = bool(scene_context)
         if is_short and not has_question and not has_scene:
