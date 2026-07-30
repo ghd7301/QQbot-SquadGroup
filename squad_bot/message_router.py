@@ -41,7 +41,7 @@ def should_process_message(
     )
     if not explicitly_addressed and not followup_of:
         lowered = normalized.lower()
-        is_short = len(normalized) < _SHORT_SKIP_MAX_LENGTH
+        is_short = len(normalized) <= _SHORT_SKIP_MAX_LENGTH
         has_question = any(cue in lowered for cue in _QUESTION_SIGNALS)
         has_scene = bool(scene_context)
         if is_short and not has_question and not has_scene:
