@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Sequence
@@ -12,6 +13,8 @@ from .models import (
     MemoryProbeResult,
     ProcessingDecision,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +389,7 @@ def probe_chat_memory(deps, item: dict, query: str) -> MemoryProbeResult:
             rejection_reason="" if context else "no relevant memory candidate",
         )
     except Exception as exc:
-        print("Chat memory probe failed:", type(exc).__name__, repr(exc))
+        logger.error("Chat memory probe failed: %s %s", type(exc).__name__, repr(exc))
         return MemoryProbeResult(
             query=query,
             attempted=True,
@@ -574,7 +577,7 @@ def enrich_decision_with_chat_memory(
         if not formatted:
             decision.memory_rejection_reason = decision.memory_rejection_reason or "no selected memory candidate"
         if getattr(deps.settings, "chat_memory_shadow_mode", False):
-            print("Chat memory shadow", group_id, len(formatted), query[:80])
+            logger.debug("Chat memory shadow %s %s %s", group_id, len(formatted), query[:80])
             deps.write_message_audit(
                 decision="memory_shadow",
                 reason="long-term chat retrieval shadow result",
@@ -653,7 +656,7 @@ def enrich_decision_with_chat_memory(
             decision.self_history_reasons = tuple(reasons)
     except Exception as exc:
         decision.memory_rejection_reason = f"retrieval error: {type(exc).__name__}"
-        print("Chat memory retrieval failed:", type(exc).__name__, repr(exc))
+        logger.error("Chat memory retrieval failed: %s %s", type(exc).__name__, repr(exc))
     apply_context_budget(deps, decision)
     if not getattr(deps.settings, "chat_memory_shadow_mode", False):
         deps.write_message_audit(

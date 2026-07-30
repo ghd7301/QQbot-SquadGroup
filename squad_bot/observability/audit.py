@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Sequence
 
 from ..llm import SemanticTopicCandidate, SubjectCandidate
+
+logger = logging.getLogger(__name__)
 
 
 def _rotate_log_if_needed(
@@ -26,9 +29,9 @@ def _rotate_log_if_needed(
                     src.rename(dst)
         rotated = log_path.with_suffix(f"{log_path.suffix}.1")
         log_path.rename(rotated)
-        print(f"Rotated audit log: {log_path} -> {rotated}")
+        logger.debug("Rotated audit log: %s -> %s", log_path, rotated)
     except Exception as exc:
-        print("Audit log rotation failed:", repr(exc))
+        logger.warning("Audit log rotation failed: %s", repr(exc))
 
 
 def write_message_audit(
@@ -230,7 +233,7 @@ def write_message_audit(
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
-        print("Audit log write failed:", repr(exc))
+        logger.error("Audit log write failed: %s", repr(exc))
 
 
 def recent_audit_entries(deps, limit: int = 5) -> list[dict]:
@@ -291,7 +294,7 @@ def record_knowledge_gap(deps, query: str, result) -> bool:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             return True
         except OSError as exc:
-            print("Knowledge gap log write failed:", repr(exc))
+            logger.error("Knowledge gap log write failed: %s", repr(exc))
             return False
 
 

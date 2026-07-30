@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def process_worker_item(
     deps, item: dict, lane: str, lifecycle: deps.PendingItemLifecycle | None = None
@@ -25,7 +29,7 @@ def process_worker_item(
             pending_id = item.get("_pending_id")
             if pending_id is not None and not mentioned:
                 if deps.is_pending_superseded(int(pending_id)):
-                    print("Skip superseded item", pending_id, group_id, question)
+                    logger.warning("Skip superseded item %s %s %s", pending_id, group_id, question)
                     deps.write_message_audit(
                         decision="skipped",
                         reason="superseded by mentioned=true duplicate",
@@ -40,7 +44,7 @@ def process_worker_item(
             admin_user = deps.is_admin_user(user_id, sender_role)
             command = deps.get_admin_command(question) if admin_user else ""
             if deps.is_restored_admin_command(item):
-                print("Drop restored admin command", group_id, user_id, question)
+                logger.warning("Drop restored admin command %s %s %s", group_id, user_id, question)
                 deps.write_message_audit(
                     decision="ignored",
                     reason="restored admin command discarded",
@@ -67,7 +71,7 @@ def process_worker_item(
             ):
                 age_limit = deps.message_max_age_seconds(mentioned)
                 message_kind = "mentioned" if mentioned else "normal"
-                print("Drop queued event: too old", group_id, message_kind, age_limit)
+                logger.warning("Drop queued event: too old %s %s %s", group_id, message_kind, age_limit)
                 deps.write_message_audit(
                     decision="ignored",
                     reason=f"queued {message_kind} message too old ({age_limit}s)",
@@ -83,7 +87,7 @@ def process_worker_item(
                     command, group_id=group_id, user_id=str(user_id or "")
                 )
                 if deps.settings.dry_run:
-                    print("Dry run admin answer:", group_id, answer)
+                    logger.debug("Dry run admin answer: %s %s", group_id, answer)
                     deps.write_message_audit(
                         decision="answered_dry_run",
                         reason=f"admin command {command}",
@@ -122,7 +126,7 @@ def process_worker_item(
                         reply_mode="admin",
                         semantic_topic=command,
                     )
-                print("Answered admin command", group_id, user_id, command)
+                logger.info("Answered admin command %s %s %s", group_id, user_id, command)
                 deps.write_message_audit(
                     decision="answered",
                     reason=f"admin command {command}",
@@ -205,7 +209,7 @@ def process_worker_item(
                 continue
             # Check superseded again before expensive LLM calls
             if pending_id is not None and not mentioned and deps.is_pending_superseded(int(pending_id)):
-                print("Skip superseded item before routing", pending_id, group_id, question)
+                logger.warning("Skip superseded item before routing %s %s %s", pending_id, group_id, question)
                 deps.write_message_audit(
                     decision="skipped",
                     reason="superseded by mentioned=true duplicate",
@@ -264,7 +268,7 @@ def process_worker_item(
                 memory_probe,
             )
             if not decision.should_reply:
-                print("Skip message: model/router decided no reply", group_id, question)
+                logger.warning("Skip message: model/router decided no reply %s %s", group_id, question)
                 deps.write_message_audit(
                     decision="skipped",
                     reason=decision.reason,
@@ -323,8 +327,8 @@ def process_worker_item(
                 and decision.reply_mode == "knowledge"
                 and deps.check_and_mark_topic_replied(group_id, current_topic_key)
             ):
-                print(
-                    "Skip message: recent topic cooldown",
+                logger.warning(
+                    "Skip message: recent topic cooldown %s %s %s",
                     group_id,
                     current_topic_key,
                     question,
@@ -474,7 +478,7 @@ def process_worker_item(
                 mentioned_user_ids=tuple(item.get("mentioned_user_ids") or ()),
             )
             if deps.settings.dry_run:
-                print("Dry run answer:", group_id, answer)
+                logger.debug("Dry run answer: %s %s", group_id, answer)
                 deps.write_message_audit(
                     decision="answered_dry_run",
                     reason=decision.reason,
@@ -612,7 +616,7 @@ def process_worker_item(
                         reply_to_trigger=mentioned,
                     )
                 )
-            print("Answered group", group_id, "question", question)
+            logger.info("Answered group %s question %s", group_id, question)
             deps.write_message_audit(
                 decision="answered",
                 reason=(
@@ -678,7 +682,7 @@ def process_worker_item(
             )
         except Exception as exc:
             lifecycle.handle_failure(repr(exc), deps.handle_pending_worker_failure)
-            print(f"{lane} worker error:", repr(exc))
+            logger.error("%s worker error: %s", lane, repr(exc))
             deps.write_message_audit(
                 decision="error",
                 reason=repr(exc),

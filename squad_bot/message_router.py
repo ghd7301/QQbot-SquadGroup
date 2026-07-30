@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 # Quick-skip signals for unsolicited messages that rarely need a bot reply.
+
+logger = logging.getLogger(__name__)
 _SHORT_SKIP_MAX_LENGTH = 2
 _QUESTION_SIGNALS = ("?", "？", "怎么", "如何", "什么", "啥", "为什么", "为啥",
                      "能不能", "可以吗", "是不是", "怎么办", "求助", "请问")
@@ -431,7 +435,7 @@ def should_process_message(
             fallback_reason = "weak-context llm fallback" if context else "llm fallback"
             if mentioned:
                 fallback_reason = "mentioned " + fallback_reason
-            print("Fallback reply:", fallback_reason, normalized)
+            logger.info("Fallback reply: %s %s", fallback_reason, normalized)
             return deps.ProcessingDecision(
                 should_reply=True,
                 reason=fallback_reason,
@@ -455,7 +459,7 @@ def should_process_message(
                 semantic_confidence=usable_plan.confidence if usable_plan else 0.0,
             )
         if mentioned:
-            print("Skip mentioned message: fallback disabled", normalized)
+            logger.warning("Skip mentioned message: fallback disabled %s", normalized)
             return deps.ProcessingDecision(
                 should_reply=False,
                 reason="no strong knowledge context and fallback disabled",
@@ -524,7 +528,7 @@ def should_process_message(
         and (not deps.has_auto_reply_keyword(query_text))
         and (not followup_of)
     ):
-        print("Skip message: too short for auto reply", normalized)
+        logger.warning("Skip message: too short for auto reply %s", normalized)
         return deps.ProcessingDecision(
             False,
             "too short for auto reply",
@@ -537,7 +541,7 @@ def should_process_message(
             retrieval_coverage=result.query_coverage,
         )
     if mentioned:
-        print("Mention reply: knowledge context found", normalized)
+        logger.info("Mention reply: knowledge context found %s", normalized)
         return deps.attach_knowledge_result(
             deps.ProcessingDecision(
                 True,
@@ -565,7 +569,7 @@ def should_process_message(
             result,
         )
     if not deps.auto_reply_enabled:
-        print("Skip message: auto reply disabled", normalized)
+        logger.warning("Skip message: auto reply disabled %s", normalized)
         return deps.ProcessingDecision(
             False,
             "auto reply disabled",
@@ -578,7 +582,7 @@ def should_process_message(
             retrieval_coverage=result.query_coverage,
         )
     if deps.looks_like_assignment_to_humans(normalized):
-        print("Skip message: looks like assignment to humans", normalized)
+        logger.warning("Skip message: looks like assignment to humans %s", normalized)
         return deps.ProcessingDecision(
             False,
             "looks like assignment to humans",
@@ -608,7 +612,7 @@ def should_process_message(
         decision.retrieval_coverage = result.query_coverage
         return decision
     if deps.has_auto_reply_keyword(query_text):
-        print("Auto reply: matched Squad keyword", normalized)
+        logger.info("Auto reply: matched Squad keyword %s", normalized)
         return deps.attach_knowledge_result(
             deps.ProcessingDecision(
                 True,

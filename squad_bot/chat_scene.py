@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import threading
 import time
 
@@ -192,9 +196,9 @@ def chat_scene_update_loop(deps, group_id: int) -> None:
                 updated_at=time.time(),
                 sequence=target_sequence,
             )
-            print("Updated chat scene", group_id, target_sequence)
+            logger.info("Updated chat scene %s %s", group_id, target_sequence)
         else:
-            print("Chat scene update failed", group_id, target_sequence)
+            logger.error("Chat scene update failed %s %s", group_id, target_sequence)
 
         if not deps.chat_scene_state.should_continue(
             group_id,

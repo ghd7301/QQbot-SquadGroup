@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Sequence
+
+logger = logging.getLogger(__name__)
 
 
 def message_ids(deps, item: dict) -> list[str]:
@@ -55,7 +58,7 @@ def send_and_record_bot_turn(
             semantic_topic=semantic_topic,
         )
     except Exception as record_exc:
-        print("Post-send recording failed:", repr(record_exc))
+        logger.error("Post-send recording failed: %s", repr(record_exc))
         # Mark as sent_unknown so the pending entry is not retried
         # (message was already delivered, we just failed to record it)
         pending_id = item.get("_pending_id")
@@ -75,7 +78,7 @@ def send_and_record_bot_turn(
     try:
         deps.save_chat_history()
     except Exception as save_exc:
-        print("Chat history save failed:", repr(save_exc))
+        logger.error("Chat history save failed: %s", repr(save_exc))
     return bot_message_id, trigger_message_ids, turn_id
 
 

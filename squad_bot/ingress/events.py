@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def handle_onebot_event(deps, event: dict) -> tuple[int, dict]:
@@ -24,8 +27,8 @@ def handle_onebot_event(deps, event: dict) -> tuple[int, dict]:
                 pass
         return (200, {"ok": True, "recalled": True})
     if event.get("message_type") != "group":
-        print(
-            "Ignored event: not group",
+        logger.warning(
+            "Ignored event: not group %s %s",
             event.get("post_type"),
             event.get("message_type"),
         )
@@ -35,7 +38,7 @@ def handle_onebot_event(deps, event: dict) -> tuple[int, dict]:
         deps.settings.allowed_group_ids
         and str(group_id) not in deps.settings.allowed_group_ids
     ):
-        print("Ignored event: group not allowed", group_id)
+        logger.warning("Ignored event: group not allowed %s", group_id)
         (question, mentioned) = deps.extract_event_question(event)
         if mentioned:
             deps.write_message_audit(
@@ -92,7 +95,7 @@ def handle_onebot_event(deps, event: dict) -> tuple[int, dict]:
             numeric_group_id, user_id, defer_dispatch=True
         )
     except Exception as exc:
-        print("Fragment queue write failed:", repr(exc))
+        logger.error("Fragment queue write failed: %s", repr(exc))
         return (503, {"ok": False, "error": "queue unavailable"})
     if deps.is_event_too_old(event):
         deps.write_message_audit(
@@ -136,14 +139,11 @@ def handle_onebot_event(deps, event: dict) -> tuple[int, dict]:
     (ok, question) = deps.should_respond(
         text, deps.settings.command_prefix, deps.settings.bot_qq, raw_message
     )
-    print(
-        "Group event",
+    logger.info(
+        "Group event %s mentioned %s queued %s question %s",
         group_id,
-        "mentioned",
         mentioned,
-        "queued",
         ok,
-        "question",
         question,
     )
     Path("work/last_onebot_event.json").parent.mkdir(exist_ok=True)
@@ -201,7 +201,7 @@ def handle_onebot_event(deps, event: dict) -> tuple[int, dict]:
     try:
         pending_ids = deps.submit_message_fragment(item, defer_dispatch=True)
     except Exception as exc:
-        print("Pending queue write failed:", repr(exc))
+        logger.error("Pending queue write failed: %s", repr(exc))
         deps.write_message_audit(
             decision="error",
             reason=f"pending queue write failed: {exc!r}",

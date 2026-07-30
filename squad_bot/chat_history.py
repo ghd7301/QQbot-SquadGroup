@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Sequence
 
 from .chat_memory import MemoryMessage
 from .models import GroupChatMessage
+
+logger = logging.getLogger(__name__)
 
 
 class ChatHistoryState:
@@ -514,7 +517,7 @@ def save_chat_history(deps, path: str | Path | None = None) -> None:
     try:
         deps.chat_history_state.save(save_path)
     except Exception as exc:
-        print("Save chat history failed:", repr(exc))
+        logger.error("Save chat history failed: %s", repr(exc))
 
 
 def schedule_chat_history_save(deps) -> None:
@@ -547,7 +550,7 @@ def initialize_chat_memory(deps) -> bool:
         return True
     except Exception as exc:
         deps.chat_memory_manager = None
-        print("Chat memory initialization failed:", type(exc).__name__, repr(exc))
+        logger.error("Chat memory initialization failed: %s %s", type(exc).__name__, repr(exc))
         return False
 
 
@@ -569,10 +572,10 @@ def load_chat_history(deps, path: str | Path | None = None) -> int:
         count = deps.chat_history_state.load(load_path)
         with deps.chat_history_lock:
             deps.chat_message_sequence = deps.chat_history_state.sequence
-        print(f"Loaded {count} chat history entries from {load_path}")
+        logger.info("Loaded %s chat history entries from %s", count, load_path)
         return count
     except Exception as exc:
-        print("Load chat history failed:", repr(exc))
+        logger.error("Load chat history failed: %s", repr(exc))
         return 0
 
 

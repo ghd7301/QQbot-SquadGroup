@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def process_chat_item(
     deps,
@@ -171,7 +175,7 @@ def process_chat_item(
                 model_latency_ms = routing_latency_ms + int(
                     (deps.time.monotonic() - model_started) * 1000
                 )
-                print("Chat generation: NO_REPLY", group_id, question)
+                logger.info("Chat generation: NO_REPLY %s %s", group_id, question)
                 deps.write_message_audit(
                     decision="skipped",
                     reason="chat generation declined",
@@ -302,7 +306,7 @@ def process_chat_item(
                 )
                 continue
             if deps.settings.dry_run:
-                print("Dry run chat answer:", group_id, answer)
+                logger.debug("Dry run chat answer: %s %s", group_id, answer)
                 deps.write_message_audit(
                     decision="answered_dry_run",
                     reason=accepted_reason,
@@ -429,7 +433,7 @@ def process_chat_item(
                 deps.mark_celebration_replied(
                     group_id, celebration_target_key, social_event_kind
                 )
-            print("Answered chat", group_id, question)
+            logger.info("Answered chat %s %s", group_id, question)
             deps.write_message_audit(
                 decision="answered",
                 reason=f"{accepted_reason}; {review_reason}",
@@ -489,7 +493,7 @@ def process_chat_item(
             )
         except Exception as exc:
             lifecycle.handle_failure(repr(exc), deps.handle_pending_worker_failure)
-            print("Chat worker error:", repr(exc))
+            logger.error("Chat worker error: %s", repr(exc))
             deps.write_message_audit(
                 decision="error",
                 reason=repr(exc),

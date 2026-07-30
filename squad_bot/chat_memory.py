@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import queue
 import re
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .embedding import EmbeddingProvider
+
+logger = logging.getLogger(__name__)
 
 
 TOKEN_RE = re.compile(r"[a-z0-9_]+|[\u3400-\u9fff]", re.I)
@@ -587,7 +590,7 @@ class ChatMemoryStore:
             vector = self.embedding.embed([redact_for_model(text)])[0]
             return pack_vector(vector), len(vector), self.embedding.name
         except Exception as exc:
-            print("Chat memory embedding failed:", type(exc).__name__, repr(exc))
+            logger.error("Chat memory embedding failed: %s %s", type(exc).__name__, repr(exc))
             return None, 0, ""
 
     def _create_chunk(self, connection, utterance_id: int, topic_id: int, message: MemoryMessage) -> None:
@@ -1133,7 +1136,7 @@ class ChatMemoryManager:
             self.jobs.put_nowait(("message", message))
             return True
         except queue.Full:
-            print("Chat memory queue full; message not indexed", message.group_id, message.message_id)
+            logger.warning("Chat memory queue full; message not indexed %s %s", message.group_id, message.message_id)
             return False
 
     def enqueue_recall(self, group_id: int, message_id: str) -> bool:
@@ -1167,7 +1170,7 @@ class ChatMemoryManager:
                     self.store.cleanup(self.retention_days)
                     last_cleanup = time.time()
             except Exception as exc:
-                print("Chat memory job failed:", type(exc).__name__, repr(exc))
+                logger.error("Chat memory job failed: %s %s", type(exc).__name__, repr(exc))
             finally:
                 self.jobs.task_done()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 import threading
 from pathlib import Path
@@ -10,6 +11,8 @@ from .models import (
     FollowupMatch,
     ProcessingDecision,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +652,7 @@ def remember_conversation(
     try:
         deps.persist_conversation_turn(group_id, state, db_path=db_path)
     except Exception as exc:
-        print("Persist conversation turn failed:", repr(exc))
+        logger.error("Persist conversation turn failed: %s", repr(exc))
 
 
 def group_chat_has_newer_user_message(deps, group_id: int, sequence: int) -> bool:
@@ -954,11 +957,11 @@ def consider_chat_reply(
     followup_scope: str = "",
 ) -> ProcessingDecision:
     if not deps.auto_reply_enabled:
-        print("Skip message: auto reply disabled", normalized)
+        logger.warning("Skip message: auto reply disabled %s", normalized)
         return ProcessingDecision(False, "auto reply disabled", has_context, tuple(sources))
     if not deps.settings.chat_reply_enabled:
         reason = "not a direct question or help request" if has_context else "no knowledge context"
-        print("Skip message:", reason, normalized)
+        logger.warning("Skip message: %s %s", reason, normalized)
         return ProcessingDecision(False, reason, has_context, tuple(sources))
     if deps.settings.chat_allowed_group_ids and str(group_id) not in deps.settings.chat_allowed_group_ids:
         return ProcessingDecision(False, "chat group not allowed", has_context, tuple(sources))
@@ -1002,7 +1005,7 @@ def consider_chat_reply(
         return ProcessingDecision(False, reason, has_context, tuple(sources))
     quota_reason = deps.chat_reply_quota_reason(group_id)
     if quota_reason:
-        print("Skip chat message:", quota_reason, group_id, normalized)
+        logger.warning("Skip chat message: %s %s %s", quota_reason, group_id, normalized)
         return ProcessingDecision(False, quota_reason, has_context, tuple(sources))
     return ProcessingDecision(
         True,

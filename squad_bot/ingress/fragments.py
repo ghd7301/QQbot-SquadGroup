@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Sequence
 
 from ..models import MessageFragmentBuffer
+
+logger = logging.getLogger(__name__)
 
 
 def classify_fragment_audience(deps, item: dict) -> str:
@@ -79,11 +82,12 @@ def _dispatch_fragment_buffer(deps, buffer: MessageFragmentBuffer) -> int:
     count = deps.semantic_bot_fragment_count(buffer)
     item = deps._fragment_prefix_item(buffer, count)
     if count < len(buffer.fragments):
-        print(
-            "Fragment audience split",
+        logger.info(
+            "Fragment audience split %s %s bot=%s/%s",
             buffer.group_id,
             buffer.user_id,
-            f"bot={count}/{len(buffer.fragments)}",
+            count,
+            len(buffer.fragments),
         )
     priority = 0 if item.get("mentioned") else 1
     return deps.enqueue_persistent_message(priority, item)
@@ -160,4 +164,4 @@ def fragment_aggregation_worker(deps) -> None:
             try:
                 deps._dispatch_fragment_buffer(buffer)
             except Exception as exc:
-                print("Fragment queue write failed:", repr(exc))
+                logger.error("Fragment queue write failed: %s", repr(exc))

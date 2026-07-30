@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 
 def next_sequence(deps) -> int:
@@ -26,7 +29,7 @@ def enqueue_persistent_message(deps, priority: int, item: dict) -> int:
             duplicate_ids = deps.find_queued_duplicates(group_id, ids)
             for dup_id in duplicate_ids:
                 deps.mark_pending_superseded(int(dup_id))
-                print("Superseded pending entry", dup_id, "for group", group_id)
+                logger.info("Superseded pending entry %s for group %s", dup_id, group_id)
     sequence = deps.next_sequence()
     pending_id = deps.persist_pending_message(priority, sequence, item)
     queued_item = dict(item)
@@ -92,14 +95,14 @@ def begin_pending_dispatch(deps, item: dict) -> None:
 def restore_pending_messages(deps) -> int:
     recovered = deps.recover_incomplete_pending_dispatches()
     if recovered:
-        print("Marked interrupted message dispatches as sent_unknown", recovered)
+        logger.info("Marked interrupted message dispatches as sent_unknown %s", recovered)
     cleaned = 0
     try:
         cleaned = deps.cleanup_stale_pending_messages()
     except (AttributeError, TypeError) as exc:
-        print("Stale pending cleanup skipped:", repr(exc))
+        logger.warning("Stale pending cleanup skipped: %s", repr(exc))
     if cleaned:
-        print("Cleaned stale pending entries:", cleaned)
+        logger.info("Cleaned stale pending entries: %s", cleaned)
     pending = deps.load_pending_messages(include_future=True)
     if not pending:
         return 0

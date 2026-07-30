@@ -1,10 +1,13 @@
 import json
+import logging
 import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 IDENTITY_INVARIANT = """不要声称自己是真人，也不要输出“我是 AI”“我是机器人”这类自我说明。被问身份时，只使用既有群内身份自然回答，不讨论底层实现。
@@ -822,7 +825,7 @@ def plan_group_message(
             participation_role=participation_role,
         )
     except Exception as exc:
-        print("Semantic planner failed:", type(exc).__name__, repr(exc))
+        logger.error("Semantic planner failed: %s %s", type(exc).__name__, repr(exc))
         return None
 
 
@@ -882,7 +885,7 @@ def verify_bot_capability(
         confidence = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
         return capability if confidence >= 0.8 else None
     except Exception as exc:
-        print("Bot capability verification failed:", type(exc).__name__, repr(exc))
+        logger.error("Bot capability verification failed: %s %s", type(exc).__name__, repr(exc))
         return None
 
 
@@ -990,7 +993,7 @@ def review_candidate_reply(
             related_message_ids=related_message_ids,
         )
     except Exception as exc:
-        print("Final reply review failed:", type(exc).__name__, repr(exc))
+        logger.error("Final reply review failed: %s %s", type(exc).__name__, repr(exc))
         return None
 
 
@@ -1065,14 +1068,14 @@ def analyze_chat_scene(
             disable_thinking=True,
         )
     except Exception as exc:
-        print("Chat scene model error:", type(exc).__name__, repr(exc))
+        logger.error("Chat scene model error: %s %s", type(exc).__name__, repr(exc))
         return ""
     payload = _extract_json_object(answer)
     if not payload or not isinstance(payload.get("topics"), list):
         legacy = normalize_model_answer(answer, max_chars=500)
         if all(label in legacy for label in ("话题：", "关系：", "进展：", "接话：")):
             return legacy
-        print("Chat scene invalid response:", normalize_model_answer(answer, max_chars=160))
+        logger.error("Chat scene invalid response: %s", normalize_model_answer(answer, max_chars=160))
         return ""
     context_payloads = []
     for line in context:
@@ -1142,7 +1145,7 @@ def analyze_chat_scene(
             }
         )
     if not topics:
-        print("Chat scene invalid response: no valid topics")
+        logger.error("Chat scene invalid response: no valid topics")
         return ""
     active_topic_id = str(payload.get("active_topic_id") or "").strip()
     if active_topic_id not in topic_ids:
