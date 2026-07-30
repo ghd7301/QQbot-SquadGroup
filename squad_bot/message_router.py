@@ -44,21 +44,23 @@ def should_process_message(
     circuit_open = planner_enabled and (not planner_request_allowed)
     plan = None
     if planner_request_allowed:
-        plan = deps.semantic_plan_for_message(
-            normalized,
-            chat_context,
-            scene_context=scene_context,
-            memory_candidates=memory_candidates,
-            mentioned=mentioned,
-            mentions_other=mentions_other,
-            reply_target_user_id=reply_target_user_id,
-            timeout=planner_timeout,
-        )
-        if planner_enabled:
-            deps.record_semantic_planner_availability(
-                plan is not None,
-                lane="addressed" if explicitly_addressed else "unsolicited",
+        try:
+            plan = deps.semantic_plan_for_message(
+                normalized,
+                chat_context,
+                scene_context=scene_context,
+                memory_candidates=memory_candidates,
+                mentioned=mentioned,
+                mentions_other=mentions_other,
+                reply_target_user_id=reply_target_user_id,
+                timeout=planner_timeout,
             )
+        finally:
+            if planner_enabled:
+                deps.record_semantic_planner_availability(
+                    plan is not None,
+                    lane="addressed" if explicitly_addressed else "unsolicited",
+                )
     usable_plan = plan if deps.semantic_plan_is_usable(plan) else None
     if usable_plan is not None and plan_out is not None:
         plan_out.append(usable_plan)
