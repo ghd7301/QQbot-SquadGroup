@@ -22,6 +22,7 @@ from . import admin as admin_service
 from . import message_router, semantic_routing, worker_handlers
 from .ingress import events as ingress_events
 from .observability import audit as audit_observability
+from .queueing import dispatcher as queue_dispatcher
 from .queueing import store as queue_store
 from .transport import http as http_transport
 from .config import settings
@@ -2950,10 +2951,8 @@ def is_model_error_answer(answer: str) -> bool:
 
 
 def next_sequence() -> int:
-    global sequence_number
-    with sequence_lock:
-        sequence_number += 1
-        return sequence_number
+    return queue_dispatcher.next_sequence(runtime_dependencies)
+
 
 
 def _pending_db_path(db_path: str | Path | None = None) -> str | Path:
@@ -3067,67 +3066,27 @@ def pending_status_counts(db_path: str | Path | None = None) -> dict[str, int]:
 
 
 def enqueue_persistent_message(priority: int, item: dict) -> int:
-    sequence = next_sequence()
-    pending_id = persist_pending_message(priority, sequence, item)
-    queued_item = dict(item)
-    queued_item["_pending_id"] = pending_id
-    queued_item["_queue_priority"] = priority
-    queued_item["_queue_sequence"] = sequence
-    target_queue = message_queue if priority == 0 else normal_message_queue
-    target_queue.put((priority, sequence, queued_item))
-    return pending_id
+    return queue_dispatcher.enqueue_persistent_message(
+        runtime_dependencies, priority, item
+    )
+
 
 
 def _queue_pending_item(item: dict, *, delay: float = 0.0) -> None:
-    raw_priority = item.get("_queue_priority")
-    priority = int(
-        raw_priority
-        if raw_priority is not None
-        else (0 if item.get("mentioned") or item.get("explicit_knowledge_command") else 1)
-    )
-    raw_sequence = item.get("_queue_sequence")
-    sequence = int(raw_sequence if raw_sequence is not None else next_sequence())
-    queued_item = dict(item)
-    queued_item["_queue_priority"] = priority
-    queued_item["_queue_sequence"] = sequence
-    target_queue = message_queue if priority == 0 else normal_message_queue
+    return queue_dispatcher._queue_pending_item(runtime_dependencies, item, delay=delay)
 
-    def enqueue() -> None:
-        target_queue.put((priority, sequence, queued_item))
-
-    if delay <= 0:
-        enqueue()
-        return
-    timer = threading.Timer(delay, enqueue)
-    timer.daemon = True
-    timer.start()
 
 
 def handle_pending_worker_failure(item: dict, error: str) -> str:
-    pending_id = item.get("_pending_id")
-    if pending_id is None:
-        return "untracked"
-    if item.get("_dispatch_completed"):
-        return "delivered"
-    if item.get("_dispatch_started"):
-        mark_pending_sent_unknown(int(pending_id), error)
-        return "sent_unknown"
-    result = mark_pending_failure(int(pending_id), error)
-    if result.status == "retry":
-        _queue_pending_item(
-            item,
-            delay=max(0.0, result.next_attempt_at - time.time()),
-        )
-    return result.status
+    return queue_dispatcher.handle_pending_worker_failure(
+        runtime_dependencies, item, error
+    )
+
 
 
 def begin_pending_dispatch(item: dict) -> None:
-    pending_id = item.get("_pending_id")
-    dispatch_id = f"{pending_id or 'untracked'}:{time.time_ns()}"
-    if pending_id is not None:
-        mark_pending_dispatch_started(int(pending_id), dispatch_id)
-    item["_pending_dispatch_id"] = dispatch_id
-    item["_dispatch_started"] = True
+    return queue_dispatcher.begin_pending_dispatch(runtime_dependencies, item)
+
 
 
 def classify_fragment_audience(item: dict) -> str:
@@ -3388,26 +3347,8 @@ def fragment_aggregation_worker() -> None:
 
 
 def restore_pending_messages() -> int:
-    global sequence_number
-    recovered = recover_incomplete_pending_dispatches()
-    if recovered:
-        print("Marked interrupted message dispatches as sent_unknown", recovered)
-    pending = load_pending_messages(include_future=True)
-    if not pending:
-        return 0
-    with sequence_lock:
-        sequence_number = max(sequence_number, max(sequence for _priority, sequence, _item in pending))
-    for priority, sequence, item in pending:
-        item["_queue_priority"] = priority
-        item["_queue_sequence"] = sequence
-        _queue_pending_item(
-            item,
-            delay=max(
-                0.0,
-                float(item.get("_pending_next_attempt_at") or 0) - time.time(),
-            ),
-        )
-    return len(pending)
+    return queue_dispatcher.restore_pending_messages(runtime_dependencies)
+
 
 
 def message_max_age_seconds(mentioned: bool) -> int:

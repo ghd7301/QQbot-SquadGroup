@@ -63,6 +63,7 @@ squad-qqbot-mvp/
       audit.py      消息审计、知识缺口日志和日志轮转
       health.py     服务、队列、规划器和记忆健康快照
     queueing/
+      dispatcher.py 入队、重试、dispatch 标记和启动恢复
       store.py      pending/conversation 数据库配置门面
     transport/
       http.py       HTTP 请求解析、健康接口和 OneBot 入口适配
