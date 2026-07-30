@@ -299,7 +299,7 @@ def review_and_refresh_answer(
                 )
                 if degraded:
                     return degraded, "reply deadline exhausted; deterministic fallback", latest_revision
-                if candidate:
+                if candidate and not deps.is_model_error_answer(candidate):
                     return candidate, "reply deadline exhausted; raw candidate sent", latest_revision
             return "", "reply deadline exhausted before final review", latest_revision
         review = deps.review_candidate_reply(
@@ -348,7 +348,7 @@ def review_and_refresh_answer(
                     latest_revision,
                 )
             if mentioned or decision.reply_mode in {"knowledge", "fallback"}:
-                if candidate:
+                if candidate and not deps.is_model_error_answer(candidate):
                     return candidate, f"{failure_reason}; raw candidate sent", latest_revision
             return "", failure_reason, latest_revision
         deps.merge_review_message_ids(target_item, review, latest_context)
@@ -360,7 +360,7 @@ def review_and_refresh_answer(
                 )
                 if degraded:
                     return degraded, f"review dropped [{review.context_relation}]; deterministic fallback", latest_revision
-                if candidate:
+                if candidate and not deps.is_model_error_answer(candidate):
                     return candidate, f"review dropped [{review.context_relation}]; raw candidate sent", latest_revision
             return (
                 "",
@@ -407,7 +407,7 @@ def review_and_refresh_answer(
                 )
             )
             if refreshed_decision is None:
-                if mentioned or decision.reply_mode in {"knowledge", "fallback"} and candidate:
+                if mentioned or decision.reply_mode in {"knowledge", "fallback"} and candidate and not deps.is_model_error_answer(candidate):
                     return candidate, f"{semantic_replan_reason}; raw candidate sent", latest_revision
                 return "", semantic_replan_reason, latest_revision
             decision = refreshed_decision
@@ -432,7 +432,7 @@ def review_and_refresh_answer(
             reserve=reserve,
         )
         if not generation_timeout:
-            if mentioned or decision.reply_mode in {"knowledge", "fallback"} and candidate:
+            if mentioned or decision.reply_mode in {"knowledge", "fallback"} and candidate and not deps.is_model_error_answer(candidate):
                 return candidate, "reply deadline exhausted before regeneration; raw candidate sent", latest_revision
             return "", "reply deadline exhausted before regeneration", latest_revision
         candidate = deps.answer_for_decision(
