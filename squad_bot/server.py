@@ -1344,102 +1344,35 @@ def allow_hostile_reply(group_id: int, user_id: str, *, now: float | None = None
 
 
 def save_chat_history(path: str | Path | None = None) -> None:
-    """Persist chat history to disk for restart recovery."""
-    save_path = Path(path or "work/chat_history.json")
-    try:
-        chat_history_state.save(save_path)
-    except Exception as exc:
-        print("Save chat history failed:", repr(exc))
+    return chat_history_service.save_chat_history(runtime_dependencies, path)
 
 
 def schedule_chat_history_save() -> None:
-    chat_history_save_event.set()
+    return chat_history_service.schedule_chat_history_save(runtime_dependencies)
 
 
 def chat_history_save_worker() -> None:
-    while True:
-        chat_history_save_event.wait()
-        time.sleep(0.5)
-        chat_history_save_event.clear()
-        save_chat_history()
+    return chat_history_service.chat_history_save_worker(runtime_dependencies)
 
 
 def initialize_chat_memory() -> bool:
-    global chat_memory_manager
-    if not getattr(settings, "chat_memory_enabled", True):
-        return False
-    try:
-        store = ChatMemoryStore(
-            getattr(settings, "chat_memory_db", "work/chat_memory.sqlite3"),
-            build_embedding_provider(settings),
-        )
-        chat_memory_manager = ChatMemoryManager(
-            store,
-            retention_days=max(0, getattr(settings, "chat_memory_retention_days", 90)),
-        )
-        chat_memory_manager.start()
-        return True
-    except Exception as exc:
-        chat_memory_manager = None
-        print("Chat memory initialization failed:", type(exc).__name__, repr(exc))
-        return False
+    return chat_history_service.initialize_chat_memory(runtime_dependencies)
 
 
 def recall_group_chat_message(group_id: int, message_id: str) -> None:
-    target = str(message_id or "").strip()
-    if not target:
-        return
-    chat_history_state.recall(group_id, target)
-    if chat_memory_manager:
-        chat_memory_manager.enqueue_recall(group_id, target)
+    return chat_history_service.recall_group_chat_message(
+        runtime_dependencies, group_id, message_id
+    )
 
 
 def load_chat_history(path: str | Path | None = None) -> int:
-    """Load persisted chat history on startup."""
-    global chat_message_sequence
-    load_path = Path(path or "work/chat_history.json")
-    if not load_path.exists():
-        return 0
-    try:
-        count = chat_history_state.load(load_path)
-        with chat_history_lock:
-            chat_message_sequence = chat_history_state.sequence
-        print(f"Loaded {count} chat history entries from {load_path}")
-        return count
-    except Exception as exc:
-        print("Load chat history failed:", repr(exc))
-        return 0
+    return chat_history_service.load_chat_history(runtime_dependencies, path)
 
 
 def migrate_loaded_chat_history_to_memory() -> int:
-    if not chat_memory_manager:
-        return 0
-    snapshot = chat_history_state.snapshot()
-    queued = 0
-    for group_id, item in snapshot:
-        speaker_id = stable_member_id(group_id, item.user_id)
-        queued += int(chat_memory_manager.enqueue(MemoryMessage(
-            group_id=group_id,
-            message_id=item.message_id or f"local:{group_id}:{item.sequence}",
-            speaker_id=speaker_id,
-            display_name=item.display_name if speaker_id != "bot" else "机器人",
-            speaker_role="bot" if speaker_id == "bot" else "member",
-            text=item.text,
-            event_time=item.timestamp,
-            reply_message_id=item.reply_message_id,
-            reply_speaker_id=stable_member_id(group_id, item.reply_target_user_id),
-            quoted_text=item.reply_text,
-            mentions=tuple(stable_member_id(group_id, value) for value in item.mentioned_user_ids),
-            generated_for_message_ids=item.generated_for_message_ids,
-            turn_id=item.turn_id,
-            reply_mode=item.reply_mode,
-            semantic_topic=item.semantic_topic,
-            sequence=item.sequence,
-            received_time=item.received_time,
-            content_segments=item.content_segments,
-            message_status=item.message_status,
-        )))
-    return queued
+    return chat_history_service.migrate_loaded_chat_history_to_memory(
+        runtime_dependencies
+    )
 
 
 def chat_reply_quota_reason(

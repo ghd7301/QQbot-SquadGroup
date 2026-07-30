@@ -506,3 +506,115 @@ def recent_group_chat_context(
         )
         for item in selected
     )
+
+
+def save_chat_history(deps, path: str | Path | None = None) -> None:
+    """Persist chat history to disk for restart recovery."""
+    save_path = Path(path or "work/chat_history.json")
+    try:
+        deps.chat_history_state.save(save_path)
+    except Exception as exc:
+        print("Save chat history failed:", repr(exc))
+
+
+def schedule_chat_history_save(deps) -> None:
+    deps.chat_history_save_event.set()
+
+
+def chat_history_save_worker(deps) -> None:
+    while True:
+        deps.chat_history_save_event.wait()
+        time.sleep(0.5)
+        deps.chat_history_save_event.clear()
+        deps.save_chat_history()
+
+
+def initialize_chat_memory(deps) -> bool:
+    if not getattr(deps.settings, "chat_memory_enabled", True):
+        return False
+    try:
+        store = deps.ChatMemoryStore(
+            getattr(deps.settings, "chat_memory_db", "work/chat_memory.sqlite3"),
+            deps.build_embedding_provider(deps.settings),
+        )
+        deps.chat_memory_manager = deps.ChatMemoryManager(
+            store,
+            retention_days=max(
+                0, getattr(deps.settings, "chat_memory_retention_days", 90)
+            ),
+        )
+        deps.chat_memory_manager.start()
+        return True
+    except Exception as exc:
+        deps.chat_memory_manager = None
+        print("Chat memory initialization failed:", type(exc).__name__, repr(exc))
+        return False
+
+
+def recall_group_chat_message(deps, group_id: int, message_id: str) -> None:
+    target = str(message_id or "").strip()
+    if not target:
+        return
+    deps.chat_history_state.recall(group_id, target)
+    if deps.chat_memory_manager:
+        deps.chat_memory_manager.enqueue_recall(group_id, target)
+
+
+def load_chat_history(deps, path: str | Path | None = None) -> int:
+    """Load persisted chat history on startup."""
+    load_path = Path(path or "work/chat_history.json")
+    if not load_path.exists():
+        return 0
+    try:
+        count = deps.chat_history_state.load(load_path)
+        with deps.chat_history_lock:
+            deps.chat_message_sequence = deps.chat_history_state.sequence
+        print(f"Loaded {count} chat history entries from {load_path}")
+        return count
+    except Exception as exc:
+        print("Load chat history failed:", repr(exc))
+        return 0
+
+
+def migrate_loaded_chat_history_to_memory(deps) -> int:
+    if not deps.chat_memory_manager:
+        return 0
+    snapshot = deps.chat_history_state.snapshot()
+    queued = 0
+    for group_id, item in snapshot:
+        speaker_id = deps.stable_member_id(group_id, item.user_id)
+        queued += int(
+            deps.chat_memory_manager.enqueue(
+                MemoryMessage(
+                    group_id=group_id,
+                    message_id=(
+                        item.message_id or f"local:{group_id}:{item.sequence}"
+                    ),
+                    speaker_id=speaker_id,
+                    display_name=(
+                        item.display_name if speaker_id != "bot" else "机器人"
+                    ),
+                    speaker_role="bot" if speaker_id == "bot" else "member",
+                    text=item.text,
+                    event_time=item.timestamp,
+                    reply_message_id=item.reply_message_id,
+                    reply_speaker_id=deps.stable_member_id(
+                        group_id, item.reply_target_user_id
+                    ),
+                    quoted_text=item.reply_text,
+                    mentions=tuple(
+                        deps.stable_member_id(group_id, value)
+                        for value in item.mentioned_user_ids
+                    ),
+                    generated_for_message_ids=item.generated_for_message_ids,
+                    turn_id=item.turn_id,
+                    reply_mode=item.reply_mode,
+                    semantic_topic=item.semantic_topic,
+                    sequence=item.sequence,
+                    received_time=item.received_time,
+                    content_segments=item.content_segments,
+                    message_status=item.message_status,
+                )
+            )
+        )
+    return queued

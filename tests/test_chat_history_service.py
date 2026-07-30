@@ -105,6 +105,28 @@ class ChatHistoryServiceTests(unittest.TestCase):
         self.assertTrue(payload["speaker"]["id"].startswith("member_"))
         self.assertNotEqual(payload["speaker"]["id"], "200")
 
+    def test_recall_updates_short_and_long_term_memory(self) -> None:
+        state = chat_history.ChatHistoryState()
+        state.record(
+            100,
+            "200",
+            "待撤回消息",
+            10,
+            context_seconds=300,
+            context_messages=20,
+            message_id="m1",
+        )
+        manager = SimpleNamespace(enqueue_recall=Mock())
+        deps = SimpleNamespace(
+            chat_history_state=state,
+            chat_memory_manager=manager,
+        )
+
+        chat_history.recall_group_chat_message(deps, 100, "m1")
+
+        self.assertIsNone(state.find(100, "m1"))
+        manager.enqueue_recall.assert_called_once_with(100, "m1")
+
 
 if __name__ == "__main__":
     unittest.main()
