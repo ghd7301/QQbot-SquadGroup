@@ -62,6 +62,8 @@ squad-qqbot-mvp/
     observability/
       audit.py      消息审计、知识缺口日志和日志轮转
       health.py     服务、队列、规划器和记忆健康快照
+    queueing/
+      store.py      pending/conversation 数据库配置门面
     transport/
       http.py       HTTP 请求解析、健康接口和 OneBot 入口适配
     config.py       配置

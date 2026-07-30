@@ -22,6 +22,7 @@ from . import admin as admin_service
 from . import message_router, semantic_routing, worker_handlers
 from .ingress import events as ingress_events
 from .observability import audit as audit_observability
+from .queueing import store as queue_store
 from .transport import http as http_transport
 from .config import settings
 from .chat_memory import ChatMemoryManager, ChatMemoryStore, MemoryHit, MemoryMessage, redact_for_model
@@ -2956,66 +2957,54 @@ def next_sequence() -> int:
 
 
 def _pending_db_path(db_path: str | Path | None = None) -> str | Path:
-    return db_path or settings.pending_queue_db
+    return queue_store._pending_db_path(runtime_dependencies, db_path)
+
 
 
 def open_pending_queue_db(db_path: str | Path | None = None) -> sqlite3.Connection:
-    return pending_store.open_pending_queue_db(_pending_db_path(db_path))
+    return queue_store.open_pending_queue_db(runtime_dependencies, db_path)
+
 
 
 def persist_conversation_turn(
-    group_id: int,
-    state: ConversationState,
-    *,
-    db_path: str | Path | None = None,
+    group_id: int, state: ConversationState, *, db_path: str | Path | None = None
 ) -> int:
-    return pending_store.persist_conversation_turn(
-        group_id,
-        state,
-        db_path=_pending_db_path(db_path),
+    return queue_store.persist_conversation_turn(
+        runtime_dependencies, group_id, state, db_path=db_path
     )
+
 
 
 def _conversation_state_from_row(row) -> ConversationState:
-    return pending_store.conversation_state_from_row(row)
+    return queue_store._conversation_state_from_row(runtime_dependencies, row)
+
 
 
 def load_conversation_turn_by_bot_message_id(
-    group_id: int,
-    bot_message_id: str,
-    *,
-    db_path: str | Path | None = None,
+    group_id: int, bot_message_id: str, *, db_path: str | Path | None = None
 ) -> ConversationState | None:
-    return pending_store.load_conversation_turn_by_bot_message_id(
-        group_id,
-        bot_message_id,
-        db_path=_pending_db_path(db_path),
+    return queue_store.load_conversation_turn_by_bot_message_id(
+        runtime_dependencies, group_id, bot_message_id, db_path=db_path
     )
+
 
 
 def persist_pending_message(
-    priority: int,
-    sequence: int,
-    item: dict,
-    db_path: str | Path | None = None,
+    priority: int, sequence: int, item: dict, db_path: str | Path | None = None
 ) -> int:
-    return pending_store.persist_pending_message(
-        priority,
-        sequence,
-        item,
-        db_path=_pending_db_path(db_path),
+    return queue_store.persist_pending_message(
+        runtime_dependencies, priority, sequence, item, db_path
     )
+
 
 
 def load_pending_messages(
-    db_path: str | Path | None = None,
-    *,
-    include_future: bool = False,
+    db_path: str | Path | None = None, *, include_future: bool = False
 ) -> list[tuple[int, int, dict]]:
-    return pending_store.load_pending_messages(
-        db_path=_pending_db_path(db_path),
-        include_future=include_future,
+    return queue_store.load_pending_messages(
+        runtime_dependencies, db_path, include_future=include_future
     )
+
 
 
 def mark_pending_failure(
@@ -3024,72 +3013,57 @@ def mark_pending_failure(
     *,
     db_path: str | Path | None = None,
     now: float | None = None,
-    max_attempts: int | None = None,
+    max_attempts: int | None = None
 ) -> PendingFailureResult:
-    retry_limit = (
-        max_attempts
-        if max_attempts is not None
-        else getattr(settings, "pending_retry_max_attempts", 3)
-    )
-    return pending_store.mark_pending_failure(
+    return queue_store.mark_pending_failure(
+        runtime_dependencies,
         pending_id,
         error,
-        db_path=_pending_db_path(db_path),
+        db_path=db_path,
         now=now,
-        max_attempts=retry_limit,
+        max_attempts=max_attempts,
     )
+
 
 
 def mark_pending_sent_unknown(
-    pending_id: int,
-    error: str,
-    *,
-    db_path: str | Path | None = None,
+    pending_id: int, error: str, *, db_path: str | Path | None = None
 ) -> None:
-    pending_store.mark_pending_sent_unknown(
-        pending_id,
-        error,
-        db_path=_pending_db_path(db_path),
+    return queue_store.mark_pending_sent_unknown(
+        runtime_dependencies, pending_id, error, db_path=db_path
     )
+
 
 
 def mark_pending_dispatch_started(
-    pending_id: int,
-    dispatch_id: str,
-    *,
-    db_path: str | Path | None = None,
+    pending_id: int, dispatch_id: str, *, db_path: str | Path | None = None
 ) -> None:
-    pending_store.mark_pending_dispatch_started(
-        pending_id,
-        dispatch_id,
-        db_path=_pending_db_path(db_path),
+    return queue_store.mark_pending_dispatch_started(
+        runtime_dependencies, pending_id, dispatch_id, db_path=db_path
     )
 
 
-def recover_incomplete_pending_dispatches(
-    db_path: str | Path | None = None,
-) -> int:
-    return pending_store.recover_incomplete_pending_dispatches(
-        db_path=_pending_db_path(db_path)
+
+def recover_incomplete_pending_dispatches(db_path: str | Path | None = None) -> int:
+    return queue_store.recover_incomplete_pending_dispatches(
+        runtime_dependencies, db_path
     )
 
 
-def delete_pending_message(
-    pending_id: int,
-    db_path: str | Path | None = None,
-) -> None:
-    pending_store.delete_pending_message(
-        pending_id,
-        db_path=_pending_db_path(db_path),
-    )
+
+def delete_pending_message(pending_id: int, db_path: str | Path | None = None) -> None:
+    return queue_store.delete_pending_message(runtime_dependencies, pending_id, db_path)
+
 
 
 def pending_message_count(db_path: str | Path | None = None) -> int:
-    return pending_store.pending_message_count(db_path=_pending_db_path(db_path))
+    return queue_store.pending_message_count(runtime_dependencies, db_path)
+
 
 
 def pending_status_counts(db_path: str | Path | None = None) -> dict[str, int]:
-    return pending_store.pending_status_counts(db_path=_pending_db_path(db_path))
+    return queue_store.pending_status_counts(runtime_dependencies, db_path)
+
 
 
 def enqueue_persistent_message(priority: int, item: dict) -> int:
