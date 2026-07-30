@@ -59,6 +59,7 @@ squad-qqbot-mvp/
     admin.py        管理命令识别、权限判断和运行态维护操作
     ingress/
       events.py     OneBot 撤回、群过滤、上下文记录和入队编排
+      fragments.py  分段消息分类、聚合、语义切分和派发
     observability/
       audit.py      消息审计、知识缺口日志和日志轮转
       health.py     服务、队列、规划器和记忆健康快照
