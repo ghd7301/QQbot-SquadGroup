@@ -39,7 +39,7 @@ class KnowledgeTermTests(unittest.TestCase):
                 )
 
     def test_answer_prompt_requires_plain_language_term(self) -> None:
-        self.assertIn("统一说“队包”", SYSTEM_PROMPT)
+        self.assertIn('统一说"队包"', SYSTEM_PROMPT)
         self.assertIn("不要直接输出英文 Rally", SYSTEM_PROMPT)
 
     def test_retrieval_metrics_separate_strong_and_weak_matches(self) -> None:

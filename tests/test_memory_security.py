@@ -823,8 +823,8 @@ class MemorySecurityTests(unittest.TestCase):
     def test_group_recruitment_prompts_redirect_to_ts_without_fake_participation(self):
         self.assertIn("向全群公开找人组队", llm.MESSAGE_PLAN_PROMPT)
         self.assertIn("TS 里对应游戏的语音频道", llm.MESSAGE_PLAN_PROMPT)
-        self.assertIn("不得回答“有”“我来”“算我一个”", llm.MESSAGE_PLAN_PROMPT)
-        self.assertIn("代替真实群友确认“有人”", llm.FINAL_REPLY_REVIEW_PROMPT)
+        self.assertIn('不得回答"有""我来""算我一个"', llm.MESSAGE_PLAN_PROMPT)
+        self.assertIn('代替真实群友确认"有人"', llm.FINAL_REPLY_REVIEW_PROMPT)
         self.assertIn("这类候选绝不能 send", llm.FINAL_REPLY_REVIEW_PROMPT)
         self.assertIn("有啊，你打哪个版本", llm.FINAL_REPLY_REVIEW_PROMPT)
         self.assertIn("TS 里对应游戏的语音频道", llm.CHAT_PROMPT)

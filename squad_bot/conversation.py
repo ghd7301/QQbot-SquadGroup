@@ -992,17 +992,6 @@ def consider_chat_reply(
     lowered = normalized.lower()
     if any(cue in lowered for cue in CHAT_BLOCK_CUES):
         return ProcessingDecision(False, "chat filtered announcement, link, or meta", has_context, tuple(sources))
-    if (
-        deps.looks_like_direct_question(normalized)
-        and deps.has_auto_reply_keyword(normalized)
-        and not social_celebration
-    ):
-        reason = (
-            "weak knowledge context for factual question"
-            if has_context
-            else "no knowledge context for factual question"
-        )
-        return ProcessingDecision(False, reason, has_context, tuple(sources))
     quota_reason = deps.chat_reply_quota_reason(group_id)
     if quota_reason:
         logger.warning("Skip chat message: %s %s %s", quota_reason, group_id, normalized)

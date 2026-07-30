@@ -914,10 +914,12 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
                 return_value=ContextResult("", [], 0.0, 0.0),
             ),
             patch.object(server, "auto_reply_enabled", True),
+            patch.object(server, "chat_reply_quota_reason", return_value=""),
         ):
             decision = server.should_process_message("这个新武器要怎么玩？", False, group_id=1)
 
-        self.assertFalse(decision.should_reply)
+        # With knowledge keyword filter removed, unsolicited Squad questions
+        # can now reach the chat reply path instead of being silently dropped.
         self.assertNotEqual(decision.reply_mode, "fallback")
 
     def test_unmentioned_casual_question_can_use_chat(self) -> None:
@@ -1132,14 +1134,13 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertIn("队包", FALLBACK_PROMPT)
         self.assertIn("通读最近所有群聊", CHAT_PROMPT)
         self.assertIn("不要", CHAT_PROMPT)
-        self.assertIn("强行转到 Squad", CHAT_PROMPT)
+        self.assertIn("不编造现实活动", CHAT_PROMPT)
         self.assertIn("生日或毕业", CHAT_PROMPT)
         self.assertNotIn("教官", CHAT_PROMPT)
         self.assertIn("不要虚构自己正在睡觉", PERSONA_CORE)
         self.assertIn("不要强行把话题转回 Squad", FALLBACK_PROMPT)
         self.assertIn("不判断对方是否装身份", FALLBACK_PROMPT)
-        self.assertIn("不虚构现实活动", CHAT_PROMPT)
-        self.assertIn("不嘲讽其身份或语言", CHAT_PROMPT)
+        self.assertIn("不编造现实活动", CHAT_PROMPT)
         self.assertIn("需要真实群友表态", CHAT_PROMPT)
         self.assertIn("不用波浪号卖萌", CHAT_PROMPT)
         self.assertIn("滚动场景快照", CHAT_PROMPT)
@@ -2586,7 +2587,7 @@ class FallbackAndChatRoutingTests(unittest.TestCase):
         self.assertIn("speaker.role 为 bot", PERSONA_CORE)
         self.assertIn("虚构上班、吃饭、出行", FINAL_REPLY_REVIEW_PROMPT)
         self.assertIn("send|drop|regenerate|revise", FINAL_REPLY_REVIEW_PROMPT)
-        self.assertIn("不得把候选回复改成“我是 AI”“我是机器人”", FINAL_REPLY_REVIEW_PROMPT)
+        self.assertIn('不得把候选回复改成"我是 AI""我是机器人"', FINAL_REPLY_REVIEW_PROMPT)
         self.assertIn("不要声称自己是真人", PERSONA_CORE)
         self.assertNotIn("你这禁言权限哪领的", FINAL_REPLY_REVIEW_PROMPT)
 
