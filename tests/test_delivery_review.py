@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from squad_bot.delivery import review
-from squad_bot.models import GroupChatMessage
+from squad_bot.models import GroupChatMessage, ProcessingDecision
 
 
 class DeliveryReviewTests(unittest.TestCase):
@@ -53,7 +53,49 @@ class DeliveryReviewTests(unittest.TestCase):
                 0,
             )
 
+    def test_adaptive_review_skips_model_when_context_is_unchanged(self) -> None:
+        deps = SimpleNamespace(
+            latest_group_user_sequence=lambda _group_id: 7,
+            settings=SimpleNamespace(final_reply_review_mode="adaptive"),
+            unsafe_or_repeated_reply=lambda _group_id, _answer: "",
+        )
+        decision = ProcessingDecision(False, "test")
+
+        answer, reason, revision = review.review_and_refresh_answer(
+            deps,
+            question="问题",
+            answer="回答",
+            decision=decision,
+            group_id=100,
+            mentioned=False,
+            admin=False,
+            deadline=200,
+            baseline_revision=7,
+        )
+
+        self.assertEqual(answer, "回答")
+        self.assertEqual(reason, "adaptive final review skipped")
+        self.assertEqual(revision, 7)
+
+    def test_late_context_refresh_returns_without_duplicate_review(self) -> None:
+        deps = SimpleNamespace(latest_group_user_sequence=lambda _group_id: 9)
+
+        answer, reason, revision = review.refresh_answer_for_late_context(
+            deps,
+            question="问题",
+            answer="回答",
+            decision=ProcessingDecision(False, "test"),
+            group_id=100,
+            mentioned=True,
+            admin=False,
+            deadline=200,
+            reviewed_revision=9,
+        )
+
+        self.assertEqual(answer, "回答")
+        self.assertEqual(reason, "context unchanged after final review")
+        self.assertEqual(revision, 9)
+
 
 if __name__ == "__main__":
     unittest.main()
-
