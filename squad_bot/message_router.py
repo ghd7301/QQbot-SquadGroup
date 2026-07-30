@@ -389,6 +389,41 @@ def should_process_message(
     ):
         deps.record_knowledge_gap(query_text, result)
     if not context or not strong_match:
+        # High-confidence knowledge intent override: when the planner is very
+        # confident this is a knowledge question and we have SOME context
+        # (just below strong_match threshold), go directly to the knowledge
+        # path instead of the slower fallback LLM. This avoids the fallback
+        # path's extra overhead and prevents deterministic_review_failure
+        # from returning a generic refusal.
+        if (
+            context
+            and usable_plan is not None
+            and usable_plan.intent == "knowledge"
+            and usable_plan.confidence >= 0.9
+            and usable_plan.capability == "none"
+            and (explicitly_addressed or getattr(deps, "auto_reply_enabled", False))
+        ):
+            return deps.attach_knowledge_result(
+                deps.ProcessingDecision(
+                    True,
+                    "high-confidence knowledge override (weak match)",
+                    True,
+                    tuple(sources),
+                    query_text,
+                    followup_of,
+                    followup_scope,
+                    "knowledge",
+                    tuple(chat_context),
+                    result.top_score,
+                    result.query_coverage,
+                    semantic_intent=usable_plan.intent,
+                    semantic_topic=usable_plan.topic_summary,
+                    implicit_meaning=usable_plan.implicit_meaning,
+                    semantic_confidence=usable_plan.confidence,
+                ),
+                query_text,
+                result,
+            )
         fallback_allowed = deps.settings.llm_fallback_enabled and (
             explicitly_addressed or not deps.settings.fallback_only_when_mentioned
         )
