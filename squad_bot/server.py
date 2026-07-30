@@ -10,6 +10,7 @@ from pathlib import Path
 from http.server import ThreadingHTTPServer
 from typing import Sequence
 
+from . import app as app_service
 from . import pending_store
 from . import chat_history as chat_history_service
 from . import chat_scene as chat_scene_service
@@ -2220,46 +2221,7 @@ Handler = http_transport.create_handler(runtime_dependencies)
 
 
 def main() -> None:
-    memory_started = initialize_chat_memory()
-    restored = restore_pending_messages()
-    if restored:
-        print(f"Restored pending messages: {restored}")
-    loaded = load_chat_history()
-    if loaded:
-        print(f"Loaded chat history: {loaded} entries")
-        migrated = migrate_loaded_chat_history_to_memory()
-        if migrated:
-            print(f"Queued chat history migration: {migrated} entries")
-    threading.Thread(
-        target=worker,
-        args=(message_queue, "priority"),
-        daemon=True,
-    ).start()
-    threading.Thread(
-        target=chat_history_save_worker,
-        daemon=True,
-        name="chat-history-saver",
-    ).start()
-    threading.Thread(
-        target=fragment_aggregation_worker,
-        daemon=True,
-        name="message-fragment-aggregator",
-    ).start()
-    threading.Thread(
-        target=worker,
-        args=(normal_message_queue, "normal"),
-        daemon=True,
-    ).start()
-    threading.Thread(target=chat_worker, daemon=True).start()
-    server = ThreadingHTTPServer((settings.host, settings.port), Handler)
-    print(f"Squad QQBot MVP listening on http://{settings.host}:{settings.port}")
-    print(f"Knowledge chunks: {len(kb.chunks)}")
-    print(f"Chat memory: {'enabled' if memory_started else 'disabled'}")
-    print(
-        f"Allowed groups: {','.join(settings.allowed_group_ids) or 'all'}, "
-        f"max replies/min: {settings.max_replies_per_minute}"
-    )
-    server.serve_forever()
+    app_service.main(runtime_dependencies)
 
 
 if __name__ == "__main__":
