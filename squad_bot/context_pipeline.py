@@ -435,6 +435,9 @@ def budget_memory_context(
     used = 0
     for line in context:
         if not selected and len(line) > max_chars:
+            # First item exceeds budget: skip it entirely. This prevents a
+            # single oversized memory hit from consuming the entire budget
+            # and blocking all smaller, potentially more relevant hits.
             continue
         if selected and used + len(line) > max(200, max_chars):
             continue
