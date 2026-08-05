@@ -30,11 +30,25 @@
 
 ## 运行
 
+> **Python 版本要求**：代码使用了 `X | None` 注解语法，需 **Python 3.10+**。
+> 本机系统 `python3` 是 3.9.6，直接跑会 import 失败。请用下面的 managed 3.13 解释器（已装好 aiohttp / python-dotenv，可直接 `import qqbot`）。
+
 ```bash
-cp .env.example .env          # 填写 LLM_API_KEY / BOT_QQ / WHITELISTED_GROUPS
-DRY_RUN=1 python run.py       # 仅审计不发送，先验证链路
-python run.py                 # 正式运行（需 NapCat 反向 WS 连到 ONE_BOT_WS_PORT）
+# 1) 准备配置
+cp .env.example .env
+#    必填：LLM_API_KEY / LLM_BASE_URL / LLM_MODEL / BOT_QQ / WHITELISTED_GROUPS
+#    可选：EMBEDDING_* 三项留空即用免费哈希兜底（无需 key）
+#    先开 DRY_RUN=1 只跑审计不发送
+
+# 2) 先用 dry-run 验证整条链路（不连 QQ、不发送）
+DRY_RUN=1 /Users/yuce/.workbuddy/binaries/python/envs/default/bin/python run.py
+
+# 3) 正式运行（需先让 NapCat 反向 WS 连到下面这个端点）
+/Users/yuce/.workbuddy/binaries/python/envs/default/bin/python run.py
 ```
+
+接入点：OneBot v11 反向 WebSocket，路由为 `/onebot/`，即 NapCat 应连 `ws://<host>:8081/onebot/`
+（`ONE_BOT_WS_HOST` / `ONE_BOT_WS_PORT` 在 `.env` 中配置，默认 `0.0.0.0:8081`）。
 
 ## 测试
 
