@@ -1,14 +1,17 @@
 """Embedding providers (design doc §8.3).
 
-Two strategies, matching the agreed design:
+Three strategies, in priority order:
+  - ApiEmbedding: OpenAI-compatible /embeddings endpoint, enabled when both
+    EMBEDDING_BASE_URL and EMBEDDING_MODEL are configured.
+  - LocalEmbedding: local ONNX model via fastembed (Chinese-optimized), enabled
+    when EMBEDDING_MODEL is set without a base URL. No API cost, runs offline.
   - HashedNgramEmbedding: dependency-free, zero-cost n-gram hash vector used for
-    lexical recall. Always available.
-  - ApiEmbedding: OpenAI-compatible /embeddings endpoint, enabled only when
-    EMBEDDING_MODEL is configured.
+    lexical recall. Always available; also the fallback if local/API init fails.
 """
 from __future__ import annotations
 
 import hashlib
+import os
 import logging
 import math
 import re
@@ -104,9 +107,43 @@ class ApiEmbedding(EmbeddingProvider):
             return [item["embedding"] for item in data["data"]]
 
 
+class LocalEmbedding(EmbeddingProvider):
+    """Local sentence embedding via fastembed (ONNX, no torch).
+
+    Downloads the model on first use. Defaults HF_ENDPOINT to the China mirror
+    when unset, because huggingface.co is often unreachable from CN networks.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        if not os.environ.get("HF_ENDPOINT"):
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        try:
+            from fastembed import TextEmbedding
+        except Exception as exc:  # pragma: no cover - import guard
+            raise RuntimeError(f"fastembed is required for local embedding: {exc}") from exc
+        self._model = TextEmbedding(model_name)
+        self._model_name = model_name
+        self.dim = 0
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for vec in self._model.embed(texts, batch_size=32, parallel=0):
+            out.append(vec.tolist() if hasattr(vec, "tolist") else list(vec))
+        if self.dim == 0 and out:
+            self.dim = len(out[0])
+        return out
+
+
 def build_embedding(config: Config, session: aiohttp.ClientSession | None = None) -> EmbeddingProvider:
-    if config.embedding_model:
-        logger.info("Using API embedding model: %s", config.embedding_model)
+    if config.embedding_base_url and config.embedding_model:
+        logger.info("Using API embedding model: %s @ %s", config.embedding_model, config.embedding_base_url)
         return ApiEmbedding(config, session)
+    if config.embedding_model:
+        logger.info("Using local embedding model: %s (fastembed)", config.embedding_model)
+        try:
+            return LocalEmbedding(config.embedding_model)
+        except Exception as exc:  # pragma: no cover - resilient fallback
+            logger.warning("Local embedding init failed (%s); falling back to hashed n-gram", exc)
+            return HashedNgramEmbedding()
     logger.info("Using hashed n-gram embedding (lexical fallback, no API cost)")
     return HashedNgramEmbedding()

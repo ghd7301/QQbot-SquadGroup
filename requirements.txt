@@ -1,3 +1,4 @@
 # Squad QQBot (simplified, greenfield) — runtime dependencies
 aiohttp>=3.9
 python-dotenv>=1.0
+fastembed>=0.3
