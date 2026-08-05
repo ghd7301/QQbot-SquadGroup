@@ -1,1 +1,0 @@
-"""Squad QQBot MVP package."""
