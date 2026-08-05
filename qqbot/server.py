@@ -32,6 +32,15 @@ logger = logging.getLogger("qqbot.server")
 
 HISTORY_LIMIT = 60
 
+_QUESTION_CHARS = set("?？吗怎么如何为何啥多少几哪些哪咋为啥是否")
+_KNOWLEDGE_HINTS = ("兵种", "载具", "服务器", "玩法", "枪", "地图", "小队", "伤害", "配件", "技能", "配置", "怎么")
+
+
+def _looks_like_knowledge(q: str) -> bool:
+    if any(c in q for c in _QUESTION_CHARS):
+        return True
+    return any(k in q for k in _KNOWLEDGE_HINTS)
+
 
 class Bot:
     def __init__(
@@ -87,6 +96,17 @@ class Bot:
         deadline = start + self.config.end_to_end_sec
 
         cls = await classify(env, self.llm, self.config)
+
+        # 被 @ / 被回复是明确的直接召唤，绝不允许被分类器判成 skip 而静默丢弃。
+        # 模型倾向于对"你好"这类打招呼过度判 skip，这里兜底。
+        if env.mentioned and cls.task == "skip":
+            if _looks_like_knowledge(env.question):
+                cls.task = "knowledge"
+                cls.knowledge_query = env.question
+            else:
+                cls.task = "chat"
+            cls.confidence = max(cls.confidence, 0.8)
+
         if cls.task == "skip":
             self.auditor.log({**env.to_audit(), "action": "skip_classify", "confidence": cls.confidence})
             return
@@ -110,13 +130,23 @@ class Bot:
                 gen = await generate_knowledge(env, chunks, self.llm, self.config)
             reply_type = "knowledge"
 
-        if not gen.get("should_reply") or not gen.get("reply"):
+        should_reply = bool(gen.get("should_reply"))
+        reply_text = (gen.get("reply") or "").strip()
+
+        # 被 @ 是明确的直接召唤，不应被生成阶段的 should_reply 否决权干掉。
+        # 模型倾向于对"你好"这类打招呼判不回，这里强制兜底。
+        if env.mentioned and not should_reply:
+            should_reply = True
+        if env.mentioned and not reply_text:
+            reply_text = "在的，说吧。"
+
+        if not should_reply or not reply_text:
             self.auditor.log({**env.to_audit(), "action": "no_reply", "task": cls.task})
             return
 
         ok, reason, reply = check(
             env,
-            gen["reply"],
+            reply_text,
             reply_type=reply_type,
             chunks=chunks,
             config=self.config,

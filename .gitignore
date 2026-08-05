@@ -6,6 +6,7 @@
 # 运行时文件
 work/
 *.sqlite3
+*.db
 *.jsonl
 
 # Python 缓存

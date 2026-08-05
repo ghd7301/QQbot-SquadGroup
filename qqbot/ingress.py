@@ -43,9 +43,10 @@ def _extract(message, bot_qq: str):
             qq = str(d.get("qq", ""))
             if qq == bot_qq:
                 mentioned = True
+                # 剥掉对 bot 自身的 @，避免把 "@3119065126" 带进 question
             else:
                 mentions_other = True
-            text_parts.append(f"@{qq}")
+                text_parts.append(f"@{qq}")
         elif t == "reply":
             reply_message_id = str(d.get("id", ""))
         elif t == "image":
