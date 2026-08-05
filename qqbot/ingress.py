@@ -74,6 +74,7 @@ class OneBotIngress:
         self.config = config
         self.on_message = on_message
         self._app = web.Application()
+        self._app.router.add_get("/onebot", self._ws_handler)
         self._app.router.add_get("/onebot/", self._ws_handler)
         self._runner: web.AppRunner | None = None
         self._connections: set[web.WebSocketResponse] = set()

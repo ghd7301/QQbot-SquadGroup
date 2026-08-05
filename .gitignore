@@ -1,5 +1,7 @@
 # 敏感配置（含 API Key）
 .env
+.env.old-bot
+.env.*
 
 # 运行时文件
 work/
